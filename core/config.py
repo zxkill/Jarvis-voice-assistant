@@ -4,7 +4,28 @@ from dataclasses import dataclass
 from configparser import ConfigParser
 import os
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback for missing dependency
+    def load_dotenv(dotenv_path: str | None = None) -> None:
+        """Minimal replacement for :func:`dotenv.load_dotenv`.
+
+        Parses ``KEY=VALUE`` pairs from *dotenv_path* (default ``.env``) and
+        inserts them into :data:`os.environ` if the keys are not already
+        present. Lines starting with ``#`` or without ``=`` are ignored.
+        """
+
+        path = dotenv_path or ".env"
+        try:
+            with open(path, encoding="utf-8") as fp:
+                for line in fp:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+        except FileNotFoundError:
+            pass
 
 load_dotenv()
 
