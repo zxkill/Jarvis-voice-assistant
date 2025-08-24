@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Optional
+import math
+import random
 
 # OpenCV и MediaPipe могут отсутствовать в среде тестов, поэтому
 # импортируем их с защитой. В реальном запуске ассистента эти пакеты
@@ -61,10 +63,13 @@ HEAD_MIN_ASPECT = 0.5
 HEAD_MAX_ASPECT = 2.0
 
 # Таймауты и параметры поиска лица при его отсутствии
-NO_FACE_BORED_SEC = 5.0
 NO_FACE_SCAN_SEC = 8.0
-SCAN_STEP_PX = 40.0
-SCAN_SWITCH_SEC = 2.0
+SCAN_H_RANGE_PX = 320.0
+SCAN_V_RANGE_PX = 60.0
+SCAN_PERIOD_SEC = 6.0
+SCAN_TOTAL_SEC = 30.0
+SLEEP_MIN_SEC = 120.0
+SLEEP_MAX_SEC = 1200.0
 
 
 @dataclass
@@ -232,9 +237,9 @@ class PresenceDetector:
         yaw_prev = pitch_prev = 0.0
         fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if ROTATE_90 else (FOV_DEG_X, FOV_DEG_Y)
         last_face_ts = time.monotonic()
-        mode = "idle"  # idle → bored → scanning → tracking
-        scan_dir = 1
-        scan_switch_time = time.monotonic()
+        mode = "idle"  # idle → scanning → sleeping → tracking
+        scan_start = 0.0
+        sleep_until = 0.0
         global _last_sent_ms  # pylint: disable=global-statement
 
         try:
@@ -346,24 +351,32 @@ class PresenceDetector:
                     if mode == "tracking":
                         _clear_track()
                         mode = "idle"
+
                     dt_absent = now - last_face_ts
-                    if dt_absent > NO_FACE_SCAN_SEC:
-                        if mode != "scanning":
+                    if mode == "sleeping":
+                        if now >= sleep_until:
                             publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
                             mode = "scanning"
-                            scan_dir = 1
-                            scan_switch_time = now
+                            scan_start = now
+                        # во сне камера не двигается
+                    elif dt_absent > NO_FACE_SCAN_SEC and mode != "scanning":
+                        publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
+                        mode = "scanning"
+                        scan_start = now
+
+                    if mode == "scanning":
                         now_ms = int(now * 1000)
                         dt_ms = 0 if _last_sent_ms is None else (now_ms - _last_sent_ms)
                         _last_sent_ms = now_ms
-                        _send_track(SCAN_STEP_PX * scan_dir, 0.0, dt_ms)
-                        if now - scan_switch_time > SCAN_SWITCH_SEC:
-                            scan_dir *= -1
-                            scan_switch_time = now
-                    elif dt_absent > NO_FACE_BORED_SEC:
-                        if mode != "bored":
+                        phase = (now - scan_start) / SCAN_PERIOD_SEC
+                        dx = SCAN_H_RANGE_PX * math.sin(2 * math.pi * phase)
+                        dy = SCAN_V_RANGE_PX * math.sin(math.pi * phase)
+                        _send_track(dx, dy, dt_ms)
+                        if now - scan_start > SCAN_TOTAL_SEC:
+                            _clear_track()
                             publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SLEEPY}))
-                            mode = "bored"
+                            mode = "sleeping"
+                            sleep_until = now + random.uniform(SLEEP_MIN_SEC, SLEEP_MAX_SEC)
 
                 self._update_state(kind)
 
