@@ -2,6 +2,7 @@ import time
 from threading import Timer
 
 from emotion.state import EmotionState, Emotion
+from typing import Optional
 from core.logging_json import configure_logging
 from core import events as core_events
 
@@ -30,6 +31,10 @@ class EmotionManager:
         self._query_active = False
         # Время, до которого следует удерживать эмоцию "удивление"
         self._surprised_until = 0.0
+        # Флаг активного воспроизведения речи
+        self._speech_active = False
+        # Эмоция, ожидающая публикации после окончания речи
+        self._pending_emotion: Optional[Emotion] = None
 
         # Подписываемся на события глобального event bus.  Каждый обработчик
         # отвечает за конкретную ситуацию: начало/конец пользовательского
@@ -39,6 +44,8 @@ class EmotionManager:
         core_events.subscribe("emotion_changed", self._on_external_change)
         core_events.subscribe("speech.recognized", self._on_speech_recognized)
         core_events.subscribe("presence.update", self._on_presence_update)
+        core_events.subscribe("speech.synthesis_started", self._on_speech_started)
+        core_events.subscribe("speech.synthesis_finished", self._on_speech_finished)
 
     def start(self) -> None:
         """Опубликовать начальное состояние.
@@ -130,8 +137,23 @@ class EmotionManager:
         ``core_events``. Здесь мы формируем и отправляем соответствующий
         объект ``Event``.
         """
+        if self._speech_active:
+            self._pending_emotion = emotion
+            return
         log.debug("Publishing emotion_changed(%s)", emotion.value)
         core_events.publish(
             core_events.Event(kind="emotion_changed", attrs={"emotion": emotion})
         )
+
+    def _on_speech_started(self, event: core_events.Event) -> None:
+        """Отметить, что началось воспроизведение речи."""
+        self._speech_active = True
+
+    def _on_speech_finished(self, event: core_events.Event) -> None:
+        """Опубликовать отложенную эмоцию после завершения речи."""
+        self._speech_active = False
+        if self._pending_emotion is not None:
+            emotion = self._pending_emotion
+            self._pending_emotion = None
+            self._publish_emotion(emotion)
 

@@ -19,6 +19,7 @@ from transliterate import translit  # type: ignore
 from threading import Event
 
 from core.nlp import numbers_to_words, remove_spaces_in_numbers
+from core import events as core_events
 
 # ────────────────────────── 0. LOGGING ────────────────────────────
 from core.logging_json import configure_logging
@@ -208,6 +209,9 @@ def working_tts(
     """Озвучивает *text*; при *save_wav* пишет итоговый WAV-файл."""
     global is_playing
     is_playing = True
+    core_events.publish(
+        core_events.Event(kind="speech.synthesis_started", attrs={"text": text})
+    )
     _STOP_EVENT.clear()
     # Приводим исходный текст к удобному для синтеза виду:
     # 1) числа → слова, 2) убираем пробелы в числах, 3) транслитерация
@@ -301,6 +305,7 @@ def working_tts(
     if save_wav:
         _save_wav(save_wav, full_audio)
     is_playing = False
+    core_events.publish(core_events.Event(kind="speech.synthesis_finished"))
     _STOP_EVENT.clear()
     sd.stop()
 
