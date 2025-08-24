@@ -96,6 +96,7 @@ class EmotionSoundDriver:
     def _on_emotion_changed(self, event: core_events.Event) -> None:
         if sd is None:
             return  # звук недоступен
+        sd.stop()  # оборвать звук предыдущей эмоции
         emotion: Emotion = event.attrs["emotion"]
         key = _ALIASES.get(emotion, emotion.name)
         effect = self._effects.get(key)
