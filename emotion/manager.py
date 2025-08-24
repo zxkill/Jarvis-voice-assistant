@@ -1,5 +1,5 @@
-import threading
 import time
+
 from emotion.state import EmotionState, Emotion
 from core.logging_json import configure_logging
 from core import events as core_events
@@ -8,76 +8,81 @@ log = configure_logging("emotion.manager")
 
 
 class EmotionManager:
-    """Управляет сменой эмоций через глобальный event bus."""
+    """Управляет сменой эмоций через глобальный event bus.
 
-    def __init__(self, idle_interval: float = 5.0):
+    Класс держит текущее состояние эмоции и реагирует на события,
+    поступающие из разных подсистем ассистента.  Все переходы
+    фиксируются в логах, что упрощает отладку и анализ поведения
+    ассистента.
+    """
+
+    def __init__(self) -> None:
         self._state = EmotionState()
-        self._idle_interval = idle_interval
-        self._stop_event = threading.Event()
-        self._idle_thread = threading.Thread(target=self._idle_loop, daemon=True)
-        self._busy_event = threading.Event()
+        self._prev_emotion = self._state.current
 
-        # Подписываемся на события
-        core_events.subscribe('user_query_started', self._on_query_started)
-        core_events.subscribe('user_query_ended', self._on_query_ended)
-        # Будем слушать сенсорные события по мере добавления
-        # core_events.subscribe('sensor_event', self._on_sensor_event)
+        # Подписываемся на события глобального event bus.  Каждый обработчик
+        # отвечает за конкретную ситуацию: начало/конец пользовательского
+        # запроса или внешнее изменение эмоции другими компонентами.
+        core_events.subscribe("user_query_started", self._on_query_started)
+        core_events.subscribe("user_query_ended", self._on_query_ended)
+        core_events.subscribe("emotion_changed", self._on_external_change)
 
-    def start(self):
-        """Опубликовать начальное состояние и запустить фоновый цикл."""
-        # сразу отрисовать текущее (NEUTRAL)
+    def start(self) -> None:
+        """Опубликовать начальное состояние.
+
+        Без вызова этой функции внешний мир не узнает, какая эмоция
+        активна при запуске ассистента.
+        """
         self._publish_emotion(self._state.current)
-        # а затем — запустить idle-цикл
-        self._idle_thread.start()
 
-    def stop(self):
-        """Остановить фоновый цикл (если нужно)."""
-        self._stop_event.set()
-        self._idle_thread.join()
+    def stop(self) -> None:  # pragma: no cover - для совместимости API
+        """Совместимость с прежним API, активных потоков нет."""
+        pass
 
-    def _idle_loop(self):
-        """Фоновый цикл: каждые idle_interval сек публикует новую эмоцию из idle-режима."""
-        while not self._stop_event.is_set():
-            if self._busy_event.is_set():
-                time.sleep(0.1)
-                continue
-            next_emotion = self._state.get_next_idle()
-            log.debug("Idle → %s", next_emotion.value)
-            self._publish_emotion(next_emotion)
-            # Ожидаем или прерываем
-            waited = 0.0
-            step = 0.1
-            while waited < self._idle_interval:
-                if self._stop_event.is_set() or self._busy_event.is_set():
-                    return
-                time.sleep(step)
-                waited += step
+    def _on_external_change(self, event: core_events.Event) -> None:
+        """Обновить локальное состояние при смене эмоции и вывести её в лог.
+
+        Иногда эмоцию может изменить другой компонент (например, детектор
+        присутствия).  Мы фиксируем такое изменение и сохраняем его в
+        ``EmotionState``.
+        """
+        new = event.attrs["emotion"]
+        prev = self._state.current
+        log.info("emotion %s → %s", prev.value, new.value)
+        self._state.set(new)
 
     def _on_query_started(self, event: core_events.Event) -> None:
-        """При начале обработки пользовательского запроса — эмоция THINKING."""
-        self._busy_event.set()
+        """При начале обработки пользовательского запроса — эмоция THINKING.
+
+        Запоминаем предыдущую эмоцию, чтобы по завершении вернуться к ней,
+        и публикуем эмоцию ``THINKING``.
+        """
+        self._prev_emotion = self._state.current
         emo = self._state.get_thinking()
         log.debug("user_query_started → %s", emo.value)
         self._publish_emotion(emo)
 
     def _on_query_ended(self, event: core_events.Event) -> None:
-        """При завершении обработки запроса — вернуться в режим простоя, но с паузой."""
-        # Немного подождём, чтобы у пользователя было время заметить
+        """При завершении обработки запроса — вернуться к предыдущей эмоции.
+
+        Небольшая пауза помогает избежать мгновенного переключения, если
+        следом идёт новый запрос.
+        """
         log.debug("user_query_ended → wait 1s")
         time.sleep(1)
-        self._busy_event.clear()
-        emo = self._state.get_next_idle()
-        log.debug("Post-query idle → %s", emo.value)
+        emo = self._state.set(self._prev_emotion)
+        log.debug("user_query_ended → %s", emo.value)
         self._publish_emotion(emo)
 
-    # Пример заготовки для расширения на сенсоры
-    # def _on_sensor_event(self, sensor_type: str, value=None):
-    #     """Переключить эмоцию на основе данных сенсора"""
-    #     # Логика обработки разных сенсоров
-    #     emo = Emotion.ANGRY if sensor_type == 'heat' and value > 50 else Emotion.NEUTRAL
-    #     self._publish_emotion(emo)
+    def _publish_emotion(self, emotion: Emotion) -> None:
+        """Публикует событие смены эмоции.
 
-    def _publish_emotion(self, emotion: Emotion):
-        """Публикует событие смены эмоции."""
+        Весь обмен эмоциями между компонентами происходит через
+        ``core_events``. Здесь мы формируем и отправляем соответствующий
+        объект ``Event``.
+        """
         log.debug("Publishing emotion_changed(%s)", emotion.value)
-        core_events.publish(core_events.Event(kind='emotion_changed', attrs={'emotion': emotion}))
+        core_events.publish(
+            core_events.Event(kind="emotion_changed", attrs={"emotion": emotion})
+        )
+

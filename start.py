@@ -96,7 +96,7 @@ async def main(_conn=None):
     EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
     EmotionSoundDriver()           # звуки при смене эмоций
     load_all()                     # начальная загрузка плагинов
-    EmotionManager(30).start()     # запускаем управление эмоциями
+    EmotionManager().start()        # запускаем управление эмоциями
     start_skill_reloader()         # включаем горячую перезагрузку
 
     # --- Инициализация детектора присутствия ---------------------------
