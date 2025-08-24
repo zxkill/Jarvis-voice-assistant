@@ -94,11 +94,11 @@ pip3 install -r requirements.txt
 mkdir -p piper && cp ru-RU-irina-medium.* piper/
 
 # 5. Настройка конфигурации
+#   Скопируйте `.env.example` в `.env` и заполните секретные значения
+cp .env.example .env
 #   Откройте config.ini и укажите:
 #   - в секции [MIC] → `microphone_index`
 #   - в секции [PRESENCE] → `camera_index` и `frame_interval_ms`
-#   - в секции [USER] → `telegram_user_id`
-#   - в секции [TELEGRAM] → `token`
 #   - при необходимости [INTEL] → `absent_after_sec`
 nano config.ini
 
@@ -117,10 +117,10 @@ python3 start.py
 | `[AUDIO]` `grammar` | набор команд для распознавания (`full`/`grammar`) | `full` — полный словарь, `grammar` — ограниченный |
 | `[add_to_prompt]` `add_to_prompt` | фраза, добавляемая к системному промпту | можно изменить под ваш контекст |
 | `[USER]` `name` | имя пользователя/голосового ассистента | любое удобное имя |
-| `[USER]` `telegram_user_id` | ID пользователя Telegram для личных уведомлений | получите у `@userinfobot`, `0` отключает уведомления |
-| `[INTEL]` `api_key` | API-ключ для взаимодействия с моделью ИИ | вставьте ключ OpenAI, локальной LLM и т.д. |
+| `[USER]` `telegram_user_id` | ID пользователя Telegram для личных уведомлений | переменная окружения `TELEGRAM_USER_ID`, `0` отключает уведомления |
+| `[INTEL]` `api_key` | API-ключ для взаимодействия с моделью ИИ | задаётся через `INTEL_API_KEY` |
 | `[INTEL]` `absent_after_sec` | сколько секунд отсутствия лица считать уходом пользователя | 5–10 секунд в зависимости от камеры |
-| `[TELEGRAM]` `token` | токен для Telegram-бота | создайте бота через `@BotFather` |
+| `[TELEGRAM]` `token` | токен для Telegram-бота | переменная окружения `TELEGRAM_TOKEN` |
 | `[PRESENCE]` `enabled` | включает детектор присутствия пользователя | `true` для включения, `false` чтобы отключить |
 | `[PRESENCE]` `camera_index` | индекс камеры для захвата видео | `0` — первая камера; проверьте `ls /dev/video*` |
 | `[PRESENCE]` `frame_interval_ms` | интервал между кадрами в миллисекундах | `500` — баланс между скоростью и нагрузкой |

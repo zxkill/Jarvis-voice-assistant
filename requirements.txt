@@ -19,6 +19,7 @@ pymorphy2==0.9.1
 # ────────── Конфиги, загрузки, CLI ──────────
 pyyaml==6.0.1
 configparser==6.0.1
+python-dotenv==1.0.1
 requests==2.32.4
 keyboard==0.13.5
 

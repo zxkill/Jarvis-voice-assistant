@@ -2,6 +2,11 @@
 
 from dataclasses import dataclass
 from configparser import ConfigParser
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 class ConfigError(Exception):
@@ -62,6 +67,23 @@ def _require(cfg: ConfigParser, section: str, option: str) -> str:
     return cfg.get(section, option)
 
 
+def _env_or_cfg(
+    cfg: ConfigParser, section: str, option: str, env_name: str, default: str | None = None
+) -> str:
+    """Возвращает значение из переменной окружения или конфигурации."""
+
+    value = os.getenv(env_name)
+    if value:
+        return value
+    if cfg.has_option(section, option) and cfg.get(section, option).strip():
+        return cfg.get(section, option)
+    if default is not None:
+        return default
+    raise ConfigError(
+        f"Missing option '{option}' in section '{section}' or env '{env_name}'"
+    )
+
+
 def load_config(path: str = "config.ini") -> AppConfig:
     """Загружает и валидирует конфигурацию из файла *path*.
 
@@ -81,13 +103,19 @@ def load_config(path: str = "config.ini") -> AppConfig:
     # Формируем dataclass-объекты для каждой секции конфигурации
     user = UserConfig(
         name=_require(parser, "USER", "name"),
-        telegram_user_id=parser.getint("USER", "telegram_user_id"),
+        telegram_user_id=int(
+            _env_or_cfg(
+                parser, "USER", "telegram_user_id", "TELEGRAM_USER_ID", default="0"
+            )
+        ),
     )
     intel = IntelConfig(
-        api_key=_require(parser, "INTEL", "api_key"),
+        api_key=_env_or_cfg(parser, "INTEL", "api_key", "INTEL_API_KEY"),
         absent_after_sec=parser.getfloat("INTEL", "absent_after_sec"),
     )
-    telegram = TelegramConfig(token=_require(parser, "TELEGRAM", "token"))
+    telegram = TelegramConfig(
+        token=_env_or_cfg(parser, "TELEGRAM", "token", "TELEGRAM_TOKEN")
+    )
     # Параметры камеры берём целочисленными значениями
     presence = PresenceConfig(
         enabled=parser.getboolean("PRESENCE", "enabled"),
