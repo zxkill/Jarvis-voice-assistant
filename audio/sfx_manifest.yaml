@@ -119,12 +119,11 @@ ANGRY:
     - audio/sfx/angry/pixabay_ugh_short.wav
     - audio/sfx/angry/freesound_glitch_cc0.wav              # CC0 глитч (Erokia pack)
 
-SLEEP:
+SLEEPY:
   gain_db: -12
   cooldown_ms: 8000
   files:
-    - audio/sfx/sleep/mixkit_ambience_night_soft.wav
-    - audio/sfx/sleep/mixkit_low_hum_loop.wav
+    - audio/sfx/sleepy/mixkit-sleep-breathing.wav
 
 WAKE:
   gain_db: -8
