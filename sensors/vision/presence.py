@@ -62,6 +62,10 @@ HEAD_MIN_AREA = 0.01
 HEAD_MIN_ASPECT = 0.5
 HEAD_MAX_ASPECT = 2.0
 
+# Минимальная длительность непрерывного обнаружения,
+# после которой считаем, что в кадре действительно есть человек
+FACE_STABLE_SEC = 1.0
+
 # Таймауты и параметры поиска лица при его отсутствии
 NO_FACE_SCAN_SEC = 8.0
 SCAN_H_RANGE_PX = 320.0
@@ -237,6 +241,7 @@ class PresenceDetector:
         yaw_prev = pitch_prev = 0.0
         fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if ROTATE_90 else (FOV_DEG_X, FOV_DEG_Y)
         last_face_ts = time.monotonic()
+        stable_start: float | None = None
         mode = "idle"  # idle → scanning → sleeping → tracking
         scan_start = 0.0
         sleep_until = 0.0
@@ -327,7 +332,15 @@ class PresenceDetector:
                             ):
                                 kind = "head"
 
-                detected = kind is not None
+                now = time.monotonic()
+                raw_detected = kind is not None
+                if raw_detected:
+                    if stable_start is None:
+                        stable_start = now
+                    detected = now - stable_start >= FACE_STABLE_SEC
+                else:
+                    stable_start = None
+                    detected = False
 
                 if detected:
                     fh, fw = frame_bgr.shape[:2]
@@ -348,7 +361,7 @@ class PresenceDetector:
                     dx_px = float(cx - fw / 2.0)
                     dy_px = float(cy - fh / 2.0)
                     _update_track(True, dx_px, dy_px, dt_ms)
-                    last_face_ts = time.monotonic()
+                    last_face_ts = now
                     if mode != "tracking":
                         publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.HAPPY}))
                         mode = "tracking"
@@ -369,7 +382,6 @@ class PresenceDetector:
                             lineType=cv2.LINE_AA,
                         )
                 else:
-                    now = time.monotonic()
                     log.debug("no face/pose detected")
                     if mode == "tracking":
                         _clear_track()
@@ -401,7 +413,7 @@ class PresenceDetector:
                             mode = "sleeping"
                             sleep_until = now + random.uniform(SLEEP_MIN_SEC, SLEEP_MAX_SEC)
 
-                self._update_state(kind)
+                self._update_state(kind if detected else None)
 
                 if DEBUG_GUI:
                     cv2.imshow("Jarvis-View", frame_bgr)
