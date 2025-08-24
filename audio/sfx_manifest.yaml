@@ -1,0 +1,134 @@
+# Все файлы желательно конвертировать в WAV 44.1kHz mono 16-bit PCM
+# Поля gain_db и cooldown_ms помогут тонко подстроить озвучку.
+
+# из любой mp3/ogg → wav mono 44.1k с нормализацией (пример для всех входных файлов)
+#for f in downloaded/*.*; do
+#  b=$(basename "$f"); out="audio/sfx/_converted/${b%.*}.wav"
+#  ffmpeg -v error -i "$f" -ac 1 -ar 44100 -af loudnorm=I=-16:TP=-1.5:LRA=11 "$out"
+#done
+
+
+IDLE:
+  gain_db: -8
+  cooldown_ms: 8000
+  files:
+    - audio/sfx/idle/mixkit_tech_futuristic_hum.wav        # Mixkit: Technological futuristic hum
+    - audio/sfx/idle/mixkit_bass_rumble_hum.wav            # Mixkit: Bass rumble hum
+
+HAPPY:
+  gain_db: -6
+  cooldown_ms: 3000
+  files:
+    - audio/sfx/happy/mixkit_happy_child_laugh.wav         # Mixkit: Happy child laughing
+    - audio/sfx/happy/mixkit_cartoon_giggle.wav            # Mixkit: Cartoon giggle
+    - audio/sfx/happy/mixkit_small_crowd_laugh_applause.wav
+
+EXCITED:
+  gain_db: -6
+  cooldown_ms: 2500
+  files:
+    - audio/sfx/excited/mixkit_sci_fi_positive_notification.wav
+    - audio/sfx/excited/mixkit_retro_confirmation_tone.wav
+
+SURPRISED:
+  gain_db: -6
+  cooldown_ms: 2500
+  files:
+    - audio/sfx/surprised/mixkit-cartoon-surprise-gasp.wav
+
+THINKING:
+  gain_db: -10
+  cooldown_ms: 3000
+  files:
+    - audio/sfx/thinking/mixkit-technology-computer-calculations.wav
+    - audio/sfx/thinking/mixkit-robotic-insect-buzz.wav
+
+CURIOUS:
+  gain_db: -10
+  cooldown_ms: 2500
+  files:
+    - audio/sfx/curious/mixkit_ui_zoom_in.wav
+    - audio/sfx/curious/mixkit_tech_computer_calculations.wav
+
+LISTENING:
+  gain_db: -9
+  cooldown_ms: 1500
+  files:
+    - audio/sfx/listening/mixkit_ui_zoom_in.wav
+    - audio/sfx/listening/mixkit_click_soft.wav
+
+SPEAKING:
+  gain_db: -9
+  cooldown_ms: 2000
+  files:
+    - audio/sfx/speaking/mixkit_sci_fi_robot_speaking.wav
+
+ACK:
+  gain_db: -8
+  cooldown_ms: 1200
+  files:
+    - audio/sfx/ack/mixkit_retro_confirmation_tone.wav
+    - audio/sfx/ack/mixkit_ding_soft.wav
+
+YES:
+  gain_db: -7
+  cooldown_ms: 1500
+  files:
+    - audio/sfx/yes_no/kenney_correct_female.ogg           # Kenney Voiceover Pack
+    - audio/sfx/yes_no/kenney_correct_male.ogg
+
+NO:
+  gain_db: -7
+  cooldown_ms: 1500
+  files:
+    - audio/sfx/yes_no/kenney_wrong_female.ogg
+    - audio/sfx/yes_no/kenney_wrong_male.ogg
+
+SUCCESS:
+  gain_db: -7
+  cooldown_ms: 2000
+  files:
+    - audio/sfx/success/mixkit_win_fanfare.wav
+    - audio/sfx/success/mixkit_coin_ding.wav
+
+ERROR:
+  gain_db: -8
+  cooldown_ms: 1500
+  files:
+    - audio/sfx/error/mixkit_wrong_answer_mech.wav
+    - audio/sfx/error/mixkit_error_buzzer.wav
+
+WARNING:
+  gain_db: -10
+  cooldown_ms: 3000
+  files:
+    - audio/sfx/warning/mixkit_classic_alarm.wav
+    - audio/sfx/warning/mixkit_alert_beep.wav
+
+SAD:
+  gain_db: -9
+  cooldown_ms: 4000
+  files:
+    - audio/sfx/sad/pixabay_sigh_soft.wav
+    - audio/sfx/sad/mixkit_sad_game_over_trombone.wav
+
+ANGRY:
+  gain_db: -8
+  cooldown_ms: 3000
+  files:
+    - audio/sfx/angry/pixabay_ugh_short.wav
+    - audio/sfx/angry/freesound_glitch_cc0.wav              # CC0 глитч (Erokia pack)
+
+SLEEP:
+  gain_db: -12
+  cooldown_ms: 8000
+  files:
+    - audio/sfx/sleep/mixkit_ambience_night_soft.wav
+    - audio/sfx/sleep/mixkit_low_hum_loop.wav
+
+WAKE:
+  gain_db: -8
+  cooldown_ms: 4000
+  files:
+    - audio/sfx/wake/mixkit_futuristic_door_open.wav
+    - audio/sfx/wake/mixkit_machine_activation_short.wav
