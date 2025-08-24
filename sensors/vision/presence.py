@@ -56,17 +56,28 @@ FOV_DEG_Y = 62.0
 SMOOTH_ALPHA = 0.0
 POSE_MIN_VIS = 0.60
 
-# Ограничения для fallback-детекции головы по Pose. Позволяют
-# отсеивать ложные срабатывания на предметы (например, стул).
-HEAD_MIN_AREA = 0.005
-HEAD_MIN_ASPECT = 0.3
-HEAD_MAX_ASPECT = 3.0
+# Ограничения для fallback-детекции головы по Pose.  Если объект по
+# площади слишком мал/велик или имеет нетипичное соотношение сторон,
+# считаем его ложным и игнорируем. Помогает отбрасывать, например, спинку
+# стула, попавшую в кадр.
+HEAD_MIN_AREA = 0.005  # относительная площадь прямоугольника (0..1)
+HEAD_MIN_ASPECT = 0.3  # минимальное соотношение ширины к высоте
+HEAD_MAX_ASPECT = 3.0  # максимальное соотношение ширины к высоте
 
-# Минимальная длительность непрерывного обнаружения,
-# после которой считаем, что в кадре действительно есть человек
+# Минимальная длительность непрерывного обнаружения лица.  Кратковременные
+# «вспышки» детектора (например, из‑за шумов) игнорируются, если они
+# длятся меньше этого порога.
 FACE_STABLE_SEC = 1.0
 
-# Таймауты и параметры поиска лица при его отсутствии
+# Таймауты и параметры поиска лица при его отсутствии.  После
+# ``NO_FACE_SCAN_SEC`` секунд отсутствия лица камера начинает медленно
+# осматривать комнату. Горизонтальный обзор выполняется на полный доступный
+# диапазон ``SCAN_H_RANGE_PX`` в пикселях, вертикальный – на небольшой угол
+# ``SCAN_V_RANGE_PX``. Поворот осуществляется со скоростью
+# ``SCAN_SPEED_PX_PER_SEC`` с небольшими паузами ``SCAN_HOLD_SEC`` на
+# крайних точках. Полный цикл обзора длится ``SCAN_TOTAL_SEC`` секунд, после
+# чего ассистент «засыпает» на случайный промежуток между
+# ``SLEEP_MIN_SEC`` и ``SLEEP_MAX_SEC``.
 NO_FACE_SCAN_SEC = 8.0
 SCAN_H_RANGE_PX = 320.0
 SCAN_V_RANGE_PX = 60.0
@@ -77,7 +88,10 @@ SCAN_TOTAL_SEC = 30.0
 SLEEP_MIN_SEC = 120.0
 SLEEP_MAX_SEC = 1200.0
 
-# Параметры отображения эмоций при обнаружении лица
+# Параметры отображения эмоций при обнаружении лица.  Если лицо не
+# появлялось более ``FACE_ABSENT_HAPPY_SEC`` секунд, при следующем
+# обнаружении ассистент кратко (``HAPPY_SHOW_SEC``) демонстрирует эмоцию
+# «счастье», затем возвращается в нейтральное состояние.
 FACE_ABSENT_HAPPY_SEC = 300.0
 HAPPY_SHOW_SEC = 5.0
 
@@ -247,12 +261,24 @@ class PresenceDetector:
         yaw_prev = pitch_prev = 0.0
         fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if ROTATE_90 else (FOV_DEG_X, FOV_DEG_Y)
         last_face_ts = time.monotonic() - FACE_ABSENT_HAPPY_SEC
+        # ``stable_start`` хранит момент начала устойчивой детекции лица,
+        # чтобы отфильтровать кратковременные ложные срабатывания.
         stable_start: float | None = None
-        mode = "idle"  # idle → scanning → sleeping → tracking
-        scan_start = 0.0
-        scan_pos = 0.0
-        scan_dir = 1
-        scan_hold_until = 0.0
+
+        # Текущее состояние автомата:
+        #   idle     – молча ждём появления лица
+        #   scanning – поворачиваем камеру в поисках лица
+        #   sleeping – отдыхаем, камера неподвижна
+        #   tracking – активно следим за обнаруженным лицом
+        mode = "idle"
+
+        # Параметры синусоидального сканирования
+        scan_start = 0.0        # момент начала текущего цикла
+        scan_pos = 0.0          # текущая горизонтальная позиция в пикселях
+        scan_dir = 1            # направление движения: 1 вправо, -1 влево
+        scan_hold_until = 0.0   # время, до которого нужно "задержаться" на краю
+
+        # Таймеры сна и улыбки
         sleep_until = 0.0
         face_emotion = Emotion.NEUTRAL
         happy_until = 0.0
@@ -405,11 +431,15 @@ class PresenceDetector:
                 else:
                     log.debug("no face/pose detected")
                     if mode == "tracking":
+                        # Раньше следили за лицом, но оно исчезло – останавливаем
+                        # приводы и переходим в режим ожидания.
                         _clear_track()
                         mode = "idle"
 
                     dt_absent = now - last_face_ts
                     if mode == "sleeping":
+                        # Во сне камера неподвижна. Просыпаемся, когда истёк
+                        # таймер ``sleep_until``.
                         if now >= sleep_until:
                             publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
                             mode = "scanning"
@@ -419,6 +449,7 @@ class PresenceDetector:
                             scan_hold_until = now
                         # во сне камера не двигается
                     elif dt_absent > NO_FACE_SCAN_SEC and mode != "scanning":
+                        # Лица нет уже достаточно долго → начинаем поиск
                         publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
                         mode = "scanning"
                         scan_start = now
@@ -427,6 +458,7 @@ class PresenceDetector:
                         scan_hold_until = now
 
                     if mode == "scanning":
+                        # Расчёт шага и направление горизонтального сканирования
                         now_ms = int(now * 1000)
                         dt_ms = 0 if _last_sent_ms is None else (now_ms - _last_sent_ms)
                         _last_sent_ms = now_ms
@@ -441,9 +473,13 @@ class PresenceDetector:
                                 scan_pos = -SCAN_H_RANGE_PX
                                 scan_dir = 1
                                 scan_hold_until = now + SCAN_HOLD_SEC
+                        # Вертикальное движение описываем синусоидой, чтобы
+                        # взгляд плавно "скользил" вверх-вниз.
                         dy = SCAN_V_RANGE_PX * math.sin(2 * math.pi * (now - scan_start) / SCAN_V_PERIOD_SEC)
                         _send_track(scan_pos, dy, dt_ms)
                         if now - scan_start > SCAN_TOTAL_SEC:
+                            # Полный обзор завершён → уходим спать на случайный
+                            # интервал и показываем эмоцию сонливости.
                             _clear_track()
                             publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SLEEPY}))
                             mode = "sleeping"
