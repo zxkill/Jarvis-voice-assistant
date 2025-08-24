@@ -70,7 +70,9 @@ FACE_STABLE_SEC = 1.0
 NO_FACE_SCAN_SEC = 8.0
 SCAN_H_RANGE_PX = 320.0
 SCAN_V_RANGE_PX = 60.0
-SCAN_PERIOD_SEC = 6.0
+SCAN_SPEED_PX_PER_SEC = 40.0
+SCAN_HOLD_SEC = 1.0
+SCAN_V_PERIOD_SEC = 10.0
 SCAN_TOTAL_SEC = 30.0
 SLEEP_MIN_SEC = 120.0
 SLEEP_MAX_SEC = 1200.0
@@ -244,6 +246,9 @@ class PresenceDetector:
         stable_start: float | None = None
         mode = "idle"  # idle → scanning → sleeping → tracking
         scan_start = 0.0
+        scan_pos = 0.0
+        scan_dir = 1
+        scan_hold_until = 0.0
         sleep_until = 0.0
         global _last_sent_ms  # pylint: disable=global-statement
 
@@ -393,25 +398,42 @@ class PresenceDetector:
                             publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
                             mode = "scanning"
                             scan_start = now
+                            scan_pos = 0.0
+                            scan_dir = 1
+                            scan_hold_until = now
                         # во сне камера не двигается
                     elif dt_absent > NO_FACE_SCAN_SEC and mode != "scanning":
                         publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
                         mode = "scanning"
                         scan_start = now
+                        scan_pos = 0.0
+                        scan_dir = 1
+                        scan_hold_until = now
 
                     if mode == "scanning":
                         now_ms = int(now * 1000)
                         dt_ms = 0 if _last_sent_ms is None else (now_ms - _last_sent_ms)
                         _last_sent_ms = now_ms
-                        phase = (now - scan_start) / SCAN_PERIOD_SEC
-                        dx = SCAN_H_RANGE_PX * math.sin(2 * math.pi * phase)
-                        dy = SCAN_V_RANGE_PX * math.sin(math.pi * phase)
-                        _send_track(dx, dy, dt_ms)
+                        dt_sec = dt_ms / 1000.0
+                        if now >= scan_hold_until:
+                            scan_pos += scan_dir * SCAN_SPEED_PX_PER_SEC * dt_sec
+                            if scan_pos >= SCAN_H_RANGE_PX:
+                                scan_pos = SCAN_H_RANGE_PX
+                                scan_dir = -1
+                                scan_hold_until = now + SCAN_HOLD_SEC
+                            elif scan_pos <= -SCAN_H_RANGE_PX:
+                                scan_pos = -SCAN_H_RANGE_PX
+                                scan_dir = 1
+                                scan_hold_until = now + SCAN_HOLD_SEC
+                        dy = SCAN_V_RANGE_PX * math.sin(2 * math.pi * (now - scan_start) / SCAN_V_PERIOD_SEC)
+                        _send_track(scan_pos, dy, dt_ms)
                         if now - scan_start > SCAN_TOTAL_SEC:
                             _clear_track()
                             publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SLEEPY}))
                             mode = "sleeping"
-                            sleep_until = now + random.uniform(SLEEP_MIN_SEC, SLEEP_MAX_SEC)
+                            sleep_dur = random.uniform(SLEEP_MIN_SEC, SLEEP_MAX_SEC)
+                            sleep_until = now + sleep_dur
+                            log.info("sleeping for %.1f seconds", sleep_dur)
 
                 self._update_state(kind if detected else None)
 
