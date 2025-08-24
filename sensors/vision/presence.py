@@ -17,6 +17,7 @@ except Exception:  # pylint: disable=broad-except
 from core.events import Event, publish
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
+from emotion.state import Emotion
 
 # Попытка импортировать драйвер дисплея для отправки команд поворота.
 # Сам драйвер инициализируется позже (в start.py через ``init_driver``),
@@ -44,7 +45,7 @@ _last_sent_ms: int | None = None
 # Был ли ранее активен трекинг — чтобы остановить сервоприводы при потере цели
 _tracking_active = False
 
-# Настройки визуализации/обработки (аналогично skill/face_tracker)
+# Настройки визуализации и обработки
 DEBUG_GUI = True  # показывать окно OpenCV
 ROTATE_90 = True
 ROTATE_CODE = cv2.ROTATE_90_COUNTERCLOCKWISE if cv2 else 0  # pragma: no cover
@@ -52,6 +53,12 @@ FOV_DEG_X = 38.0
 FOV_DEG_Y = 62.0
 SMOOTH_ALPHA = 0.0
 POSE_MIN_VIS = 0.80
+
+# Таймауты и параметры поиска лица при его отсутствии
+NO_FACE_BORED_SEC = 5.0
+NO_FACE_SCAN_SEC = 8.0
+SCAN_STEP_PX = 40.0
+SCAN_SWITCH_SEC = 2.0
 
 
 @dataclass
@@ -218,6 +225,11 @@ class PresenceDetector:
         dt_target = self.frame_interval_ms / 1000.0
         yaw_prev = pitch_prev = 0.0
         fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if ROTATE_90 else (FOV_DEG_X, FOV_DEG_Y)
+        last_face_ts = time.monotonic()
+        mode = "idle"  # idle → bored → scanning → tracking
+        scan_dir = 1
+        scan_switch_time = time.monotonic()
+        global _last_sent_ms  # pylint: disable=global-statement
 
         try:
             while True:
@@ -294,13 +306,16 @@ class PresenceDetector:
                     yaw_prev, pitch_prev = yaw, pitch
 
                     now_ms = int(time.time() * 1000)
-                    global _last_sent_ms  # pylint: disable=global-statement
                     dt_ms = 0 if _last_sent_ms is None else now_ms - _last_sent_ms
                     _last_sent_ms = now_ms
 
                     dx_px = float(cx - fw / 2.0)
                     dy_px = float(cy - fh / 2.0)
                     _update_track(True, dx_px, dy_px, dt_ms)
+                    last_face_ts = time.monotonic()
+                    if mode != "tracking":
+                        publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.HAPPY}))
+                        mode = "tracking"
 
                     if DEBUG_GUI:
                         color = (0, 255, 0) if kind == "face" else (0, 165, 255)
@@ -318,8 +333,29 @@ class PresenceDetector:
                             lineType=cv2.LINE_AA,
                         )
                 else:
+                    now = time.monotonic()
                     log.debug("no face/pose detected")
-                    _update_track(False, 0.0, 0.0, 0)
+                    if mode == "tracking":
+                        _clear_track()
+                        mode = "idle"
+                    dt_absent = now - last_face_ts
+                    if dt_absent > NO_FACE_SCAN_SEC:
+                        if mode != "scanning":
+                            publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
+                            mode = "scanning"
+                            scan_dir = 1
+                            scan_switch_time = now
+                        now_ms = int(now * 1000)
+                        dt_ms = 0 if _last_sent_ms is None else (now_ms - _last_sent_ms)
+                        _last_sent_ms = now_ms
+                        _send_track(SCAN_STEP_PX * scan_dir, 0.0, dt_ms)
+                        if now - scan_switch_time > SCAN_SWITCH_SEC:
+                            scan_dir *= -1
+                            scan_switch_time = now
+                    elif dt_absent > NO_FACE_BORED_SEC:
+                        if mode != "bored":
+                            publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SLEEPY}))
+                            mode = "bored"
 
                 self._update_state(kind)
 
@@ -344,7 +380,7 @@ class PresenceDetector:
 def _send_track(dx_px: float, dy_px: float, dt_ms: int) -> None:
     """Отправить ошибку положения для сервоприводов на M5.
 
-    Формат совместим с display-driver, используемым в skill/face_tracker.
+    Формат совместим с display-driver, управляющим поворотом камеры.
     Если драйвер недоступен, функция ничего не делает.
     """
 
