@@ -16,7 +16,7 @@ except Exception:  # pylint: disable=broad-except
     cv2 = None  # type: ignore
     mp = None  # type: ignore
 
-from core.events import Event, publish
+from core.events import Event, publish, subscribe
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from emotion.state import Emotion
@@ -151,6 +151,9 @@ class PresenceDetector:
         # Отслеживание времени непрерывного присутствия
         self._session_start: float | None = None
         set_metric("presence.active_seconds", 0)
+        # Флаг, что нужно немедленно проснуться по голосовой команде
+        self._wake_requested = False
+        subscribe("speech.recognized", self._on_voice_command)
 
     # ------------------------------------------------------------------
     def _ensure_camera(self) -> bool:
@@ -226,6 +229,10 @@ class PresenceDetector:
                 detected,
                 kind,
             )
+
+    def _on_voice_command(self, event: Event) -> None:
+        """Получили голосовую команду — просыпаемся и ищем лицо."""
+        self._wake_requested = True
 
     # ------------------------------------------------------------------
     def run(self) -> None:
@@ -368,6 +375,18 @@ class PresenceDetector:
                                 kind = "head"
 
                 now = time.monotonic()
+                if self._wake_requested:
+                    # Снаружи поступила голосовая команда — просыпаемся и
+                    # начинаем сканировать пространство, как будто только что
+                    # потеряли лицо из вида.
+                    self._wake_requested = False
+                    if mode in ("sleeping", "idle"):
+                        mode = "scanning"
+                        scan_start = now
+                        scan_pos = 0.0
+                        scan_dir = 1
+                        scan_hold_until = now
+                        last_face_ts = now
                 if face_emotion == Emotion.HAPPY and now >= happy_until:
                     publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.NEUTRAL}))
                     face_emotion = Emotion.NEUTRAL
