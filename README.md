@@ -35,6 +35,7 @@
 * Определение присутствия пользователя по веб‑камере (событие `presence.update`)
 * Скилл `face_tracker` для слежения за лицом и подстройки камеры с отладочным окном
 * Хранение событий, сессий и подсказок в SQLite (`memory/`)
+* Краткосрочный и долговременный контекст (`context/`), агрегаты привычек и генератор подсказок (`analysis/`)
 
 ---
 
@@ -44,16 +45,23 @@
 .
 ├── start.py             # основной цикл и распознавание речи
 ├── jarvis_skills.py     # менеджер плагинов (скиллов)
-├── logging_config.py    # настройка логирования
-├── core/                # конфигурация и метрики
+├── commands.yaml        # словарь встроенных команд
+├── config.ini           # основная конфигурация ассистента
+├── core/                # конфигурация, события, логирование, NLP
+├── working_tts.py       # адаптер Piper-TTS
+├── audio/               # звуковые эффекты
+├── context/             # краткосрочный и долгосрочный контекст
 ├── display/             # драйверы для вывода (console.py, serial.py, websocket.py)
+├── emotion/             # система эмоций и звуковые драйверы
 ├── notifiers/           # уведомления (voice.py, telegram.py; публичный API `send()`)
-├── skills/              # плагины-скиллы (time_ru.py, weather_ru.py, ...)
 ├── sensors/             # датчики (vision/presence.py, ...)
 ├── proactive/           # проактивные подсказки (policy.py, engine.py)
-├── working_tts.py       # адаптер Piper-TTS
+├── analysis/            # генератор подсказок и агрегаты привычек
+├── memory/              # SQLite-память событий, сессий и подсказок
+├── skills/              # плагины-скиллы (time_ru.py, weather_ru.py, ...)
+├── models/              # модели Vosk и Piper
+├── JarvisM5/            # прошивка для M5Stack Core ESP32
 ├── requirements.txt
-├── memory/              # SQLite-память событий и подсказок
 └── README.md
 ```
 
