@@ -41,7 +41,6 @@ MANIFEST_PATH = Path(__file__).resolve().parent.parent / "audio" / "sfx_manifest
 # соответствие некоторых эмоций ключам в манифесте
 _ALIASES: Dict[Emotion, str] = {
     Emotion.NEUTRAL: "IDLE",
-    Emotion.SLEEPY: "SLEEP",
 }
 
 @dataclass
