@@ -28,8 +28,11 @@ class EmotionManager:
         pass
 
     def _on_external_change(self, event: core_events.Event) -> None:
-        """Обновить локальное состояние при внешней смене эмоции."""
-        self._state.set(event.attrs["emotion"])
+        """Обновить локальное состояние при смене эмоции и вывести её в лог."""
+        new = event.attrs["emotion"]
+        prev = self._state.current
+        log.info("emotion %s → %s", prev.value, new.value)
+        self._state.set(new)
 
     def _on_query_started(self, event: core_events.Event) -> None:
         """При начале обработки пользовательского запроса — эмоция THINKING."""
