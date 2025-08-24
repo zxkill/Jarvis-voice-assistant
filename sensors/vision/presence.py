@@ -54,6 +54,12 @@ FOV_DEG_Y = 62.0
 SMOOTH_ALPHA = 0.0
 POSE_MIN_VIS = 0.80
 
+# Ограничения для fallback-детекции головы по Pose. Позволяют
+# отсеивать ложные срабатывания на предметы (например, стул).
+HEAD_MIN_AREA = 0.01
+HEAD_MIN_ASPECT = 0.5
+HEAD_MAX_ASPECT = 2.0
+
 # Таймауты и параметры поиска лица при его отсутствии
 NO_FACE_BORED_SEC = 5.0
 NO_FACE_SCAN_SEC = 8.0
@@ -267,29 +273,31 @@ class PresenceDetector:
                     if pose:
                         vis = POSE_MIN_VIS
                         lms = pose.landmark
-                        xs = [
-                            lms[mp.solutions.pose.PoseLandmark.LEFT_EAR].x,
-                            lms[mp.solutions.pose.PoseLandmark.RIGHT_EAR].x,
-                            lms[mp.solutions.pose.PoseLandmark.NOSE].x,
-                        ]
-                        ys = [
-                            lms[mp.solutions.pose.PoseLandmark.LEFT_EAR].y,
-                            lms[mp.solutions.pose.PoseLandmark.RIGHT_EAR].y,
-                            lms[mp.solutions.pose.PoseLandmark.NOSE].y,
-                        ]
-                        visibilities = [
-                            lms[mp.solutions.pose.PoseLandmark.LEFT_EAR].visibility,
-                            lms[mp.solutions.pose.PoseLandmark.RIGHT_EAR].visibility,
-                            lms[mp.solutions.pose.PoseLandmark.NOSE].visibility,
-                        ]
-                        xs_vis = [x for x, v in zip(xs, visibilities) if v > vis]
-                        ys_vis = [y for y, v in zip(ys, visibilities) if v > vis]
-                        if len(xs_vis) >= 2:
-                            x_rel = min(xs_vis)
-                            y_rel = min(ys_vis)
-                            w_rel = max(xs_vis) - x_rel
-                            h_rel = max(ys_vis) - y_rel
-                            kind = "head"
+                        nose = lms[mp.solutions.pose.PoseLandmark.NOSE]
+                        left = lms[mp.solutions.pose.PoseLandmark.LEFT_EAR]
+                        right = lms[mp.solutions.pose.PoseLandmark.RIGHT_EAR]
+                        if nose.visibility > vis and (
+                            left.visibility > vis or right.visibility > vis
+                        ):
+                            xs = [nose.x]
+                            ys = [nose.y]
+                            if left.visibility > vis:
+                                xs.append(left.x)
+                                ys.append(left.y)
+                            if right.visibility > vis:
+                                xs.append(right.x)
+                                ys.append(right.y)
+                            x_rel = min(xs)
+                            y_rel = min(ys)
+                            w_rel = max(xs) - x_rel
+                            h_rel = max(ys) - y_rel
+                            area = w_rel * h_rel
+                            aspect = w_rel / h_rel if h_rel else 0.0
+                            if (
+                                area > HEAD_MIN_AREA
+                                and HEAD_MIN_ASPECT < aspect < HEAD_MAX_ASPECT
+                            ):
+                                kind = "head"
 
                 detected = kind is not None
 
