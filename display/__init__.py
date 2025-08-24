@@ -17,7 +17,19 @@ from typing import Literal, Optional, Union
 
 @dataclass
 class DisplayItem:
-    kind:    Literal["text", "icon", "image", "rect", "line", "weather", "time", "emotion", "track", "frame"]
+    kind:    Literal[
+        "text",
+        "icon",
+        "image",
+        "rect",
+        "line",
+        "weather",
+        "time",
+        "emotion",
+        "track",
+        "frame",
+        "mode",
+    ]
     payload: Optional[Union[str, bytes, dict]]  # None → удалить элемент из кеша
 
 
@@ -51,7 +63,7 @@ class DisplayDriver(ABC):
 _driver: DisplayDriver | None = None
 
 
-def init_driver(name: str = "windows", driver: DisplayDriver | None = None) -> None:
+def init_driver(name: str = "windows", driver: DisplayDriver | None = None) -> DisplayDriver:
     """
     Инициализировать драйвер дисплея:
       - name: имя модуля внутри display.drivers (без .py)
@@ -61,10 +73,10 @@ def init_driver(name: str = "windows", driver: DisplayDriver | None = None) -> N
     """
     global _driver
     if _driver is not None:
-        return
+        return _driver
     if driver is not None:
         _driver = driver
-        return
+        return _driver
 
     # динамический импорт по имени
     module_path = f"display.drivers.{name}"
@@ -78,6 +90,7 @@ def init_driver(name: str = "windows", driver: DisplayDriver | None = None) -> N
         _driver.process_events()
     except Exception:
         pass
+    return _driver
 
 def get_driver() -> DisplayDriver:
     """Получить текущий драйвер, инициализировать по умолчанию, если не задан."""

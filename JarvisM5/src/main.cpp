@@ -14,6 +14,7 @@ LGFX_Sprite frame(&M5.Display);
 #include "EnergyManager.h"
 #include "ServoController.h"
 #include "SerialClient.h"
+#include "UIMode.h"
 
 #include <esp_wifi.h>
 #include <Ticker.h>
@@ -23,6 +24,20 @@ FaceWrapper   face(320, 240, 60);
 Emotion       emotion(face);
 ServoController servo;
 SerialClient ser(overlay, emotion, servo);
+
+static UIMode uiMode = UIMode::Sleep;
+
+void setUIMode(UIMode m) {
+  uiMode = m;
+  if (m == UIMode::Sleep) {
+    M5.Display.sleep();
+  } else {
+    M5.Display.wakeup();
+    M5.Display.setBrightness(20);
+  }
+}
+
+UIMode getUIMode() { return uiMode; }
 
 Menu          menu;
 EnergyManager energy;
@@ -41,10 +56,8 @@ void setup() {
   Logger::enableAutoPresent(false);
 
   frame.fillScreen(TFT_BLACK);
-  // Если у тебя есть DisplayAdapter с объектом gfx — оставь как было.
-  // Иначе можно нарисовать логотип через M5.Display напрямую.
-  // M5.Display.pushImage((320 - 128) / 2, 10, 128, 32, logo_data);
   frame.pushSprite(0, 0);
+  setUIMode(UIMode::Sleep);
 
   // 2) Логгер
   Logger::init();
@@ -90,22 +103,45 @@ void setup() {
 
 void loop() {
   ButtonsManager::instance().update();
-
   ser.loop();
 
-  overlay.tick();
+  switch (getUIMode()) {
+    case UIMode::Sleep:
+      energy.update(false);
+      return;
 
-  if (menu.isVisible()) return;
+    case UIMode::Boot: {
+      static uint32_t last = 0;
+      static uint16_t prog = 0;
+      if (millis() - last > 100) {
+        last = millis();
+        prog = (prog + 4) % 281;
+        frame.fillScreen(TFT_BLACK);
+        frame.pushImage((320 - 128) / 2, 40, 128, 32, logo_data);
+        frame.drawRect(20, 200, 280, 10, TFT_WHITE);
+        frame.fillRect(20, 200, prog, 10, TFT_WHITE);
+        frame.pushSprite(0, 0);
+      }
+      energy.update(true);
+      return;
+    }
 
-  static uint32_t last = 0;
-  if (millis() - last > 100) {
-    last = millis();
-    frame.fillScreen(0);
-    face.update();
-    overlay.draw(frame);
-    Logger::renderTo(frame);
-    frame.pushSprite(0, 0);
+    case UIMode::Run:
+      overlay.tick();
+      if (menu.isVisible()) {
+        energy.update(true);
+        return;
+      }
+      static uint32_t last = 0;
+      if (millis() - last > 100) {
+        last = millis();
+        frame.fillScreen(0);
+        face.update();
+        overlay.draw(frame);
+        Logger::renderTo(frame);
+        frame.pushSprite(0, 0);
+      }
+      energy.update(true);
+      return;
   }
-
-  energy.update(true);
 }

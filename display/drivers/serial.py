@@ -49,10 +49,12 @@ class SerialDisplayDriver(DisplayDriver):
         port: Optional[str] = None,
         baud: int = 921_600,
         reconnect_delay: float = 2.0,
+        startup_timeout: float = 5.0,
     ) -> None:
         self.port = port or _find_default_port()
         self.baud = baud
         self.reconnect_delay = reconnect_delay
+        self.startup_timeout = startup_timeout
         self._last: dict[str, DisplayItem] = {}
         self._inq: Queue[tuple[str, str]] = Queue()
         self._running = threading.Event()
@@ -60,7 +62,9 @@ class SerialDisplayDriver(DisplayDriver):
         self.ser: Optional[serial.Serial] = None
         self._cache_sent = False
         self._last_handshake = 0.0
-        self._open_serial()  # blocks until port is opened
+        self.ready = threading.Event()
+        self.disconnected = threading.Event()
+        self._open_serial(timeout=self.startup_timeout)  # blocks until port is opened
         atexit.register(self.close)
 
     def draw(self, item: DisplayItem) -> None:
@@ -107,9 +111,11 @@ class SerialDisplayDriver(DisplayDriver):
             log.info("Handshake received; pushing cache")
             self._cache_sent = False
             self._push_cache()
+            self.ready.set()
 
-    def _open_serial(self) -> None:
+    def _open_serial(self, timeout: float | None = None) -> None:
         """Open serial connection and start reader thread."""
+        start = time.monotonic()
         while self._running.is_set():
             try:
                 self.ser = serial.Serial(
@@ -121,8 +127,12 @@ class SerialDisplayDriver(DisplayDriver):
                 )
                 log.info("Serial opened %s @%d", self.port, self.baud)
                 self._cache_sent = False
+                self.ready.clear()
+                self.disconnected.clear()
                 break
             except serial.SerialException as exc:
+                if timeout is not None and time.monotonic() - start >= timeout:
+                    raise RuntimeError(f"Serial open failed: {exc}")
                 log.warning(
                     "Serial open failed: %s. Retrying in %.1fs", exc, self.reconnect_delay
                 )
@@ -131,6 +141,10 @@ class SerialDisplayDriver(DisplayDriver):
         # Spawn reader thread
         self._rx = threading.Thread(target=self._reader, daemon=True)
         self._rx.start()
+
+    def wait_ready(self, timeout: float = 5.0) -> bool:
+        """Wait until board sends initial handshake."""
+        return self.ready.wait(timeout)
 
     def _send_item(self, item: DisplayItem) -> None:
         """Serialize item as JSON and write to serial port."""
@@ -188,6 +202,7 @@ class SerialDisplayDriver(DisplayDriver):
                 if not self._running.is_set():
                     break
                 log.warning("Connection lost: %s", exc)
+                self.disconnected.set()
                 try:
                     if self.ser and self.ser.is_open:
                         self.ser.close()

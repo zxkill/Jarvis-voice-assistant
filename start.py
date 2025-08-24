@@ -22,7 +22,7 @@ import vosk
 import yaml
 from pvrecorder import PvRecorder
 
-from display import init_driver
+from display import DisplayItem, init_driver
 from emotion.manager import EmotionManager
 from emotion.drivers import EmotionDisplayDriver  # вывод эмоций на экран
 from emotion.sounds import EmotionSoundDriver  # звуковое сопровождение
@@ -92,12 +92,39 @@ async def main(_conn=None):
     owner_id = str(app_cfg.user.telegram_user_id)
     setup_presence_session(owner_id)
 
-    init_driver('serial')          # канал вывода информации
+    try:
+        driver = init_driver('serial')          # канал вывода информации
+        if not driver.wait_ready():
+            await asyncio.to_thread(
+                working_tts.working_tts,
+                "Дисплей не подключен", preset="neutral"
+            )
+            return
+    except Exception:
+        await asyncio.to_thread(
+            working_tts.working_tts,
+            "Дисплей не подключен", preset="neutral"
+        )
+        return
+
+    driver.draw(DisplayItem(kind="mode", payload="boot"))
     EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
     EmotionSoundDriver()           # звуки при смене эмоций
     load_all()                     # начальная загрузка плагинов
     EmotionManager().start()        # запускаем управление эмоциями
     start_skill_reloader()         # включаем горячую перезагрузку
+
+    async def _monitor_display() -> None:
+        while True:
+            await asyncio.sleep(1)
+            if driver.disconnected.is_set():
+                await asyncio.to_thread(
+                    working_tts.working_tts,
+                    "Дисплей был отключен, завершаю работу", preset="neutral"
+                )
+                sys.exit(0)
+
+    asyncio.create_task(_monitor_display())
 
     # --- Инициализация детектора присутствия ---------------------------
     # Если в конфигурации включено распознавание присутствия, создаём
@@ -133,6 +160,7 @@ async def main(_conn=None):
         "Джарвис запущен и готов к работе",
         preset="neutral",
     )
+    driver.draw(DisplayItem(kind="mode", payload="run"))
 
     asyncio.create_task(gui_loop())
 

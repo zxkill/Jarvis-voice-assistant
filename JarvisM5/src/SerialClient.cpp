@@ -1,4 +1,5 @@
 #include "SerialClient.h"
+#include "UIMode.h"
 
 void SerialClient::begin(uint32_t baud) {
   Serial.begin(baud);
@@ -15,6 +16,10 @@ void SerialClient::loop() {
   if (millis() - lastHello_ > 2000) {
     sendEvent("hello", "ping");
     lastHello_ = millis();
+  }
+
+  if (!Serial.dtr()) {
+    ESP.restart();
   }
 
   while (Serial.available() > 0) {
@@ -64,6 +69,15 @@ void SerialClient::handleJson_(const String& s) {
   else if (!strcmp(kind, "emotion")) {
     const char* t = d["payload"] | "";
     em_.handle(t);
+  }
+  else if (!strcmp(kind, "mode")) {
+    const char* t = d["payload"] | "";
+    if (!strcmp(t, "boot"))
+      setUIMode(UIMode::Boot);
+    else if (!strcmp(t, "run"))
+      setUIMode(UIMode::Run);
+    else
+      setUIMode(UIMode::Sleep);
   }
   else if (strcmp(kind, "track") == 0) {
     const JsonObject p = d["payload"].as<JsonObject>();
