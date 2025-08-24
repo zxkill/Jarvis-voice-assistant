@@ -18,6 +18,11 @@ set_metric("telegram.failures", 0)
 
 # Загружаем конфигурацию при импорте модуля.
 _cfg = load_config()
+log.info(
+    "config loaded: telegram_user_id=%s token_present=%s",
+    _cfg.user.telegram_user_id,
+    bool(_cfg.telegram.token),
+)
 
 
 class TelegramNotifier:

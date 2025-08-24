@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from configparser import ConfigParser
 import os
 
+from core.logging_json import configure_logging
+
 try:
     from dotenv import load_dotenv  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover - fallback for missing dependency
@@ -28,6 +30,8 @@ except ModuleNotFoundError:  # pragma: no cover - fallback for missing dependenc
             pass
 
 load_dotenv()
+
+log = configure_logging("core.config")
 
 
 class ConfigError(Exception):
@@ -95,10 +99,14 @@ def _env_or_cfg(
 
     value = os.getenv(env_name)
     if value:
+        log.info("%s=%s (env)", env_name, value)
         return value
     if cfg.has_option(section, option) and cfg.get(section, option).strip():
-        return cfg.get(section, option)
+        cfg_value = cfg.get(section, option)
+        log.info("%s=%s (cfg)", option, cfg_value)
+        return cfg_value
     if default is not None:
+        log.info("%s=%s (default)", option, default)
         return default
     raise ConfigError(
         f"Missing option '{option}' in section '{section}' or env '{env_name}'"
