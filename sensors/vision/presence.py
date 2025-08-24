@@ -54,13 +54,13 @@ ROTATE_CODE = cv2.ROTATE_90_COUNTERCLOCKWISE if cv2 else 0  # pragma: no cover
 FOV_DEG_X = 38.0
 FOV_DEG_Y = 62.0
 SMOOTH_ALPHA = 0.0
-POSE_MIN_VIS = 0.80
+POSE_MIN_VIS = 0.60
 
 # Ограничения для fallback-детекции головы по Pose. Позволяют
 # отсеивать ложные срабатывания на предметы (например, стул).
-HEAD_MIN_AREA = 0.01
-HEAD_MIN_ASPECT = 0.5
-HEAD_MAX_ASPECT = 2.0
+HEAD_MIN_AREA = 0.005
+HEAD_MIN_ASPECT = 0.3
+HEAD_MAX_ASPECT = 3.0
 
 # Минимальная длительность непрерывного обнаружения,
 # после которой считаем, что в кадре действительно есть человек
@@ -76,6 +76,10 @@ SCAN_V_PERIOD_SEC = 10.0
 SCAN_TOTAL_SEC = 30.0
 SLEEP_MIN_SEC = 120.0
 SLEEP_MAX_SEC = 1200.0
+
+# Параметры отображения эмоций при обнаружении лица
+FACE_ABSENT_HAPPY_SEC = 300.0
+HAPPY_SHOW_SEC = 5.0
 
 
 @dataclass
@@ -242,7 +246,7 @@ class PresenceDetector:
         dt_target = self.frame_interval_ms / 1000.0
         yaw_prev = pitch_prev = 0.0
         fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if ROTATE_90 else (FOV_DEG_X, FOV_DEG_Y)
-        last_face_ts = time.monotonic()
+        last_face_ts = time.monotonic() - FACE_ABSENT_HAPPY_SEC
         stable_start: float | None = None
         mode = "idle"  # idle → scanning → sleeping → tracking
         scan_start = 0.0
@@ -250,6 +254,8 @@ class PresenceDetector:
         scan_dir = 1
         scan_hold_until = 0.0
         sleep_until = 0.0
+        face_emotion = Emotion.NEUTRAL
+        happy_until = 0.0
         global _last_sent_ms  # pylint: disable=global-statement
 
         try:
@@ -319,15 +325,13 @@ class PresenceDetector:
                                 or visible(left_ear)
                                 or visible(right_ear)
                             )
-                            cond_left = (
-                                visible(left_ear)
-                                and visible(left_sh)
-                                and left_ear.y < left_sh.y
+                            cond_left = visible(left_ear) and (
+                                (visible(left_sh) and left_ear.y < left_sh.y)
+                                or visible(left_eye)
                             )
-                            cond_right = (
-                                visible(right_ear)
-                                and visible(right_sh)
-                                and right_ear.y < right_sh.y
+                            cond_right = visible(right_ear) and (
+                                (visible(right_sh) and right_ear.y < right_sh.y)
+                                or visible(right_eye)
                             )
 
                             if (
@@ -338,6 +342,10 @@ class PresenceDetector:
                                 kind = "head"
 
                 now = time.monotonic()
+                if face_emotion == Emotion.HAPPY and now >= happy_until:
+                    publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.NEUTRAL}))
+                    face_emotion = Emotion.NEUTRAL
+
                 raw_detected = kind is not None
                 if raw_detected:
                     if stable_start is None:
@@ -366,9 +374,17 @@ class PresenceDetector:
                     dx_px = float(cx - fw / 2.0)
                     dy_px = float(cy - fh / 2.0)
                     _update_track(True, dx_px, dy_px, dt_ms)
+                    dt_since_face = now - last_face_ts
                     last_face_ts = now
+                    if dt_since_face > FACE_ABSENT_HAPPY_SEC:
+                        desired = Emotion.HAPPY
+                        happy_until = now + HAPPY_SHOW_SEC
+                    else:
+                        desired = Emotion.NEUTRAL
+                    if face_emotion != desired:
+                        publish(Event(kind="emotion_changed", attrs={"emotion": desired}))
+                        face_emotion = desired
                     if mode != "tracking":
-                        publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.HAPPY}))
                         mode = "tracking"
 
                     if DEBUG_GUI:
