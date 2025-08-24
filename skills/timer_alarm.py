@@ -21,6 +21,7 @@ import datetime as _dt
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Dict, Tuple
 
 from display import get_driver, DisplayItem
@@ -54,6 +55,9 @@ _TIMERS: Dict[str, Tuple[threading.Timer, str, _dt.datetime]] = {}
 
 # Сработавшие, но ещё не подтверждённые таймеры: метка -> (тип, событие остановки)
 _ALERTS: Dict[str, Tuple[str, threading.Event]] = {}
+
+# Путь к пользовательскому звуку будильника/напоминания
+_ALARM_WAV = Path(__file__).resolve().parent.parent / "audio" / "sfx" / "alarm.wav"
 
 
 def _save_timer(label: str, typ: str, end: _dt.datetime) -> None:
@@ -156,25 +160,43 @@ def _to_int(tok: str) -> int | None:
 
 
 def _beep(freq: int = 880, duration: float = 0.2) -> None:
-    """Проигрывает короткий звуковой сигнал.
+    """Проигрывает звуковой сигнал.
 
-    ``numpy`` и ``sounddevice`` доступны не во всех средах
-    (например, в тестах на CI). Чтобы модуль можно было
-    импортировать без этих зависимостей, выполняем импорты
-    лениво и при ошибке просто выходим.
+    Если в ``audio/sfx/alarm.wav`` присутствует пользовательский WAV‑файл,
+    воспроизводим его. В противном случае генерируем короткий синусоидальный
+    сигнал для обратной совместимости.
+
+    ``numpy`` и ``sounddevice`` доступны не во всех средах (например, в тестах
+    на CI). Чтобы модуль можно было импортировать без этих зависимостей,
+    выполняем импорты лениво и при ошибке просто выходим.
     """
-    try:
+    try:  # зависимости могут отсутствовать
         import numpy as _np  # type: ignore
         import sounddevice as _sd  # type: ignore
     except Exception:
-        return  # если зависимостей нет — пропускаем воспроизведение
+        return
+
+    if _ALARM_WAV.exists():
+        try:
+            import wave
+
+            with wave.open(str(_ALARM_WAV), "rb") as wf:
+                sample_rate = wf.getframerate()
+                frames = wf.readframes(wf.getnframes())
+                data = _np.frombuffer(frames, dtype=_np.int16)
+                if wf.getnchannels() > 1:
+                    data = data.reshape(-1, wf.getnchannels())
+                _sd.play(data, sample_rate)
+                _sd.wait()
+                return
+        except Exception:
+            pass  # при ошибке откатываемся к генерации синусоиды
+
     sample_rate = 44100  # частота дискретизации
-    # формируем массив времени для синусоиды
     t = _np.linspace(0, duration, int(sample_rate * duration), False)
-    # генерируем синусоидальный сигнал нужной частоты
     tone = _np.sin(freq * 2 * _np.pi * t) * 0.2
-    _sd.play(tone, sample_rate)  # воспроизводим
-    _sd.wait()  # ждём завершения
+    _sd.play(tone, sample_rate)
+    _sd.wait()
 
 
 def _speak(msg: str) -> None:
