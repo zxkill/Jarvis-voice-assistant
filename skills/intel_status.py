@@ -6,10 +6,18 @@ import json
 from datetime import datetime
 from typing import List
 
-from context.long_term import add_daily_event
+from context.long_term import add_daily_event, get_events_by_label
 from memory.db import get_connection
 
-PATTERNS = ["что ты запомнил", "запомни:"]
+PATTERNS = [
+    "что ты запомнил",
+    "запомни:",
+    "запомни",
+    "события дня",
+    "что запомнил",
+]
+
+LABEL = "note"
 
 
 def _format_ts(ts: int) -> str:
@@ -55,20 +63,23 @@ def _get_last_context_items(limit: int = 3) -> List[str]:
 
 def handle(text: str) -> str:
     low = text.lower().strip()
-    if low.startswith("запомни:"):
-        note = text.split(":", 1)[1].strip()
+    if low.startswith("запомни"):
+        note = text[len("запомни") :].lstrip(" :")
         if not note:
             return "Что запомнить?"
-        add_daily_event(note, ["note"])
+        add_daily_event(note, [LABEL])
         return "Запомнил"
-    if "что ты запомнил" in low:
+    if any(p in low for p in ["что ты запомнил", "что запомнил", "события дня"]):
         presence = _get_last_presence()
         items = _get_last_context_items()
+        events = get_events_by_label(LABEL)
         parts = []
         if presence:
             parts.append(f"последняя сессия присутствия: {presence}")
         if items:
             parts.append("последние записи: " + "; ".join(items))
+        if events:
+            parts.append("события дня: " + "; ".join(events))
         if not parts:
             return "Пока ничего не запомнил"
         return ". ".join(parts)
