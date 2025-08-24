@@ -279,27 +279,50 @@ class PresenceDetector:
                         vis = POSE_MIN_VIS
                         lms = pose.landmark
                         nose = lms[mp.solutions.pose.PoseLandmark.NOSE]
-                        left = lms[mp.solutions.pose.PoseLandmark.LEFT_EAR]
-                        right = lms[mp.solutions.pose.PoseLandmark.RIGHT_EAR]
-                        if nose.visibility > vis and (
-                            left.visibility > vis or right.visibility > vis
-                        ):
-                            xs = [nose.x]
-                            ys = [nose.y]
-                            if left.visibility > vis:
-                                xs.append(left.x)
-                                ys.append(left.y)
-                            if right.visibility > vis:
-                                xs.append(right.x)
-                                ys.append(right.y)
+                        left_ear = lms[mp.solutions.pose.PoseLandmark.LEFT_EAR]
+                        right_ear = lms[mp.solutions.pose.PoseLandmark.RIGHT_EAR]
+                        left_eye = lms[mp.solutions.pose.PoseLandmark.LEFT_EYE]
+                        right_eye = lms[mp.solutions.pose.PoseLandmark.RIGHT_EYE]
+                        left_sh = lms[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
+                        right_sh = lms[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
+
+                        visible = lambda lm: lm.visibility > vis
+                        landmarks = [
+                            lm
+                            for lm in (nose, left_ear, right_ear, left_eye, right_eye)
+                            if visible(lm)
+                        ]
+
+                        if len(landmarks) >= 2:
+                            xs = [lm.x for lm in landmarks]
+                            ys = [lm.y for lm in landmarks]
                             x_rel = min(xs)
                             y_rel = min(ys)
                             w_rel = max(xs) - x_rel
                             h_rel = max(ys) - y_rel
                             area = w_rel * h_rel
                             aspect = w_rel / h_rel if h_rel else 0.0
+
+                            cond_face = visible(nose) and (
+                                visible(left_eye)
+                                or visible(right_eye)
+                                or visible(left_ear)
+                                or visible(right_ear)
+                            )
+                            cond_left = (
+                                visible(left_ear)
+                                and visible(left_sh)
+                                and left_ear.y < left_sh.y
+                            )
+                            cond_right = (
+                                visible(right_ear)
+                                and visible(right_sh)
+                                and right_ear.y < right_sh.y
+                            )
+
                             if (
-                                area > HEAD_MIN_AREA
+                                (cond_face or cond_left or cond_right)
+                                and area > HEAD_MIN_AREA
                                 and HEAD_MIN_ASPECT < aspect < HEAD_MAX_ASPECT
                             ):
                                 kind = "head"
