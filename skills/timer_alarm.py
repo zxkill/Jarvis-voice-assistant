@@ -29,6 +29,9 @@ from emotion.state import Emotion
 from memory.db import get_connection
 from notifiers.telegram import send as _tg_send
 from core import stop as _stop_mgr
+from core.logging_json import configure_logging
+
+log = configure_logging("skills.timer_alarm")
 
 # ─────────────────────────────────────────────────────────────────────────────
 PATTERNS = [
@@ -208,9 +211,12 @@ def _speak(msg: str) -> None:
 def _fire(label: str, typ: str) -> None:
     """Логика срабатывания таймера/будильника/напоминания."""
 
+    log.info("timer fired: label=%s typ=%s", label, typ)
     _TIMERS.pop(label, None)  # объект ``Timer`` больше не нужен
+    present = _user_present()
+    log.info("user_present=%s", present)
 
-    if _user_present():
+    if present:
         # Пользователь рядом — озвучиваем и повторяем сигнал до остановки
         _beep()
         driver = get_driver()
@@ -230,6 +236,7 @@ def _fire(label: str, typ: str) -> None:
         else:
             kind = "Будильник" if typ == "alarm" else "Таймер"
             msg = f"{kind} {label} сработал"
+        log.info("sending telegram: %s", msg)
         _tg_send(msg)
         _remove_timer(label)
 
@@ -240,7 +247,9 @@ def _user_present() -> bool:
         row = conn.execute(
             "SELECT end_ts FROM presence_sessions ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        return row is not None and row["end_ts"] is None
+    present = row is not None and row["end_ts"] is None
+    log.info("presence check: row=%s present=%s", row, present)
+    return present
 
 
 def _alert_loop(stop_event: threading.Event) -> None:
