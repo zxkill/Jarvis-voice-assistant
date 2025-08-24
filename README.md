@@ -96,7 +96,7 @@ sudo apt install -y python3-pip portaudio19-dev libasound2-dev
 
 py -3.10 -m venv venv
 # 3. Python-библиотеки
-pip3 install -r requirements.txt
+pip3 install -r requirements.txt  # включает python-dotenv для чтения .env
 
 # 4. Копируем модель Piper
 mkdir -p piper && cp ru-RU-irina-medium.* piper/
@@ -112,6 +112,12 @@ nano config.ini
 
 # 6. Запуск
 python3 start.py
+```
+
+После установки зависимостей убедитесь, что всё работает, выполнив тесты:
+
+```bash
+pytest
 ```
 
 ## Параметры `config.ini`
