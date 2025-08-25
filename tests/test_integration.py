@@ -14,36 +14,38 @@ from emotion.drivers import EmotionDisplayDriver
 from emotion.state import Emotion
 
 
-def test_presence_update_generates_and_sends(monkeypatch, tmp_path):
+def test_no_stretch_when_user_absent(monkeypatch, tmp_path):
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
     sent = []
+
     def fake_send_tg(text):
         sent.append(("telegram", text))
+
     def fake_send_voice(text):
         sent.append(("voice", text))
 
-    monkeypatch.setitem(sys.modules, "notifiers.telegram", types.SimpleNamespace(send=fake_send_tg))
-    monkeypatch.setitem(sys.modules, "notifiers.voice", types.SimpleNamespace(send=fake_send_voice))
+    monkeypatch.setitem(
+        sys.modules, "notifiers.telegram", types.SimpleNamespace(send=fake_send_tg)
+    )
+    monkeypatch.setitem(
+        sys.modules, "notifiers.voice", types.SimpleNamespace(send=fake_send_voice)
+    )
 
     core_events._subscribers.clear()
+    # Восстанавливаем обработчик presence.update в модуле подсказок.
+    core_events.subscribe("presence.update", suggestions._on_presence)
     policy = Policy(PolicyConfig())
-    engine = ProactiveEngine(policy)
+    ProactiveEngine(policy)
 
     core_events.publish(Event(kind="presence.update", attrs={"present": False}))
 
     now = dt.datetime(2024, 1, 1, 12, 0)
     ids = suggestions.generate(now=now)
-    assert ids
-    suggestion_id = ids[0]
 
-    assert ("telegram", "разминка?") in sent
-    assert all(channel != "voice" for channel, _ in sent)
-
-    with db.get_connection() as conn:
-        row = conn.execute("SELECT processed FROM suggestions WHERE id=?", (suggestion_id,)).fetchone()
-        assert row["processed"] == 1
+    assert not ids
+    assert sent == []
 
 
 def test_voice_channel_also_notifies_telegram(monkeypatch, tmp_path):
@@ -66,10 +68,15 @@ def test_voice_channel_also_notifies_telegram(monkeypatch, tmp_path):
     )
 
     core_events._subscribers.clear()
+    core_events.subscribe("presence.update", suggestions._on_presence)
     policy = Policy(PolicyConfig())
     ProactiveEngine(policy)
+    core_events.publish(Event(kind="presence.update", attrs={"present": True}))
 
     now = dt.datetime(2024, 1, 1, 12, 0)
+    # Пользователь не уходил более часа.
+    suggestions._last_absent = now - dt.timedelta(hours=1, minutes=1)
+
     ids = suggestions.generate(now=now)
     suggestion_id = ids[0]
 
