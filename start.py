@@ -20,6 +20,7 @@ from typing import Any
 from display import DisplayItem, init_driver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
+from emotion import sounds
 
 # ────────────────────────── LOGGING ──────────────────────────────
 log = configure_logging("app")
@@ -171,12 +172,8 @@ async def main() -> None:
     kaldi = vosk.KaldiRecognizer(model, 16000)
     recorder = PvRecorder(device_index=mic_idx, frame_length=512)
 
-    # 3. Приветственное сообщение (синхронно, чтобы не потерялось)
-    await asyncio.to_thread(
-        working_tts.working_tts,
-        "Джарвис запущен и готов к работе",
-        preset="neutral",
-    )
+    # 3. Приветственный звук (синхронно, чтобы не потерялся)
+    await asyncio.to_thread(sounds.play_effect, "WAKE")
     driver.draw(DisplayItem(kind="mode", payload="run"))
 
     recorder.start()
