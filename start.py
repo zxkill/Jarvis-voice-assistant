@@ -133,6 +133,8 @@ async def main() -> None:
                 reconnected = await asyncio.to_thread(driver.wait_ready, 5.0)
                 if reconnected:
                     continue
+                while working_tts.is_playing:
+                    await asyncio.sleep(0.1)
                 await asyncio.to_thread(
                     working_tts.working_tts,
                     "Дисплей был отключен, завершаю работу",
