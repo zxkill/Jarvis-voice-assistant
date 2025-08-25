@@ -101,17 +101,21 @@ class SerialDisplayDriver(DisplayDriver):
     def on_event(self, kind: str, payload: str) -> None:
         """Handle events from M5Stack. Override as needed."""
         log.debug("Event received kind=%s payload=%s", kind, payload)
-        if kind == "hello" and payload == "ready":
-            now = time.monotonic()
-            # Ignore duplicate handshakes that arrive in quick succession
-            if now - self._last_handshake < 5:
-                log.debug("Duplicate handshake ignored")
-                return
-            self._last_handshake = now
-            log.info("Handshake received; pushing cache")
-            self._cache_sent = False
-            self._push_cache()
-            self.ready.set()
+        if kind == "hello":
+            if payload == "ready":
+                now = time.monotonic()
+                # Ignore duplicate handshakes that arrive in quick succession
+                if now - self._last_handshake < 5:
+                    log.debug("Duplicate handshake ignored")
+                else:
+                    self._last_handshake = now
+                    log.info("Handshake received; pushing cache")
+                    self._cache_sent = False
+                    self._push_cache()
+                    self.ready.set()
+            if payload in ("ready", "ping"):
+                self._send_json("hello", "pong")
+            return
 
     def _open_serial(self, timeout: float | None = None) -> None:
         """Open serial connection and start reader thread."""
@@ -146,17 +150,21 @@ class SerialDisplayDriver(DisplayDriver):
         """Wait until board sends initial handshake."""
         return self.ready.wait(timeout)
 
-    def _send_item(self, item: DisplayItem) -> None:
-        """Serialize item as JSON and write to serial port."""
+    def _send_json(self, kind: str, payload: str) -> None:
+        """Write an arbitrary JSON message to the serial port."""
         if not self.ser or not self.ser.is_open:
-            log.debug("Serial port not open, dropping frame kind=%s", item.kind)
+            log.debug("Serial port not open, dropping frame kind=%s", kind)
             return
-        msg = json.dumps({"kind": item.kind, "payload": item.payload})
+        msg = json.dumps({"kind": kind, "payload": payload})
         log.debug("SER→M5 %s", msg)
         try:
             self.ser.write(msg.encode() + b"\n")
         except serial.SerialException as exc:
             log.error("Write error: %s", exc)
+
+    def _send_item(self, item: DisplayItem) -> None:
+        """Serialize item as JSON and write to serial port."""
+        self._send_json(item.kind, item.payload)
 
     def _reader(self) -> None:
         """Background thread: read lines, parse JSON, enqueue events."""

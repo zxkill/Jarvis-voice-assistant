@@ -9,6 +9,7 @@ void SerialClient::begin(uint32_t baud) {
   // Первый "hello" — строго JSON:
   sendEvent("hello", "ready");
   lastHello_ = millis();
+  lastRecv_ = millis();  // стартовый таймер ожидания ответа хоста
 }
 
 void SerialClient::loop() {
@@ -18,7 +19,8 @@ void SerialClient::loop() {
     lastHello_ = millis();
   }
 
-  if (!Serial.dtr()) {
+  // Если долго нет ответов от хоста — перезапускаемся и ждём новое подключение
+  if (millis() - lastRecv_ > 5000) {
     ESP.restart();
   }
 
@@ -86,6 +88,9 @@ void SerialClient::handleJson_(const String& s) {
     uint32_t dt = p["dt_ms"] | 0;
     servo_.updateFromError(dx, dy, dt);
     Logger::log(LogLevel::DEBUG, "[SER] track: dx=%.1f dy=%.1f dt=%u", dx, dy, (unsigned)dt);
+  }
+  else if (!strcmp(kind, "hello")) {
+    // keep-alive от хоста, ничего делать не нужно
   }
   else {
     Logger::log(LogLevel::WARN, "[SER] Unknown kind '%s'", kind);
