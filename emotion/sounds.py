@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover
 
 
 MANIFEST_PATH = Path(__file__).resolve().parent.parent / "audio" / "sfx_manifest.yaml"
+log = configure_logging("emotion.sound")
 
 
 # соответствие некоторых эмоций ключам в манифесте
@@ -83,6 +84,23 @@ def _read_wav(path: str) -> tuple[np.ndarray, int]:
         data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
         data /= 32768.0  # нормализуем в диапазон [-1;1]
         return data, wf.getframerate()
+
+
+def play_effect(name: str) -> None:
+    """Воспроизводит одиночный эффект по ключу из манифеста."""
+    if sd is None:
+        return  # звук недоступен
+    effects = _load_manifest()
+    effect = effects.get(str(name).upper())
+    if not effect or not effect.files:
+        return
+    file = random.choice(effect.files)
+    try:
+        data, rate = _read_wav(file)
+        volume = 10 ** (effect.gain / 20)
+        sd.play(data * volume, rate, blocking=False)
+    except Exception:  # pragma: no cover
+        log.exception("sound playback failed")
 
 
 class EmotionSoundDriver:
