@@ -30,6 +30,8 @@ static UIMode uiMode = UIMode::Sleep;
 void setUIMode(UIMode m) {
   uiMode = m;
   if (m == UIMode::Sleep) {
+    // Ensure the backlight is fully off while waiting for the host
+    M5.Display.setBrightness(0);
     M5.Display.sleep();
   } else {
     M5.Display.wakeup();
@@ -50,7 +52,8 @@ void setup() {
   auto cfg = M5.config();
   cfg.clear_display = true;
   M5.begin(cfg);
-  M5.Display.setBrightness(20);
+  // Start with backlight off until the host tells us otherwise
+  M5.Display.setBrightness(0);
   frame.setColorDepth(8);
   frame.createSprite(320, 240);
   Logger::enableAutoPresent(false);
