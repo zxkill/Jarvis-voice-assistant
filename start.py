@@ -162,7 +162,6 @@ async def main() -> None:
     model = vosk.Model('models/model_small')
     kaldi = vosk.KaldiRecognizer(model, 16000)
     recorder = PvRecorder(device_index=mic_idx, frame_length=512)
-    recorder.start()
 
     # 3. Приветственное сообщение (синхронно, чтобы не потерялось)
     await asyncio.to_thread(
@@ -172,6 +171,7 @@ async def main() -> None:
     )
     driver.draw(DisplayItem(kind="mode", payload="run"))
 
+    recorder.start()
     asyncio.create_task(gui_loop())
 
     log.info("Говорите команды, начиная с 'джарвис'")
