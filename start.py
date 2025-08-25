@@ -128,9 +128,15 @@ async def main() -> None:
         while True:
             await asyncio.sleep(1)
             if driver.disconnected.is_set():
+                log.warning("Display disconnected, waiting for reconnection")
+                # Даем M5 время на перезапуск и повторное рукопожатие
+                reconnected = await asyncio.to_thread(driver.wait_ready, 5.0)
+                if reconnected:
+                    continue
                 await asyncio.to_thread(
                     working_tts.working_tts,
-                    "Дисплей был отключен, завершаю работу", preset="neutral"
+                    "Дисплей был отключен, завершаю работу",
+                    preset="neutral",
                 )
                 sys.exit(0)
 
