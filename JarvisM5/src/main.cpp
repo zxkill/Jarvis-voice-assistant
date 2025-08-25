@@ -26,14 +26,21 @@ ServoController servo;
 SerialClient ser(overlay, emotion, servo);
 
 static UIMode uiMode = UIMode::Sleep;
+static bool  loggerReady = false;
 
 void setUIMode(UIMode m) {
   uiMode = m;
   if (m == UIMode::Sleep) {
-    // Ensure the backlight is fully off while waiting for the host
+    Logger::enableScreenLogging(false);
     M5.Display.setBrightness(0);
     M5.Display.sleep();
   } else {
+    if (!loggerReady) {
+      Logger::init();
+      Logger::enableAutoPresent(false);
+      loggerReady = true;
+    }
+    Logger::enableScreenLogging(true);
     M5.Display.wakeup();
     M5.Display.setBrightness(20);
   }
@@ -56,15 +63,7 @@ void setup() {
   M5.Display.setBrightness(0);
   frame.setColorDepth(8);
   frame.createSprite(320, 240);
-  Logger::enableAutoPresent(false);
-
-  frame.fillScreen(TFT_BLACK);
-  frame.pushSprite(0, 0);
   setUIMode(UIMode::Sleep);
-
-  // 2) Логгер
-  Logger::init();
-  Logger::enableScreenLogging(true);
   Logger::log(LogLevel::INFO, "=== Device booting ===");
 
   // 3) Серво
@@ -115,14 +114,11 @@ void loop() {
 
     case UIMode::Boot: {
       static uint32_t last = 0;
-      static uint16_t prog = 0;
       if (millis() - last > 100) {
         last = millis();
-        prog = (prog + 4) % 281;
         frame.fillScreen(TFT_BLACK);
         frame.pushImage((320 - 128) / 2, 40, 128, 32, logo_data);
-        frame.drawRect(20, 200, 280, 10, TFT_WHITE);
-        frame.fillRect(20, 200, prog, 10, TFT_WHITE);
+        Logger::renderTo(frame);
         frame.pushSprite(0, 0);
       }
       energy.update(true);
