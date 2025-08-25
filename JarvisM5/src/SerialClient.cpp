@@ -1,4 +1,5 @@
 #include "SerialClient.h"
+#include "UIMode.h"
 
 void SerialClient::begin(uint32_t baud) {
   Serial.begin(baud);
@@ -8,6 +9,7 @@ void SerialClient::begin(uint32_t baud) {
   // Первый "hello" — строго JSON:
   sendEvent("hello", "ready");
   lastHello_ = millis();
+  lastRecv_ = millis();  // стартовый таймер ожидания ответа хоста
 }
 
 void SerialClient::loop() {
@@ -15,6 +17,11 @@ void SerialClient::loop() {
   if (millis() - lastHello_ > 2000) {
     sendEvent("hello", "ping");
     lastHello_ = millis();
+  }
+
+  // Если долго нет ответов от хоста — перезапускаемся и ждём новое подключение
+  if (millis() - lastRecv_ > 5000) {
+    ESP.restart();
   }
 
   while (Serial.available() > 0) {
@@ -65,6 +72,15 @@ void SerialClient::handleJson_(const String& s) {
     const char* t = d["payload"] | "";
     em_.handle(t);
   }
+  else if (!strcmp(kind, "mode")) {
+    const char* t = d["payload"] | "";
+    if (!strcmp(t, "boot"))
+      setUIMode(UIMode::Boot);
+    else if (!strcmp(t, "run"))
+      setUIMode(UIMode::Run);
+    else
+      setUIMode(UIMode::Sleep);
+  }
   else if (strcmp(kind, "track") == 0) {
     const JsonObject p = d["payload"].as<JsonObject>();
     float dx = p["dx_px"] | 0.0f;
@@ -72,6 +88,9 @@ void SerialClient::handleJson_(const String& s) {
     uint32_t dt = p["dt_ms"] | 0;
     servo_.updateFromError(dx, dy, dt);
     Logger::log(LogLevel::DEBUG, "[SER] track: dx=%.1f dy=%.1f dt=%u", dx, dy, (unsigned)dt);
+  }
+  else if (!strcmp(kind, "hello")) {
+    // keep-alive от хоста, ничего делать не нужно
   }
   else {
     Logger::log(LogLevel::WARN, "[SER] Unknown kind '%s'", kind);

@@ -14,6 +14,7 @@ LGFX_Sprite frame(&M5.Display);
 #include "EnergyManager.h"
 #include "ServoController.h"
 #include "SerialClient.h"
+#include "UIMode.h"
 
 #include <esp_wifi.h>
 #include <Ticker.h>
@@ -23,6 +24,29 @@ FaceWrapper   face(320, 240, 60);
 Emotion       emotion(face);
 ServoController servo;
 SerialClient ser(overlay, emotion, servo);
+
+static UIMode uiMode = UIMode::Sleep;
+static bool  loggerReady = false;
+
+void setUIMode(UIMode m) {
+  uiMode = m;
+  if (m == UIMode::Sleep) {
+    Logger::enableScreenLogging(false);
+    M5.Display.setBrightness(0);
+    M5.Display.sleep();
+  } else {
+    if (!loggerReady) {
+      Logger::init();
+      Logger::enableAutoPresent(false);
+      loggerReady = true;
+    }
+    Logger::enableScreenLogging(true);
+    M5.Display.wakeup();
+    M5.Display.setBrightness(20);
+  }
+}
+
+UIMode getUIMode() { return uiMode; }
 
 Menu          menu;
 EnergyManager energy;
@@ -35,20 +59,11 @@ void setup() {
   auto cfg = M5.config();
   cfg.clear_display = true;
   M5.begin(cfg);
-  M5.Display.setBrightness(20);
+  // Start with backlight off until the host tells us otherwise
+  M5.Display.setBrightness(0);
   frame.setColorDepth(8);
   frame.createSprite(320, 240);
-  Logger::enableAutoPresent(false);
-
-  frame.fillScreen(TFT_BLACK);
-  // Если у тебя есть DisplayAdapter с объектом gfx — оставь как было.
-  // Иначе можно нарисовать логотип через M5.Display напрямую.
-  // M5.Display.pushImage((320 - 128) / 2, 10, 128, 32, logo_data);
-  frame.pushSprite(0, 0);
-
-  // 2) Логгер
-  Logger::init();
-  Logger::enableScreenLogging(true);
+  setUIMode(UIMode::Sleep);
   Logger::log(LogLevel::INFO, "=== Device booting ===");
 
   // 3) Серво
@@ -90,22 +105,41 @@ void setup() {
 
 void loop() {
   ButtonsManager::instance().update();
-
   ser.loop();
 
-  overlay.tick();
+  switch (getUIMode()) {
+    case UIMode::Sleep:
+      return;
 
-  if (menu.isVisible()) return;
+    case UIMode::Boot: {
+      static uint32_t last = 0;
+      if (millis() - last > 100) {
+        last = millis();
+        frame.fillScreen(TFT_BLACK);
+        frame.pushImage((320 - 128) / 2, 40, 128, 32, logo_data);
+        Logger::renderTo(frame);
+        frame.pushSprite(0, 0);
+      }
+      energy.update(true);
+      return;
+    }
 
-  static uint32_t last = 0;
-  if (millis() - last > 100) {
-    last = millis();
-    frame.fillScreen(0);
-    face.update();
-    overlay.draw(frame);
-    Logger::renderTo(frame);
-    frame.pushSprite(0, 0);
+    case UIMode::Run:
+      overlay.tick();
+      if (menu.isVisible()) {
+        energy.update(true);
+        return;
+      }
+      static uint32_t last = 0;
+      if (millis() - last > 100) {
+        last = millis();
+        frame.fillScreen(0);
+        face.update();
+        overlay.draw(frame);
+        Logger::renderTo(frame);
+        frame.pushSprite(0, 0);
+      }
+      energy.update(true);
+      return;
   }
-
-  energy.update(true);
 }
