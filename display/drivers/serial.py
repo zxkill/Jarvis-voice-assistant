@@ -102,18 +102,21 @@ class SerialDisplayDriver(DisplayDriver):
         """Handle events from M5Stack. Override as needed."""
         log.debug("Event received kind=%s payload=%s", kind, payload)
         if kind == "hello":
-            if payload == "ready":
-                now = time.monotonic()
-                # Ignore duplicate handshakes that arrive in quick succession
-                if now - self._last_handshake < 5:
-                    log.debug("Duplicate handshake ignored")
-                else:
-                    self._last_handshake = now
-                    log.info("Handshake received; pushing cache")
-                    self._cache_sent = False
-                    self._push_cache()
-                    self.ready.set()
             if payload in ("ready", "ping"):
+                now = time.monotonic()
+                # Treat the first ping as a handshake if we missed the initial
+                # "ready" message (e.g. Jarvis started after the board booted).
+                if not self.ready.is_set() or payload == "ready":
+                    # Ignore duplicate handshakes that arrive in quick
+                    # succession, but allow a later "ready" to refresh cache.
+                    if now - self._last_handshake < 5 and self.ready.is_set():
+                        log.debug("Duplicate handshake ignored")
+                    else:
+                        self._last_handshake = now
+                        log.info("Handshake received; pushing cache")
+                        self._cache_sent = False
+                        self._push_cache()
+                        self.ready.set()
                 self._send_json("hello", "pong")
             return
 

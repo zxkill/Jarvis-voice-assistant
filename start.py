@@ -72,6 +72,27 @@ signal.signal(signal.SIGTERM, _shutdown)
 async def main(_conn=None):
     """Инициализация и основной цикл ассистента."""
 
+    # 0. Проверяем подключение дисплея как можно раньше, чтобы
+    # ошибки отображались ещё до загрузки тяжёлых подсистем.
+    try:
+        driver = init_driver('serial')
+        if not driver.wait_ready():
+            await asyncio.to_thread(
+                working_tts.working_tts,
+                "Дисплей не подключен", preset="neutral"
+            )
+            return
+    except Exception:
+        await asyncio.to_thread(
+            working_tts.working_tts,
+            "Дисплей не подключен", preset="neutral"
+        )
+        return
+
+    driver.draw(DisplayItem(kind="mode", payload="boot"))
+    EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
+    EmotionSoundDriver()           # звуки при смене эмоций
+
     # 1. Конфигурация и загрузка скиллов
     command_processing.VA_CMD_LIST = yaml.safe_load(
         open('commands.yaml', 'rt', encoding='utf-8')
@@ -92,24 +113,6 @@ async def main(_conn=None):
     owner_id = str(app_cfg.user.telegram_user_id)
     setup_presence_session(owner_id)
 
-    try:
-        driver = init_driver('serial')          # канал вывода информации
-        if not driver.wait_ready():
-            await asyncio.to_thread(
-                working_tts.working_tts,
-                "Дисплей не подключен", preset="neutral"
-            )
-            return
-    except Exception:
-        await asyncio.to_thread(
-            working_tts.working_tts,
-            "Дисплей не подключен", preset="neutral"
-        )
-        return
-
-    driver.draw(DisplayItem(kind="mode", payload="boot"))
-    EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
-    EmotionSoundDriver()           # звуки при смене эмоций
     load_all()                     # начальная загрузка плагинов
     EmotionManager().start()        # запускаем управление эмоциями
     start_skill_reloader()         # включаем горячую перезагрузку
