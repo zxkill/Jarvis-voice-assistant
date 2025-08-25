@@ -7,7 +7,6 @@ class EnergyManager {
 public:
     void begin() {
         lastActivity_ = millis();
-        M5.Display.setBrightness(20);
         screenDimmed_ = false;
     }
 

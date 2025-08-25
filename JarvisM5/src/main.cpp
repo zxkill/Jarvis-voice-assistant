@@ -109,7 +109,6 @@ void loop() {
 
   switch (getUIMode()) {
     case UIMode::Sleep:
-      energy.update(false);
       return;
 
     case UIMode::Boot: {
