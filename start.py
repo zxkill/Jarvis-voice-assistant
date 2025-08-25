@@ -15,48 +15,20 @@ import json
 import signal
 import sys
 import threading
-from multiprocessing import Pipe, Process
-from typing import Any, List
-
-import vosk
-import yaml
-from pvrecorder import PvRecorder
+from typing import Any
 
 from display import DisplayItem, init_driver
-from emotion.manager import EmotionManager
-from emotion.drivers import EmotionDisplayDriver  # вывод эмоций на экран
-from emotion.sounds import EmotionSoundDriver  # звуковое сопровождение
-from jarvis_skills import load_all, start_skill_reloader
-from core.config import load_config
-from core.events import Event, publish
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
-from sensors.vision import PresenceDetector
-from proactive.policy import Policy, PolicyConfig
-from proactive.engine import ProactiveEngine
-from memory.event_logger import setup_event_logging
-import working_tts  # модуль синтеза речи
-from core.nlp import normalize
-from app import command_processing
-from app.command_processing import contains_stop, extract_cmd, is_stop_cmd, va_respond
-from app.presence_session import setup_presence_session
-from app.gui import gui_loop
-from app.scheduler import start_background_tasks
 
 # ────────────────────────── LOGGING ──────────────────────────────
 log = configure_logging("app")
 
-# ────────────────────────── STATE ────────────────────────────────
-child_processes: List[Process] = []  # дочерние процессы (если будут)
-
 # ────────────────────────── SIGNALS ──────────────────────────────
 
 def _shutdown(signum: int, frame: Any):
-    """Корректное завершение по Ctrl‑C/SIGTERM.""" 
+    """Корректное завершение по Ctrl‑C/SIGTERM."""
     log.info("Получен сигнал %s, завершаюсь…", signum)
-    for p in child_processes:
-        if p.is_alive():
-            p.terminate()
     try:
         loop = asyncio.get_running_loop()
         loop.stop()
@@ -69,42 +41,77 @@ signal.signal(signal.SIGTERM, _shutdown)
 
 # ────────────────────────── MAIN LOOP ────────────────────────────
 
-async def main(_conn=None):
+async def main() -> None:
     """Инициализация и основной цикл ассистента."""
 
     # 0. Проверяем подключение дисплея как можно раньше, чтобы
     # ошибки отображались ещё до загрузки тяжёлых подсистем.
     try:
-        driver = init_driver('serial')
+        driver = init_driver("serial")
         if not driver.wait_ready():
+            from working_tts import working_tts
+
             await asyncio.to_thread(
-                working_tts.working_tts,
-                "Дисплей не подключен", preset="neutral"
+                working_tts,
+                "Дисплей не подключен",
+                preset="neutral",
             )
             return
     except Exception:
+        from working_tts import working_tts
+
         await asyncio.to_thread(
-            working_tts.working_tts,
-            "Дисплей не подключен", preset="neutral"
+            working_tts,
+            "Дисплей не подключен",
+            preset="neutral",
         )
         return
 
     driver.draw(DisplayItem(kind="mode", payload="boot"))
+
+    from emotion.manager import EmotionManager
+    from emotion.drivers import EmotionDisplayDriver
+    from emotion.sounds import EmotionSoundDriver
+    from jarvis_skills import load_all, start_skill_reloader
+    from core.config import load_config
+    from core.events import Event, publish
+    from sensors.vision import PresenceDetector
+    from proactive.policy import Policy, PolicyConfig
+    from proactive.engine import ProactiveEngine
+    from memory.event_logger import setup_event_logging
+    import working_tts
+    from core.nlp import normalize
+    from app import command_processing
+    from app.command_processing import (
+        contains_stop,
+        extract_cmd,
+        is_stop_cmd,
+        va_respond,
+    )
+    from app.presence_session import setup_presence_session
+    from app.gui import gui_loop
+    from app.scheduler import start_background_tasks
+    import vosk
+    import yaml
+    from pvrecorder import PvRecorder
+
     EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
     EmotionSoundDriver()           # звуки при смене эмоций
 
     # 1. Конфигурация и загрузка скиллов
     command_processing.VA_CMD_LIST = yaml.safe_load(
-        open('commands.yaml', 'rt', encoding='utf-8')
+        open("commands.yaml", "rt", encoding="utf-8")
     )
     command_processing.VA_CMD_LIST = {
         k: [normalize(v) for v in variants]
         for k, variants in command_processing.VA_CMD_LIST.items()
     }
     cfg = configparser.ConfigParser()
-    cfg.read('config.ini', encoding='utf-8')
-    mic_idx = cfg.getint('MIC', 'microphone_index')
-    suggestion_interval = cfg.getint('SUGGESTIONS', 'interval_sec', fallback=60)
+    cfg.read("config.ini", encoding="utf-8")
+    mic_idx = cfg.getint("MIC", "microphone_index")
+    suggestion_interval = cfg.getint(
+        "SUGGESTIONS", "interval_sec", fallback=60
+    )
     # Загружаем структуру конфигурации (``core.config``) для передачи
     # параметров в отдельные подсистемы.
     app_cfg = load_config()
@@ -214,33 +221,6 @@ async def main(_conn=None):
                     stop_mgr.trigger()
                     kaldi.Reset()
 
-# ────────────────────────── ENTRYPOINT ───────────────────────────
 
-def start_jarvis(conn):
-    asyncio.run(main(conn))
-
-if __name__ == '__main__':
-    # ─── Демонстрация новых утилит из пакета core ────────────────
-    from core.config import load_config
-    from core.events import Event, publish, subscribe
-    from core.logging_json import configure_logging
-
-    # Загружаем конфигурацию из config.ini
-    cfg = load_config()
-    # Настраиваем JSON‑логирование для компонента "start"
-    demo_log = configure_logging("start")
-
-    def _on_demo(event: Event) -> None:
-        """Простейший обработчик события для демонстрации pub/sub."""
-
-        demo_log.info("received event", extra={"event": event.kind, "attrs": event.attrs})
-
-    # Подписываемся на события типа "demo" и публикуем тестовое событие
-    subscribe("demo", _on_demo)
-    publish(Event("demo", {"user": cfg.user.name}))
-
-    # Запускаем основное приложение в отдельном процессе
-    parent_conn, _ = Pipe()
-    p = Process(target=start_jarvis, args=(parent_conn,), daemon=True)
-    p.start()
-    p.join()
+if __name__ == "__main__":
+    asyncio.run(main())
