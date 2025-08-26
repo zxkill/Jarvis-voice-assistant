@@ -40,12 +40,10 @@ def _shutdown(signum: int, frame: Any):
     if tg_task is not None:
         log.info("Останавливаю Telegram-слушатель")
         tg_task.cancel()
-    try:
-        loop = asyncio.get_running_loop()
-        loop.stop()
-    except RuntimeError:
-        pass
-    sys.exit(0)
+    # Вместо принудительного sys.exit() генерируем KeyboardInterrupt,
+    # чтобы дать ``asyncio.run`` корректно остановить цикл событий и
+    # закрыть все задействованные ресурсы.
+    raise KeyboardInterrupt
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
@@ -254,4 +252,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Пользователь запросил остановку (Ctrl+C). Дополнительный
+        # лог помогает отследить завершение приложения.
+        log.info("Ассистент завершил работу по запросу пользователя")
