@@ -20,6 +20,7 @@ from core.events import Event, publish, subscribe
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from emotion.state import Emotion
+from core.quiet import is_quiet_now
 
 # Попытка импортировать драйвер дисплея для отправки команд поворота.
 # Сам драйвер инициализируется позже (в start.py через ``init_driver``),
@@ -459,11 +460,21 @@ class PresenceDetector:
                         mode = "idle"
 
                     dt_absent = now - last_face_ts
-                    if mode == "sleeping":
+                    if is_quiet_now():
+                        # Ночью не сканируем комнату и не издаём звуков.
+                        if mode != "sleeping":
+                            publish(
+                                Event(kind="emotion_changed", attrs={"emotion": Emotion.SLEEPY})
+                            )
+                            mode = "sleeping"
+                            sleep_until = now  # готовность сразу проснуться
+                    elif mode == "sleeping":
                         # Во сне камера неподвижна. Просыпаемся, когда истёк
                         # таймер ``sleep_until``.
                         if now >= sleep_until:
-                            publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
+                            publish(
+                                Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS})
+                            )
                             mode = "scanning"
                             scan_start = now
                             scan_pos = 0.0
@@ -473,7 +484,9 @@ class PresenceDetector:
                     elif dt_absent > NO_FACE_SCAN_SEC and mode != "scanning":
                         # Лица нет уже достаточно долго → начинаем медленный обзор комнаты
                         log.info("no face for %.1fs → start slow scan", dt_absent)
-                        publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
+                        publish(
+                            Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS})
+                        )
                         mode = "scanning"
                         scan_start = now
                         scan_pos = 0.0

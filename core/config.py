@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from configparser import ConfigParser
+from datetime import time
 import os
 
 from core.logging_json import configure_logging
@@ -71,6 +72,14 @@ class PresenceConfig:
 
 
 @dataclass
+class QuietConfig:
+    """Интервал «тихих часов», когда Jarvis не должен шуметь."""
+
+    start: time
+    end: time
+
+
+@dataclass
 class AppConfig:
     """Сводная конфигурация приложения."""
 
@@ -78,6 +87,7 @@ class AppConfig:
     intel: IntelConfig
     telegram: TelegramConfig
     presence: PresenceConfig
+    quiet: QuietConfig
 
 
 def _require(cfg: ConfigParser, section: str, option: str) -> str:
@@ -111,6 +121,20 @@ def _env_or_cfg(
     raise ConfigError(
         f"Missing option '{option}' in section '{section}' or env '{env_name}'"
     )
+
+
+def _parse_time(value: str, default: time) -> time:
+    """Разбор строки ``HH:MM`` в объект :class:`time`.
+
+    При ошибке возвращается значение по умолчанию *default*.
+    """
+
+    try:
+        h, m = (int(x) for x in value.split(":", 1))
+        return time(h % 24, m % 60)
+    except Exception:  # pragma: no cover - защита от некорректных данных
+        log.warning("bad time '%s', using default %s", value, default)
+        return default
 
 
 def load_config(path: str = "config.ini") -> AppConfig:
@@ -152,4 +176,15 @@ def load_config(path: str = "config.ini") -> AppConfig:
         frame_interval_ms=parser.getint("PRESENCE", "frame_interval_ms"),
     )
 
-    return AppConfig(user=user, intel=intel, telegram=telegram, presence=presence)
+    quiet = QuietConfig(
+        start=_parse_time(parser.get("QUIET", "start", fallback="23:00"), time(23, 0)),
+        end=_parse_time(parser.get("QUIET", "end", fallback="08:00"), time(8, 0)),
+    )
+
+    return AppConfig(
+        user=user,
+        intel=intel,
+        telegram=telegram,
+        presence=presence,
+        quiet=quiet,
+    )

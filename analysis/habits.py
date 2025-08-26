@@ -99,7 +99,17 @@ async def schedule_daily_aggregation() -> None:
         duration = time.monotonic() - start
         prev = load_last_aggregate()
         _save_daily_aggregate(date.today(), counts)
-        log.info("daily aggregation", extra={"ctx": {"duration_sec": round(duration, 3)}})
+        log.info(
+            "daily aggregation",
+            extra={"ctx": {"duration_sec": round(duration, 3)}}
+        )
+        # После сохранения пересчитываем «тихие часы» исходя из новых данных
+        try:  # импорт внутри функции, чтобы избежать циклической зависимости
+            from core import quiet
+
+            quiet.update_quiet_hours_from_counts(counts)
+        except Exception as exc:  # pragma: no cover - диагностика ошибок
+            log.exception("update quiet hours failed", extra={"ctx": {"err": str(exc)}})
         if prev:
             for hour, (p, c) in enumerate(zip(prev, counts)):
                 diff = c - p

@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - optional dependency
 from emotion.state import Emotion
 from core.logging_json import configure_logging
 from core import events as core_events
+from core.quiet import is_quiet_now
 
 try:  # ``sounddevice`` может быть недоступен в среде тестирования
     import sounddevice as sd  # type: ignore
@@ -96,8 +97,9 @@ def _read_wav(path: str) -> tuple[np.ndarray, int]:
 
 def play_effect(name: str | Emotion) -> None:
     """Воспроизводит одиночный эффект по ключу из манифеста."""
-    if sd is None:
-        return  # звук недоступен
+    if sd is None or is_quiet_now():
+        log.debug("skip effect %s: quiet=%s", name, is_quiet_now())
+        return  # звук недоступен или тихие часы
     effects = _load_manifest()
     # разрешаем использовать псевдонимы; сначала преобразуем имя в верхний
     # регистр, затем пытаемся найти его в словаре ``_ALIASES``
@@ -157,7 +159,8 @@ class EmotionSoundDriver:
 
     def _play_effect(self, name: str) -> None:
         """Воспроизводит эффект из заранее загруженного словаря."""
-        if sd is None:
+        if sd is None or is_quiet_now():
+            self.log.debug("skip %s: quiet=%s", name, is_quiet_now())
             return
         effect = self._effects.get(name)
         if not effect or not effect.files:
