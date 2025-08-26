@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 import time
 import wave
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Any
@@ -65,6 +66,7 @@ class _Effect:
     files: List[str]
     gain: float
     cooldown: float
+    repeat: int = 1  # сколько раз подряд воспроизводить эффект
     last_played: float = 0.0
     lock: Lock = field(default_factory=Lock, repr=False)
 
@@ -84,11 +86,12 @@ def _load_manifest() -> Dict[str, _Effect]:
         files = [str(f) for f in cfg.get("files", [])]
         gain = float(cfg.get("gain_db", 0))
         cooldown = float(cfg.get("cooldown_ms", 0)) / 1000.0
+        repeat = int(cfg.get("repeat", 1))
         if isinstance(name, bool):
             key = "YES" if name else "NO"
         else:
             key = str(name).upper()
-        effects[key] = _Effect(files=files, gain=gain, cooldown=cooldown)
+        effects[key] = _Effect(files=files, gain=gain, cooldown=cooldown, repeat=repeat)
     return effects
 
 
@@ -115,6 +118,24 @@ def _read_wav(path: str) -> tuple[np.ndarray, int]:
         data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
         data /= 32768.0  # нормализуем в диапазон [-1;1]
         return data, wf.getframerate()
+
+
+def _caller_name() -> str:
+    """Определяет модуль и функцию, инициировавшие запуск звука.
+
+    Используем стек вызовов, чтобы в логах было видно, кто именно
+    запросил воспроизведение эффекта.  Это упрощает отладку и поиск
+    лишних обращений к звуковому драйверу.
+    """
+
+    frame = inspect.currentframe()
+    # Поднимаемся на два уровня вверх: _caller_name -> вызывающая функция
+    for _ in range(2):
+        if frame is None or frame.f_back is None:
+            return "<unknown>"
+        frame = frame.f_back
+    module = frame.f_globals.get("__name__", "<unknown>")
+    return f"{module}.{frame.f_code.co_name}"
 
 
 def play_effect(name: str | Emotion) -> None:
@@ -145,13 +166,18 @@ def play_effect(name: str | Emotion) -> None:
             return
 
         file = random.choice(effect.files)
+        caller = _caller_name()
+        log.info("play %s (%s) by %s x%d", key, file, caller, effect.repeat)
         try:
             data, rate = _read_wav(file)
             volume = 10 ** (effect.gain / 20)
-            log.debug("start %s → %s", key, file)
-            sd.play(data * volume, rate, blocking=False)
             effect.last_played = now
-            log.debug("end %s", key)
+            # Повторяем звук ``repeat`` раз.  При значении >1 блокируемся до
+            # окончания каждого проигрывания, чтобы они не накладывались.
+            for i in range(effect.repeat):
+                log.debug("start %s → %s [%d/%d]", key, file, i + 1, effect.repeat)
+                sd.play(data * volume, rate, blocking=effect.repeat > 1)
+                log.debug("end %s [%d/%d]", key, i + 1, effect.repeat)
         except Exception:  # pragma: no cover
             log.exception("sound playback failed")
 
@@ -210,13 +236,17 @@ class EmotionSoundDriver:
                 self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
                 return
             file = random.choice(effect.files)
-            self.log.debug("start %s → %s", name, file)
+            caller = _caller_name()
+            self.log.info("play %s (%s) by %s x%d", name, file, caller, effect.repeat)
             try:
                 data, rate = _read_wav(file)
                 volume = 10 ** (effect.gain / 20)
-                sd.play(data * volume, rate, blocking=False)
                 effect.last_played = now
-                self.log.debug("end %s", name)
+                # Аналогичный цикл повторения для методов драйвера.
+                for i in range(effect.repeat):
+                    self.log.debug("start %s → %s [%d/%d]", name, file, i + 1, effect.repeat)
+                    sd.play(data * volume, rate, blocking=effect.repeat > 1)
+                    self.log.debug("end %s [%d/%d]", name, i + 1, effect.repeat)
             except Exception:  # pragma: no cover
                 self.log.exception("sound playback failed")
 
