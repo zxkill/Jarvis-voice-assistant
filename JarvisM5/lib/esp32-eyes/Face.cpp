@@ -20,12 +20,13 @@ You should have received a copy of the GNU Affero General Public License along w
 Face::Face(uint16_t screenWidth, uint16_t screenHeight, uint16_t eyeSize) 
 	: LeftEye(*this), RightEye(*this), Blink(*this), Look(*this), Behavior(*this), Expression(*this) {
 
-	Width = screenWidth;
-	Height = screenHeight;
-	EyeSize = eyeSize;
+        Width = screenWidth;
+        Height = screenHeight;
+        EyeSize = eyeSize;
+        EyeInterDistance = eyeSize / 15;
 
-	CenterX = Width / 2;
-	CenterY = Height / 2;
+        CenterX = Width / 2;
+        CenterY = Height / 2;
 
 	LeftEye.IsMirrored = true;
 

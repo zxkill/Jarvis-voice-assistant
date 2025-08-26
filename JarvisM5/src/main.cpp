@@ -20,7 +20,7 @@ LGFX_Sprite frame(&M5.Display);
 #include <Ticker.h>
 
 Overlay       overlay;
-FaceWrapper   face(320, 240, 60);
+FaceWrapper   face(320, 240, 90);
 Emotion       emotion(face);
 ServoController servo;
 SerialClient ser(overlay, emotion, servo);

@@ -50,8 +50,20 @@ void Eye::Update() {
 }
 
 void Eye::Draw() {
-	Update();
-	EyeDrawer::Draw(CenterX, CenterY, FinalConfig);
+        Update();
+        constexpr float kEyeScale = 1.5f;
+        EyeConfig scaled = *FinalConfig;
+        scaled.OffsetX = static_cast<int16_t>(scaled.OffsetX * kEyeScale);
+        scaled.OffsetY = static_cast<int16_t>(scaled.OffsetY * kEyeScale);
+        scaled.Height  = static_cast<int16_t>(scaled.Height  * kEyeScale);
+        scaled.Width   = static_cast<int16_t>(scaled.Width   * kEyeScale);
+        scaled.Radius_Top = static_cast<int16_t>(scaled.Radius_Top * kEyeScale);
+        scaled.Radius_Bottom = static_cast<int16_t>(scaled.Radius_Bottom * kEyeScale);
+        scaled.Inverse_Radius_Top = static_cast<int16_t>(scaled.Inverse_Radius_Top * kEyeScale);
+        scaled.Inverse_Radius_Bottom = static_cast<int16_t>(scaled.Inverse_Radius_Bottom * kEyeScale);
+        scaled.Inverse_Offset_Top = static_cast<int16_t>(scaled.Inverse_Offset_Top * kEyeScale);
+        scaled.Inverse_Offset_Bottom = static_cast<int16_t>(scaled.Inverse_Offset_Bottom * kEyeScale);
+        EyeDrawer::Draw(CenterX, CenterY, &scaled);
 }
 
 void Eye::ApplyPreset(const EyeConfig config) {
