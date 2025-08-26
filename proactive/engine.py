@@ -69,6 +69,9 @@ class ProactiveEngine:
         suggestion_id = int(event.attrs.get("suggestion_id", 0))
         period = event.attrs.get("period")
         weekday = event.attrs.get("weekday")
+        # Берём флаг присутствия из события, чтобы корректно
+        # обработать подсказки, сгенерированные в режиме ``absent``.
+        present = bool(event.attrs.get("present", self.present))
         # Логируем сам факт получения подсказки и её причину.
         self.log.info(
             "suggestion received",
@@ -78,16 +81,23 @@ class ProactiveEngine:
                     "reason_code": reason_code,
                     "period": period,
                     "weekday": weekday,
+                    "present": present,
                 }
             },
         )
         # Запрашиваем у политики канал доставки, учитывающий присутствие
         # и ограничения (тихое время, троттлинг и т.п.).
-        channel = self.policy.choose_channel(self.present)
+        channel = self.policy.choose_channel(present)
         # Логируем принятое политикой решение.
         self.log.info(
             "policy result",
-            extra={"ctx": {"suggestion_id": suggestion_id, "channel": channel}},
+            extra={
+                "ctx": {
+                    "suggestion_id": suggestion_id,
+                    "channel": channel,
+                    "present": present,
+                }
+            },
         )
         if channel is None:
             # Троттлинг запретил отправку — помечаем подсказку и выходим.
@@ -157,8 +167,8 @@ class ProactiveEngine:
         """Фоновый поток, генерирующий small-talk при длительном молчании."""
         while True:
             time.sleep(self.check_period_sec)
-            if not self.present:
-                continue
+            # Small-talk должен работать даже когда пользователя нет рядом:
+            # политика доставки самостоятельно выберет Telegram.
             now = time.time()
             if now - self._last_command_ts < self.idle_threshold_sec:
                 continue
@@ -174,6 +184,7 @@ class ProactiveEngine:
                 extra={
                     "ctx": {
                         "reason": "long_silence",
+                        "present": self.present,
                         "period": period,
                         "weekday": weekday,
                     }
@@ -185,6 +196,7 @@ class ProactiveEngine:
                     attrs={
                         "text": text,
                         "reason_code": "long_silence",
+                        "present": self.present,
                         "period": period,
                         "weekday": weekday,
                     },

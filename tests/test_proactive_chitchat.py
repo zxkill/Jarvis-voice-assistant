@@ -55,3 +55,13 @@ def test_smalltalk_interval(monkeypatch, tmp_path):
     time.sleep(2.5)
     assert len(events) >= 2
     assert len(sent) >= 2
+    # --- Пользователь ушёл: уведомление приходит в Telegram ---------
+    events.clear()
+    sent.clear()
+    engine.present = False
+    db.set_last_smalltalk_ts(0)
+    engine._last_command_ts = time.time() - engine.idle_threshold_sec - 0.1
+    time.sleep(1.5)
+    assert len(events) == 1
+    assert events[0].attrs["present"] is False
+    assert sent and all(ch == "telegram" for ch, _ in sent)
