@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import threading
 from typing import Any
 
 import requests
@@ -57,18 +58,25 @@ class _DummyResponse:
         return self._data
 
 
-def listen(*, max_iterations: int | None = None) -> None:
+def listen(
+    *,
+    max_iterations: int | None = None,
+    stop_event: threading.Event | None = None,
+) -> None:
     """Запуск бесконечного long polling цикла.
 
     Параметр ``max_iterations`` используется в тестах для ограничения
-    количества запросов к API.  В рабочем режиме параметр не указывается,
-    и функция будет работать бесконечно до остановки процесса.
+    количества запросов к API.  Дополнительно можно передать ``stop_event``,
+    чтобы корректно завершить цикл из другого потока.
     """
 
     offset = 0  # Указатель на последний обработанный update_id.
     iteration = 0
 
-    while max_iterations is None or iteration < max_iterations:
+    while (
+        (max_iterations is None or iteration < max_iterations)
+        and not (stop_event and stop_event.is_set())
+    ):
         iteration += 1
         try:
             # Выполняем запрос ``getUpdates`` с учётом текущего offset.
@@ -113,4 +121,24 @@ def listen(*, max_iterations: int | None = None) -> None:
             # повторить запрос после небольшой паузы.
             log.warning("telegram poll failed: %s", exc)
             time.sleep(1)
+
+
+async def launch(*, stop_event: threading.Event | None = None) -> None:
+    """Асинхронный запуск слушателя в отдельном потоке."""
+
+    log.info("telegram listener started")
+    try:
+        # ``listen`` блокирует поток, поэтому выполняем его в пуле потоков.
+        await asyncio.to_thread(listen, stop_event=stop_event)
+    except asyncio.CancelledError:
+        # Отмена задачи при завершении приложения.
+        log.info("telegram listener cancelled")
+        raise
+    except Exception:
+        # Неожиданная ошибка — логируем для последующей диагностики.
+        log.exception("telegram listener crashed")
+        raise
+    finally:
+        # Отмечаем завершение работы слушателя.
+        log.info("telegram listener stopped")
 
