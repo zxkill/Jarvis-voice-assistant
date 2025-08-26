@@ -2,6 +2,9 @@ import random
 import time
 from enum import Enum
 
+from core.logging_json import configure_logging
+from memory import db
+
 
 class Emotion(Enum):
     NEUTRAL = "Normal"
@@ -30,13 +33,58 @@ class EmotionState:
     Управляет текущим состоянием эмоции и логикой переходов.
     """
 
+    #: Максимально возможный уровень настроения
+    _MAX_MOOD = 100
+    #: Минимально возможный уровень настроения
+    _MIN_MOOD = -100
+
     def __init__(self):
+        # Текущая «видимая» эмоция персонажа
         self.current = Emotion.NEUTRAL
+        # Числовой уровень настроения [-100;100]. При запуске
+        # восстанавливаем его из постоянного хранилища, чтобы Jarvis
+        # помнил предыдущее состояние между перезапусками.
+        self.mood = db.get_mood_level()
+        # Инициализируем логгер для удобной отладки.
+        self._log = configure_logging("emotion.state")
 
     def set(self, emotion: Emotion):
         """Установить новую эмоцию и вернуть её."""
         self.current = emotion
         return self.current
+
+    # ------------------------------------------------------------------
+    # Методы работы с уровнем настроения
+    # ------------------------------------------------------------------
+
+    def _save_mood(self) -> None:
+        """Сохранить текущее значение настроения в БД."""
+        db.set_mood_level(self.mood)
+
+    def raise_mood(self, delta: int = 10, reason: str = "") -> int:
+        """Повысить настроение на ``delta`` и вернуть новое значение.
+
+        Значение всегда ограничивается диапазоном ``[-100; 100]``.
+        В лог выводится причина изменения, что помогает анализировать
+        реакцию ассистента на взаимодействие с пользователем.
+        """
+        prev = self.mood
+        self.mood = min(self._MAX_MOOD, self.mood + delta)
+        self._save_mood()
+        self._log.info("mood %s → %s (%s)", prev, self.mood, reason)
+        return self.mood
+
+    def drop_mood(self, delta: int = 10, reason: str = "") -> int:
+        """Понизить настроение на ``delta`` и вернуть новое значение.
+
+        Значение всегда ограничивается диапазоном ``[-100; 100]``.
+        Логирование аналогично ``raise_mood``.
+        """
+        prev = self.mood
+        self.mood = max(self._MIN_MOOD, self.mood - delta)
+        self._save_mood()
+        self._log.info("mood %s → %s (%s)", prev, self.mood, reason)
+        return self.mood
 
     def get_time_based_emotion(self, hour: int | None = None) -> Emotion:
         """Выбрать базовую эмоцию в зависимости от времени суток.
