@@ -40,6 +40,12 @@ MANIFEST_PATH = Path(__file__).resolve().parent.parent / "audio" / "sfx_manifest
 log = configure_logging("emotion.sound")
 
 
+# Глобальный кеш эффектов, позволяющий отслеживать время последнего
+# воспроизведения и тем самым исключать многократное повторение звука,
+# например, «вздоха».
+_EFFECTS: Dict[str, _Effect] | None = None
+
+
 # соответствие некоторых эмоций и строковых ключей записи в манифесте
 # Используем тип Any, чтобы словарь мог принимать как элементы Enum,
 # так и произвольные строковые события.  Это позволяет единообразно
@@ -84,6 +90,20 @@ def _load_manifest() -> Dict[str, _Effect]:
     return effects
 
 
+def _get_effects() -> Dict[str, _Effect]:
+    """Возвращает кеш эффектов, загружая манифест один раз.
+
+    Кешируем данные, чтобы между последовательными вызовами сохранялось
+    поле ``last_played`` и работал механизм ``cooldown``.  Это предотвращает
+    повтор звукового эффекта чаще разрешённого интервала.
+    """
+
+    global _EFFECTS
+    if _EFFECTS is None:
+        _EFFECTS = _load_manifest()
+    return _EFFECTS
+
+
 def _read_wav(path: str) -> tuple[np.ndarray, int]:
     """Возвращает аудиоданные и частоту дискретизации."""
     if np is None:  # pragma: no cover - зависит от внешней зависимости
@@ -97,10 +117,12 @@ def _read_wav(path: str) -> tuple[np.ndarray, int]:
 
 def play_effect(name: str | Emotion) -> None:
     """Воспроизводит одиночный эффект по ключу из манифеста."""
+
     if sd is None or is_quiet_now():
         log.debug("skip effect %s: quiet=%s", name, is_quiet_now())
         return  # звук недоступен или тихие часы
-    effects = _load_manifest()
+
+    effects = _get_effects()
     # разрешаем использовать псевдонимы; сначала преобразуем имя в верхний
     # регистр, затем пытаемся найти его в словаре ``_ALIASES``
     key_obj: Any = name
@@ -110,12 +132,20 @@ def play_effect(name: str | Emotion) -> None:
     effect = effects.get(str(key).upper())
     if not effect or not effect.files:
         return
+
+    now = time.monotonic()
+    if effect.last_played + effect.cooldown > now:
+        remaining = effect.last_played + effect.cooldown - now
+        log.debug("skip %s due to cooldown %.2fs", key, remaining)
+        return
+
     file = random.choice(effect.files)
     try:
         data, rate = _read_wav(file)
         volume = 10 ** (effect.gain / 20)
         log.debug("start %s → %s", key, file)
         sd.play(data * volume, rate, blocking=False)
+        effect.last_played = now
         log.debug("end %s", key)
     except Exception:  # pragma: no cover
         log.exception("sound playback failed")
