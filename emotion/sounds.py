@@ -13,7 +13,7 @@ import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Any
 
 try:  # ``numpy`` может быть недоступен в некоторых средах
     import numpy as np  # type: ignore
@@ -39,9 +39,17 @@ MANIFEST_PATH = Path(__file__).resolve().parent.parent / "audio" / "sfx_manifest
 log = configure_logging("emotion.sound")
 
 
-# соответствие некоторых эмоций ключам в манифесте
-_ALIASES: Dict[Emotion, str] = {
-    Emotion.NEUTRAL: "IDLE",
+# соответствие некоторых эмоций и строковых ключей записи в манифесте
+# Используем тип Any, чтобы словарь мог принимать как элементы Enum,
+# так и произвольные строковые события.  Это позволяет единообразно
+# обращаться к эффектам как из внутренних событий эмоций, так и при
+# явном вызове ``play_effect`` с именованным ключом.
+_ALIASES: Dict[Any, str] = {
+    Emotion.NEUTRAL: "IDLE",          # стандартный фон при простое
+    "IDLE_BREATH": "IDLE_BREATH",   # короткое дыхание во время простоя
+    "WAKE": "WAKE",                 # приветствие при запуске
+    "YAWN": "YAWN",                 # явный вызов зевка
+    "SIGH": "SIGH",                 # явный вызов вздоха
 }
 
 @dataclass
@@ -86,19 +94,27 @@ def _read_wav(path: str) -> tuple[np.ndarray, int]:
         return data, wf.getframerate()
 
 
-def play_effect(name: str) -> None:
+def play_effect(name: str | Emotion) -> None:
     """Воспроизводит одиночный эффект по ключу из манифеста."""
     if sd is None:
         return  # звук недоступен
     effects = _load_manifest()
-    effect = effects.get(str(name).upper())
+    # разрешаем использовать псевдонимы; сначала преобразуем имя в верхний
+    # регистр, затем пытаемся найти его в словаре ``_ALIASES``
+    key_obj: Any = name
+    if not isinstance(name, Emotion):
+        key_obj = str(name).upper()
+    key = _ALIASES.get(key_obj, key_obj if isinstance(key_obj, str) else key_obj.name)
+    effect = effects.get(str(key).upper())
     if not effect or not effect.files:
         return
     file = random.choice(effect.files)
     try:
         data, rate = _read_wav(file)
         volume = 10 ** (effect.gain / 20)
+        log.debug("start %s → %s", key, file)
         sd.play(data * volume, rate, blocking=False)
+        log.debug("end %s", key)
     except Exception:  # pragma: no cover
         log.exception("sound playback failed")
 
@@ -108,26 +124,61 @@ class EmotionSoundDriver:
 
     def __init__(self) -> None:
         self.log = configure_logging("emotion.sound")
+        # Предзагружаем манифест, чтобы иметь доступ к cooldown и спискам
+        # файлов без повторного чтения с диска
         self._effects = _load_manifest()
+        self._current: Emotion = Emotion.NEUTRAL
         core_events.subscribe("emotion_changed", self._on_emotion_changed)
+        # Фоновый поток воспроизводит короткие «дыхания» во время простоя.
+        # Поток демонический, чтобы не блокировать завершение приложения.
+        import threading
+
+        threading.Thread(target=self._idle_loop, daemon=True).start()
+
+    def _idle_loop(self) -> None:
+        """Фоновый цикл, периодически запускающий короткое дыхание."""
+        effect = self._effects.get("IDLE_BREATH")
+        if not effect:
+            return  # в манифесте нет описания — работать нечему
+        while True:
+            # Ждём случайную паузу, чтобы звуки не звучали по расписанию
+            delay = random.uniform(effect.cooldown, effect.cooldown * 2 or 1.0)
+            time.sleep(delay)
+            if self._current is Emotion.NEUTRAL:
+                self.play_idle_effect()
+
+    def _play_effect(self, name: str) -> None:
+        """Воспроизводит эффект из заранее загруженного словаря."""
+        if sd is None:
+            return
+        effect = self._effects.get(name)
+        if not effect or not effect.files:
+            return
+        now = time.monotonic()
+        if effect.last_played + effect.cooldown > now:
+            remaining = effect.last_played + effect.cooldown - now
+            self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
+            return
+        file = random.choice(effect.files)
+        self.log.debug("start %s → %s", name, file)
+        try:
+            data, rate = _read_wav(file)
+            volume = 10 ** (effect.gain / 20)
+            sd.play(data * volume, rate, blocking=False)
+            effect.last_played = now
+            self.log.debug("end %s", name)
+        except Exception:  # pragma: no cover
+            self.log.exception("sound playback failed")
+
+    def play_idle_effect(self) -> None:
+        """Явно воспроизводит короткое дыхание (используется в тестах)."""
+        self._play_effect("IDLE_BREATH")
 
     def _on_emotion_changed(self, event: core_events.Event) -> None:
         if sd is None:
             return  # звук недоступен
         sd.stop()  # оборвать звук предыдущей эмоции
         emotion: Emotion = event.attrs["emotion"]
+        self._current = emotion
         key = _ALIASES.get(emotion, emotion.name)
-        effect = self._effects.get(key)
-        if not effect or not effect.files:
-            return
-        now = time.monotonic()
-        if effect.last_played + effect.cooldown > now:
-            return
-        file = random.choice(effect.files)
-        try:
-            data, rate = _read_wav(file)
-            volume = 10 ** (effect.gain / 20)
-            sd.play(data * volume, rate, blocking=False)
-            effect.last_played = now
-        except Exception:  # pragma: no cover
-            self.log.exception("sound playback failed")
+        self._play_effect(key)
