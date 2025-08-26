@@ -12,9 +12,10 @@ import random
 import time
 import wave
 import inspect
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from threading import Lock
 
 try:  # ``numpy`` может быть недоступен в некоторых средах
@@ -61,6 +62,20 @@ _ALIASES: Dict[Any, str] = {
     "SIGH": "SIGH",                 # явный вызов вздоха
 }
 
+# Минимальный интервал для повторного воспроизведения "дыхания".
+# Значение в секундах, соответствует 15 минутам.  Даже если в YAML-файле
+# указан меньший ``cooldown``, мы принудительно увеличим его до этого
+# порога, чтобы избежать навязчивых повторов звука.
+MIN_IDLE_BREATH_COOLDOWN = 15 * 60
+
+# Временная метка последнего глобального воспроизведения "дыхания".
+# Используется, чтобы исключить повтор эффекта при наличии нескольких
+# экземпляров драйвера или прямых вызовов `play_effect("IDLE_BREATH")`.
+_idle_breath_last: float = 0.0
+# Общая блокировка позволяет атомарно проверять и обновлять значение
+# `_idle_breath_last` между потоками.
+_idle_breath_lock = Lock()
+
 @dataclass
 class _Effect:
     files: List[str]
@@ -92,6 +107,17 @@ def _load_manifest() -> Dict[str, _Effect]:
         else:
             key = str(name).upper()
         effects[key] = _Effect(files=files, gain=gain, cooldown=cooldown, repeat=repeat)
+    # Принудительно повышаем ``cooldown`` для дыхания, если он меньше
+    # минимального допустимого значения.  Это защищает от случайного
+    # указания слишком маленького интервала в конфигурации.
+    breath = effects.get("IDLE_BREATH")
+    if breath and breath.cooldown < MIN_IDLE_BREATH_COOLDOWN:
+        log.debug(
+            "increase IDLE_BREATH cooldown from %.1fs to %.1fs",
+            breath.cooldown,
+            MIN_IDLE_BREATH_COOLDOWN,
+        )
+        breath.cooldown = MIN_IDLE_BREATH_COOLDOWN
     return effects
 
 
@@ -156,12 +182,22 @@ def play_effect(name: str | Emotion) -> None:
     if not effect or not effect.files:
         return
 
-    # Блокируем обработку эффекта, чтобы несколько потоков не смогли
-    # одновременно обойти проверку cooldown и повторно проиграть звук.
-    with effect.lock:
+    # Для дыхания используем глобальную блокировку, чтобы разные части
+    # приложения не воспроизвели звук почти одновременно.
+    lock = _idle_breath_lock if key == "IDLE_BREATH" else effect.lock
+    with lock:
         now = time.monotonic()
-        if effect.last_played + effect.cooldown > now:
-            remaining = effect.last_played + effect.cooldown - now
+        if key == "IDLE_BREATH":
+            global _idle_breath_last
+            if _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN > now:
+                remaining = _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN - now
+                log.debug("skip %s due to global cooldown %.2fs", key, remaining)
+                return
+        cooldown = effect.cooldown
+        if key == "IDLE_BREATH":
+            cooldown = max(cooldown, MIN_IDLE_BREATH_COOLDOWN)
+        if effect.last_played + cooldown > now:
+            remaining = effect.last_played + cooldown - now
             log.debug("skip %s due to cooldown %.2fs", key, remaining)
             return
 
@@ -172,6 +208,8 @@ def play_effect(name: str | Emotion) -> None:
             data, rate = _read_wav(file)
             volume = 10 ** (effect.gain / 20)
             effect.last_played = now
+            if key == "IDLE_BREATH":
+                _idle_breath_last = now
             # Повторяем звук ``repeat`` раз.  При значении >1 блокируемся до
             # окончания каждого проигрывания, чтобы они не накладывались.
             for i in range(effect.repeat):
@@ -197,26 +235,49 @@ class EmotionSoundDriver:
         self._present: bool = False
         core_events.subscribe("emotion_changed", self._on_emotion_changed)
         core_events.subscribe("presence.update", self._on_presence_update)
-        # Фоновый поток воспроизводит короткие «дыхания» во время простоя.
-        # Поток демонический, чтобы не блокировать завершение приложения.
-        import threading
+        # Таймер, планирующий редкое воспроизведение "дыхания".  Он
+        # перезапускается при каждом изменении эмоции или флага присутствия,
+        # чтобы звук не звучал, пока пользователь рядом.
+        self._breath_timer: Optional[threading.Timer] = None
+        self._schedule_idle_breath()
 
-        threading.Thread(target=self._idle_loop, daemon=True).start()
+    def _schedule_idle_breath(self) -> None:
+        """Переустанавливает таймер фонового дыхания.
 
-    def _idle_loop(self) -> None:
-        """Фоновый цикл, периодически запускающий короткое дыхание."""
+        Звук планируется только при нейтральной эмоции и отсутствии
+        пользователя перед камерой.  При любых изменениях условия таймер
+        отменяется и запускается вновь, чтобы исключить лишние воспроизведения.
+        """
+
+        if self._breath_timer:
+            self._breath_timer.cancel()
+            self._breath_timer = None
+
+        if self._current is not Emotion.NEUTRAL or self._present:
+            self.log.debug(
+                "idle breath not scheduled: emotion=%s present=%s",
+                self._current,
+                self._present,
+            )
+            return
+
         effect = self._effects.get("IDLE_BREATH")
-        if not effect:
-            return  # в манифесте нет описания — работать нечему
-        while True:
-            # Ждём случайную паузу, чтобы звуки не звучали по расписанию
-            delay = random.uniform(effect.cooldown, effect.cooldown * 2 or 1.0)
-            time.sleep(delay)
-            # Воспроизводим «дыхание» только если никого нет в кадре и
-            # текущая эмоция нейтральна.  Иначе пользователю будет казаться,
-            # что ассистент вздыхает при виде собеседника.
-            if self._current is Emotion.NEUTRAL and not self._present:
-                self.play_idle_effect()
+        base = MIN_IDLE_BREATH_COOLDOWN
+        if effect:
+            base = max(effect.cooldown, MIN_IDLE_BREATH_COOLDOWN)
+        delay = random.uniform(base, base * 2)
+        self.log.debug("idle breath scheduled in %.1fs", delay)
+        self._breath_timer = threading.Timer(delay, self._on_idle_breath_timer)
+        self._breath_timer.daemon = True
+        self._breath_timer.start()
+
+    def _on_idle_breath_timer(self) -> None:
+        """Колбэк таймера: воспроизводит дыхание и планирует следующее."""
+
+        self._breath_timer = None
+        if self._current is Emotion.NEUTRAL and not self._present:
+            self.play_idle_effect()
+        self._schedule_idle_breath()
 
     def _play_effect(self, name: str) -> None:
         """Воспроизводит эффект из заранее загруженного словаря."""
@@ -226,13 +287,27 @@ class EmotionSoundDriver:
         effect = self._effects.get(name)
         if not effect or not effect.files:
             return
-        # Защищаемся от гонок: один эффект может быть запрошен из нескольких
-        # потоков (например, при бурном обновлении эмоций).  Блокировка
-        # гарантирует, что cooldown будет проверен и обновлён атомарно.
-        with effect.lock:
+        # Для эффекта "дыхания" используем глобальную блокировку и таймер,
+        # чтобы предотвратить повтор даже при наличии нескольких экземпляров
+        # драйвера.  Для остальных эффектов достаточно собственных блокировок.
+        lock = _idle_breath_lock if name == "IDLE_BREATH" else effect.lock
+        with lock:
             now = time.monotonic()
-            if effect.last_played + effect.cooldown > now:
-                remaining = effect.last_played + effect.cooldown - now
+            if name == "IDLE_BREATH":
+                global _idle_breath_last
+                # Учитываем глобальный cooldown в 15 минут
+                if _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN > now:
+                    remaining = _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN - now
+                    self.log.debug(
+                        "skip %s due to global cooldown %.2fs", name, remaining
+                    )
+                    return
+            # Проверяем локальный cooldown конкретного эффекта
+            cooldown = effect.cooldown
+            if name == "IDLE_BREATH":
+                cooldown = max(cooldown, MIN_IDLE_BREATH_COOLDOWN)
+            if effect.last_played + cooldown > now:
+                remaining = effect.last_played + cooldown - now
                 self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
                 return
             file = random.choice(effect.files)
@@ -242,6 +317,8 @@ class EmotionSoundDriver:
                 data, rate = _read_wav(file)
                 volume = 10 ** (effect.gain / 20)
                 effect.last_played = now
+                if name == "IDLE_BREATH":
+                    _idle_breath_last = now
                 # Аналогичный цикл повторения для методов драйвера.
                 for i in range(effect.repeat):
                     self.log.debug("start %s → %s [%d/%d]", name, file, i + 1, effect.repeat)
@@ -257,12 +334,16 @@ class EmotionSoundDriver:
             # провоцировать нежелательные вздохи.
             self.log.debug("skip idle breath: user present")
             return
+        # `_play_effect` дополнительно проверяет глобальный таймер и не
+        # допускает повтор чаще одного раза в 15 минут.
         self._play_effect("IDLE_BREATH")
 
     def _on_presence_update(self, event: core_events.Event) -> None:
         """Обновление флага присутствия пользователя."""
         self._present = bool(event.attrs.get("present"))
         self.log.debug("presence %s", "present" if self._present else "absent")
+        # При появлении пользователя или его уходе перепланируем дыхание.
+        self._schedule_idle_breath()
 
     def _on_emotion_changed(self, event: core_events.Event) -> None:
         if sd is None:
@@ -272,3 +353,5 @@ class EmotionSoundDriver:
         self._current = emotion
         key = _ALIASES.get(emotion, emotion.name)
         self._play_effect(key)
+        # Каждая смена эмоции влияет на расписание дыхания.
+        self._schedule_idle_breath()

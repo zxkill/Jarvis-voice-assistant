@@ -48,7 +48,16 @@ def test_driver_logs_caller(monkeypatch, caplog):
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
 
     driver = sounds.EmotionSoundDriver()
-    driver._effects = {"IDLE_BREATH": sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=0.0)}
+    # Сбрасываем глобальный таймер, чтобы не влиять на результат теста.
+    monkeypatch.setattr(sounds, "_idle_breath_last", -sounds.MIN_IDLE_BREATH_COOLDOWN)
+    driver._effects = {
+        "IDLE_BREATH": sounds._Effect(
+            files=["breath.wav"],
+            gain=0.0,
+            cooldown=0.0,
+            last_played=-sounds.MIN_IDLE_BREATH_COOLDOWN,
+        )
+    }
 
     with caplog.at_level(logging.INFO):
         sounds.log.addHandler(caplog.handler)
