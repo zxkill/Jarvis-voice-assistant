@@ -94,6 +94,8 @@ def _cleanup_timers(conn: sqlite3.Connection) -> None:
 
 # --- Small-talk timestamp helpers -----------------------------------------
 SMALLTALK_KEY = "smalltalk:last_ts"
+# Ключ для хранения уровня настроения ассистента
+MOOD_LEVEL_KEY = "emotion:mood"
 
 
 def get_last_smalltalk_ts() -> int:
@@ -115,4 +117,25 @@ def set_last_smalltalk_ts(ts: int) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
             (SMALLTALK_KEY, str(ts), ts),
+        )
+
+
+# --- Mood level helpers ----------------------------------------------------
+
+def get_mood_level() -> int:
+    """Вернуть сохранённый уровень настроения (по умолчанию 0)."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM context_items WHERE key=?", (MOOD_LEVEL_KEY,)
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+
+def set_mood_level(level: int) -> None:
+    """Сохранить текущий уровень настроения."""
+    ts = int(time.time())
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
+            (MOOD_LEVEL_KEY, str(level), ts),
         )

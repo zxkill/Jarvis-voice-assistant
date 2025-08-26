@@ -187,8 +187,16 @@ async def main() -> None:
         TRACE_ID.set(trace_id)
         log.info("[CMD] %s", text)
         publish(Event(kind="user_query_started", attrs={"text": text}))
-        await va_respond(text)
-        publish(Event(kind="user_query_ended", attrs={"text": text}))
+        try:
+            handled = await va_respond(text)
+        except Exception as exc:  # pragma: no cover - защита от неожиданных ошибок
+            log.exception("command error: %s", exc)
+            publish(Event(kind="dialog.failure", attrs={"text": text, "error": str(exc)}))
+        else:
+            kind = "dialog.success" if handled else "dialog.failure"
+            publish(Event(kind=kind, attrs={"text": text}))
+        finally:
+            publish(Event(kind="user_query_ended", attrs={"text": text}))
 
     while True:
         # Читаем с микрофона в отдельном потоке, чтобы не блокировать event loop

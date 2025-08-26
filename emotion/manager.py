@@ -50,6 +50,9 @@ class EmotionManager:
         core_events.subscribe("presence.update", self._on_presence_update)
         core_events.subscribe("speech.synthesis_started", self._on_speech_started)
         core_events.subscribe("speech.synthesis_finished", self._on_speech_finished)
+        # Уровень настроения зависит от успешности диалога
+        core_events.subscribe("dialog.success", self._on_dialog_success)
+        core_events.subscribe("dialog.failure", self._on_dialog_failure)
 
     def start(self) -> None:
         """Опубликовать начальное состояние.
@@ -75,6 +78,16 @@ class EmotionManager:
         prev = self._state.current
         log.info("emotion %s → %s (external)", prev.value, new.value)
         self._state.set(new)
+
+    def _on_dialog_success(self, event: core_events.Event) -> None:
+        """Реакция на успешный ответ пользователю."""
+        self._state.raise_mood(reason="dialog success")
+        self._switch_emotion(Emotion.HAPPY, "dialog success")
+
+    def _on_dialog_failure(self, event: core_events.Event) -> None:
+        """Реакция на ошибку или непонимание команды."""
+        self._state.drop_mood(reason="dialog failure")
+        self._switch_emotion(Emotion.FRUSTRATED, "dialog failure")
 
     def _on_presence_update(self, event: core_events.Event) -> None:
         """Запоминаем, есть ли сейчас человек в кадре."""
