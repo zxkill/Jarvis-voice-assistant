@@ -19,6 +19,7 @@ Emotion::Emotion(FaceWrapper& f) : face_(f)
   add("Frustrated",  [this]{ face_.expr().GoTo_Frustrated();   });
   add("Unimpressed", [this]{ face_.expr().GoTo_Unimpressed();  });
   add("Sleepy",      [this]{ face_.expr().GoTo_Sleepy();       });
+  add("Tired",       [this]{ face_.expr().GoTo_Tired();        });  // новая эмоция
   add("Suspicious",  [this]{ face_.expr().GoTo_Suspicious();   });
   add("Squint",      [this]{ face_.expr().GoTo_Squint();       });
   add("Furious",     [this]{ face_.expr().GoTo_Furious();      });

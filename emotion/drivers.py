@@ -23,8 +23,15 @@ class EmotionDisplayDriver:
         """
         emotion: Emotion = event.attrs["emotion"]
         log.debug("Received emotion_changed → %s", emotion.value)
-        item = DisplayItem(
-            kind="emotion",
-            payload=emotion.value   # строковый ключ, например "happy"
+
+        # Сначала очищаем возможный текст, оставшийся от других модулей,
+        # затем отображаем выбранную эмоцию. Благодаря расширенной
+        # прошивке M5Stack, эмоция ``TIRED`` теперь поддерживается
+        # аппаратно и рисуется так же, как остальные.
+        self._driver.draw(DisplayItem(kind="text", payload=None))
+        self._driver.draw(
+            DisplayItem(
+                kind="emotion",
+                payload=emotion.value,  # строковый ключ, например "Happy"
+            )
         )
-        self._driver.draw(item)

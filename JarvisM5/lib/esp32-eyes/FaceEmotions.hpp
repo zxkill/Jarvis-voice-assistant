@@ -28,8 +28,9 @@ enum eEmotions {
 	Skeptic,
 	Frustrated,
 	Unimpressed,
-	Sleepy,
-	Suspicious,
+        Sleepy,
+        Tired,       // новая эмоция «усталость»
+        Suspicious,
 	Squint,
 	Furious,
 	Scared,

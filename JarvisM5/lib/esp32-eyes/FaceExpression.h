@@ -39,6 +39,7 @@ class FaceExpression {
     void GoTo_Frustrated();
     void GoTo_Unimpressed();
     void GoTo_Sleepy();
+    void GoTo_Tired();      // новая эмоция «усталость»
     void GoTo_Suspicious();
     void GoTo_Squint();
     void GoTo_Furious();
