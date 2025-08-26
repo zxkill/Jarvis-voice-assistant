@@ -21,15 +21,25 @@ from display import DisplayItem, init_driver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
 from emotion import sounds
+from notifiers.telegram_listener import launch as launch_telegram_listener
 
 # ────────────────────────── LOGGING ──────────────────────────────
 log = configure_logging("app")
+
+# Глобальные объекты для управления Telegram-слушателем
+tg_stop_event = threading.Event()
+tg_task: asyncio.Task | None = None
 
 # ────────────────────────── SIGNALS ──────────────────────────────
 
 def _shutdown(signum: int, frame: Any):
     """Корректное завершение по Ctrl‑C/SIGTERM."""
     log.info("Получен сигнал %s, завершаюсь…", signum)
+    # Просим Telegram-слушатель остановиться
+    tg_stop_event.set()
+    if tg_task is not None:
+        log.info("Останавливаю Telegram-слушатель")
+        tg_task.cancel()
     try:
         loop = asyncio.get_running_loop()
         loop.stop()
@@ -166,6 +176,14 @@ async def main() -> None:
     ProactiveEngine(policy)
 
     start_background_tasks(suggestion_interval)
+
+    # --- Telegram listener -------------------------------------------------
+    global tg_task
+    if app_cfg.telegram.token:
+        log.info("Запускаю Telegram-слушатель")
+        tg_task = asyncio.create_task(
+            launch_telegram_listener(stop_event=tg_stop_event)
+        )
 
     # 2. Распознавание речи (Vosk)
     model = vosk.Model('models/model_small')

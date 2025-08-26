@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 import requests
+import asyncio
+import threading
 
 
 class DummyResp:
@@ -170,3 +172,35 @@ def test_listener_retries_on_network_error(monkeypatch):
     assert calls == ["hi"]
     assert metrics["count"] == 1
     assert call_counter["n"] == 2
+
+
+def test_launch_stops_on_event(monkeypatch, caplog):
+    tl = _load_listener(monkeypatch)
+
+    # Заглушка ``listen``: ждёт, пока событие не будет установлено.
+    def fake_listen(*, stop_event=None, max_iterations=None):
+        assert stop_event is not None
+        stop_event.wait()
+
+    monkeypatch.setattr(tl, "listen", fake_listen)
+
+    # Перехватываем вызовы log.info для проверки сообщений.
+    messages = []
+
+    def fake_info(msg, *a, **kw):
+        messages.append(msg)
+
+    monkeypatch.setattr(tl.log, "info", fake_info)
+
+    stop = threading.Event()
+
+    async def _run():
+        task = asyncio.create_task(tl.launch(stop_event=stop))
+        await asyncio.sleep(0.01)
+        stop.set()
+        await task
+
+    asyncio.run(_run())
+
+    assert "telegram listener started" in messages
+    assert "telegram listener stopped" in messages
