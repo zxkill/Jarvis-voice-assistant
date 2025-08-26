@@ -90,3 +90,29 @@ def _cleanup_timers(conn: sqlite3.Connection) -> None:
     now = int(time.time())
     cutoff = now - 24 * 3600  # оставляем информацию за последние 24 часа
     conn.execute("DELETE FROM timers WHERE end_ts <= ?", (cutoff,))
+
+
+# --- Small-talk timestamp helpers -----------------------------------------
+SMALLTALK_KEY = "smalltalk:last_ts"
+
+
+def get_last_smalltalk_ts() -> int:
+    """Вернуть метку времени последнего small-talk.
+
+    Используется проактивным движком, чтобы не надоедать пользователю
+    слишком частыми репликами.
+    """
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM context_items WHERE key=?", (SMALLTALK_KEY,)
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+
+def set_last_smalltalk_ts(ts: int) -> None:
+    """Сохранить момент времени последнего small-talk."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
+            (SMALLTALK_KEY, str(ts), ts),
+        )
