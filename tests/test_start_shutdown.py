@@ -30,10 +30,9 @@ def test_shutdown_cancels_telegram_listener(monkeypatch):
     start.tg_task = DummyTask()
     start.tg_stop_event = threading.Event()
 
-    # Замещаем sys.exit, чтобы не завершать процесс.
-    monkeypatch.setattr(start.sys, "exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
-
-    with pytest.raises(SystemExit):
+    # Вызываем обработчик сигнала и ожидаем генерацию KeyboardInterrupt,
+    # которая используется для корректного завершения ``asyncio.run``.
+    with pytest.raises(KeyboardInterrupt):
         start._shutdown(signal.SIGTERM, None)
 
     assert start.tg_stop_event.is_set()
