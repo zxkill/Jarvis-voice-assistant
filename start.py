@@ -15,6 +15,7 @@ import json
 import signal
 import sys
 import threading
+from collections import deque
 from typing import Any
 
 from display import DisplayItem, init_driver
@@ -96,6 +97,7 @@ async def main() -> None:
         extract_cmd,
         is_stop_cmd,
         va_respond,
+        _matches_activation,
     )
     from app.presence_session import setup_presence_session
     from app.gui import gui_loop
@@ -188,6 +190,18 @@ async def main() -> None:
     kaldi = vosk.KaldiRecognizer(model, 16000)
     recorder = PvRecorder(device_index=mic_idx, frame_length=512)
 
+    # Кольцевой буфер на ~1.5 секунды аудио.
+    # Храним последние PCM-кадры, чтобы при позднем обнаружении слова
+    # активации повторно передать их в распознаватель и не потерять
+    # начало команды.  Запас в 1.5 с позволяет уверенно захватывать
+    # длинное слово «джарвис» даже на шумном микрофоне.
+    buffer_size = int(1.5 * 16000 / recorder.frame_length)
+    pcm_buffer: deque[bytes] = deque(maxlen=buffer_size)
+    # Флаг, что слово активации уже было найдено и буфер «прокручен».
+    # Позволяет избежать многократных повторных распознаваний, когда
+    # ``PartialResult`` продолжает содержать «джарвис» несколько итераций подряд.
+    activated = False
+
     # 3. Приветственный звук (синхронно, чтобы не потерялся)
     await asyncio.to_thread(sounds.play_effect, "WAKE")
     driver.draw(DisplayItem(kind="mode", payload="run"))
@@ -219,12 +233,18 @@ async def main() -> None:
         raw_data = await asyncio.to_thread(recorder.read)
         pcm_arr = array.array('h', raw_data)
         pcm = pcm_arr.tobytes()
-
         if kaldi.AcceptWaveform(pcm):
+            # Фраза завершена: собираем финальный текст.
             result = json.loads(kaldi.Result()).get('text', '')
             if not result:
                 kaldi.Reset()
+                pcm_buffer.clear()
+                activated = False
                 continue
+            if activated and not result.startswith("джарвис"):
+                # Иногда Vosk отбрасывает первое слово — возвращаем его вручную.
+                log.debug("Слово активации отсутствует в финальном тексте — добавляю")
+                result = f"джарвис {result}".strip()
             log.info("Услышано: %s", result)  # логируем каждую распознанную фразу
             if working_tts.is_playing:
                 # Во время озвучивания реагируем на «джарвис стоп» и просто «стоп»
@@ -232,12 +252,16 @@ async def main() -> None:
                     working_tts.stop_speaking()
                     stop_mgr.trigger()
                 kaldi.Reset()
+                pcm_buffer.clear()
+                activated = False
                 continue
             cmd = extract_cmd(result)  # есть слово активации с небольшой погрешностью
             if cmd:
                 publish(Event(kind="speech.recognized", attrs={"text": result}))
                 asyncio.create_task(process_command(result))
+            pcm_buffer.clear()
             kaldi.Reset()
+            activated = False
         else:
             part = json.loads(kaldi.PartialResult()).get('partial', '')
             if part:
@@ -249,7 +273,30 @@ async def main() -> None:
                     working_tts.stop_speaking()
                     stop_mgr.trigger()
                     kaldi.Reset()
+                    pcm_buffer.clear()
+                else:
+                    # Проверяем, не появилось ли слово активации в промежуточном тексте
+                    if (not activated) and any(
+                        _matches_activation(w) for w in part.split()
+                    ):
+                        log.info("Обнаружено слово активации в потоке: %s", part)
+                        log.debug(
+                            "Размер буфера перед повторным распознаванием: %d",
+                            len(pcm_buffer),
+                        )
+                        # Сбрасываем распознаватель и повторно «проигрываем»
+                        # накопленные кадры, чтобы не потерять начало слова
+                        kaldi.Reset()
+                        for old_pcm in pcm_buffer:
+                            _ = kaldi.AcceptWaveform(old_pcm)
+                        _ = kaldi.AcceptWaveform(pcm)
+                        log.info("Повторное распознавание выполнено")
+                        pcm_buffer.clear()
+                        activated = True
 
+        # Добавляем текущий кадр в кольцевой буфер и выводим его размер
+        pcm_buffer.append(pcm)
+        log.debug("Размер кольцевого буфера: %d", len(pcm_buffer))
 
 if __name__ == "__main__":
     try:
