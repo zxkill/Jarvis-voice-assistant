@@ -368,6 +368,20 @@ async def speak_async(
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """Неблокирующая озвучка: `working_tts` выполняется в пуле потоков."""
+    from core.request_source import get_request_source
+    if get_request_source() == "telegram":
+        try:
+            import importlib
+            from core.metrics import inc_metric
+
+            tg = importlib.import_module("notifiers.telegram")
+            tg.send(text)
+            log.info("telegram reply text=%r", text)
+            inc_metric("telegram.outgoing")
+        except Exception as exc:  # pragma: no cover - защищаемся от сетевых ошибок
+            log.warning("telegram reply failed: %s", exc)
+        return
+
     import asyncio  # локальный импорт, чтобы не тянуть asyncio в синхронный контекст
     from functools import partial
 

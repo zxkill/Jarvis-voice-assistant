@@ -19,6 +19,7 @@ import requests
 from core.config import load_config
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
+from core.request_source import set_request_source, reset_request_source
 
 # Инициализируем логгер для удобной отладки модуля.
 log = configure_logging("notifiers.telegram_listener")
@@ -127,7 +128,11 @@ def listen(
                     handler = va_respond
                     if handler is None:  # импортируем по требованию
                         from app.command_processing import va_respond as handler
-                    asyncio.run(handler(text))
+                    token = set_request_source("telegram")
+                    try:
+                        asyncio.run(handler(text))
+                    finally:
+                        reset_request_source(token)
                 except Exception:  # pragma: no cover - на всякий случай логируем
                     log.exception("va_respond failed")
         except (requests.RequestException, ValueError) as exc:

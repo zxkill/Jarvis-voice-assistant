@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
+from core.request_source import get_request_source
 from working_tts import speak_async
 
 log = configure_logging("notifiers.voice")
@@ -31,6 +32,19 @@ async def _worker() -> None:
         item = await _queue.get()
         try:
             set_metric("tts.queue_len", _queue.qsize())
+            source = item.get("source", "voice")
+            if source == "telegram":
+                try:
+                    import importlib
+
+                    tg = importlib.import_module("notifiers.telegram")
+                    tg.send(item["text"])
+                    log.info("telegram reply text=%r", item["text"])
+                    inc_metric("telegram.outgoing")
+                except Exception as exc:  # pragma: no cover - сетевые ошибки не критичны
+                    log.warning("telegram reply failed: %s", exc)
+                continue
+
             await speak_async(
                 item["text"],
                 pitch=item.get("pitch"),
@@ -75,8 +89,22 @@ def say(text: str, *, pitch: float | None = None, speed: float | None = None, em
     ``pitch`` и ``speed`` задаются как коэффициенты, ``emotion`` — имя
     пресета из :data:`working_tts.TTS_PRESETS`.
     """
-    _queue.put_nowait({"text": text, "pitch": pitch, "speed": speed, "emotion": emotion})
-    log.debug("queued voice text=%r emotion=%s pitch=%s speed=%s", text, emotion, pitch, speed)
+    source = get_request_source()
+    _queue.put_nowait({
+        "text": text,
+        "pitch": pitch,
+        "speed": speed,
+        "emotion": emotion,
+        "source": source,
+    })
+    log.debug(
+        "queued voice text=%r emotion=%s pitch=%s speed=%s source=%s",
+        text,
+        emotion,
+        pitch,
+        speed,
+        source,
+    )
     set_metric("tts.queue_len", _queue.qsize())
 
 
