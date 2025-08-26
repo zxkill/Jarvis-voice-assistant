@@ -50,11 +50,17 @@ class SerialDisplayDriver(DisplayDriver):
         baud: int = 921_600,
         reconnect_delay: float = 2.0,
         startup_timeout: float = 5.0,
+        max_write_failures: int = 3,
     ) -> None:
         self.port = port or _find_default_port()
         self.baud = baud
         self.reconnect_delay = reconnect_delay
         self.startup_timeout = startup_timeout
+        # Сколько последовательных ошибок записи допускается, прежде чем
+        # соединение будет считаться потерянным и потребуется переподключение
+        self.max_write_failures = max_write_failures
+        # Счётчик текущих ошибок записи подряд
+        self._write_failures = 0
         self._last: dict[str, DisplayItem] = {}
         self._inq: Queue[tuple[str, str]] = Queue()
         self._running = threading.Event()
@@ -162,18 +168,30 @@ class SerialDisplayDriver(DisplayDriver):
         log.debug("SER→M5 %s", msg)
         try:
             self.ser.write(msg.encode() + b"\n")
+            # Если запись прошла успешно, сбрасываем счётчик ошибок
+            if self._write_failures:
+                log.debug("Write recovered after %d failures", self._write_failures)
+            self._write_failures = 0
         except serial.SerialException as exc:
-            # При возникновении ошибки записи считаем соединение потерянным
-            # и закрываем порт, чтобы поток чтения инициировал переподключение.
-            log.error("Write error: %s", exc)
-            self.disconnected.set()
-            try:
-                if self.ser and self.ser.is_open:
-                    log.warning("Closing serial port due to write failure")
-                    self.ser.close()
-            except Exception:
-                # Логируем полную трассировку для упрощения отладки
-                log.exception("Error closing serial port after write failure")
+            # Ошибка записи: увеличиваем счётчик и решаем, нужно ли разрывать соединение
+            self._write_failures += 1
+            log.warning(
+                "Write error %d/%d: %s",
+                self._write_failures,
+                self.max_write_failures,
+                exc,
+            )
+            if self._write_failures >= self.max_write_failures:
+                # Превышен порог допустимых ошибок – считаем соединение потерянным
+                log.error("Write error threshold reached, disconnecting")
+                self.disconnected.set()
+                try:
+                    if self.ser and self.ser.is_open:
+                        log.warning("Closing serial port due to write failure")
+                        self.ser.close()
+                except Exception:
+                    # Логируем полную трассировку для упрощения отладки
+                    log.exception("Error closing serial port after write failure")
 
     def _send_item(self, item: DisplayItem) -> None:
         """Serialize item as JSON and write to serial port."""
