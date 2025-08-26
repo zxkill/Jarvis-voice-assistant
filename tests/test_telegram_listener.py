@@ -303,11 +303,53 @@ def test_listener_skips_duplicate_update(monkeypatch):
     assert offsets == [0, 3]
 
 
+def test_listener_uses_external_loop(monkeypatch):
+    """Проверяем, что ``listen`` умеет выполнять обработчик в переданном loop."""
+    tl = _load_listener(monkeypatch)
+    loops = []
+
+    async def fake_va(text):
+        # Сохраняем цикл событий, в котором выполнен обработчик.
+        loops.append(asyncio.get_running_loop())
+
+    responses = [
+        DummyResp(
+            {
+                "ok": True,
+                "result": [
+                    {
+                        "update_id": 1,
+                        "message": {"chat": {"id": 123}, "text": "hi"},
+                    }
+                ],
+            }
+        ),
+        DummyResp({"ok": True, "result": []}),
+    ]
+
+    def fake_get(url, params, timeout):
+        return responses.pop(0)
+
+    loop = asyncio.new_event_loop()
+    thr = threading.Thread(target=loop.run_forever)
+    thr.start()
+    try:
+        monkeypatch.setattr(tl, "va_respond", fake_va)
+        monkeypatch.setattr(tl.requests, "get", fake_get)
+        tl.listen(max_iterations=2, loop=loop)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thr.join()
+        loop.close()
+
+    assert loops == [loop]
+
+
 def test_launch_stops_on_event(monkeypatch, caplog):
     tl = _load_listener(monkeypatch)
 
     # Заглушка ``listen``: ждёт, пока событие не будет установлено.
-    def fake_listen(*, stop_event=None, max_iterations=None):
+    def fake_listen(*, stop_event=None, max_iterations=None, loop=None):
         assert stop_event is not None
         stop_event.wait()
 
