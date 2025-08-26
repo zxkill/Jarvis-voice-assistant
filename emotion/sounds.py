@@ -11,9 +11,10 @@ from __future__ import annotations
 import random
 import time
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Any
+from threading import Lock
 
 try:  # ``numpy`` может быть недоступен в некоторых средах
     import numpy as np  # type: ignore
@@ -65,6 +66,7 @@ class _Effect:
     gain: float
     cooldown: float
     last_played: float = 0.0
+    lock: Lock = field(default_factory=Lock, repr=False)
 
 
 def _load_manifest() -> Dict[str, _Effect]:
@@ -133,22 +135,25 @@ def play_effect(name: str | Emotion) -> None:
     if not effect or not effect.files:
         return
 
-    now = time.monotonic()
-    if effect.last_played + effect.cooldown > now:
-        remaining = effect.last_played + effect.cooldown - now
-        log.debug("skip %s due to cooldown %.2fs", key, remaining)
-        return
+    # Блокируем обработку эффекта, чтобы несколько потоков не смогли
+    # одновременно обойти проверку cooldown и повторно проиграть звук.
+    with effect.lock:
+        now = time.monotonic()
+        if effect.last_played + effect.cooldown > now:
+            remaining = effect.last_played + effect.cooldown - now
+            log.debug("skip %s due to cooldown %.2fs", key, remaining)
+            return
 
-    file = random.choice(effect.files)
-    try:
-        data, rate = _read_wav(file)
-        volume = 10 ** (effect.gain / 20)
-        log.debug("start %s → %s", key, file)
-        sd.play(data * volume, rate, blocking=False)
-        effect.last_played = now
-        log.debug("end %s", key)
-    except Exception:  # pragma: no cover
-        log.exception("sound playback failed")
+        file = random.choice(effect.files)
+        try:
+            data, rate = _read_wav(file)
+            volume = 10 ** (effect.gain / 20)
+            log.debug("start %s → %s", key, file)
+            sd.play(data * volume, rate, blocking=False)
+            effect.last_played = now
+            log.debug("end %s", key)
+        except Exception:  # pragma: no cover
+            log.exception("sound playback failed")
 
 
 class EmotionSoundDriver:
@@ -195,21 +200,25 @@ class EmotionSoundDriver:
         effect = self._effects.get(name)
         if not effect or not effect.files:
             return
-        now = time.monotonic()
-        if effect.last_played + effect.cooldown > now:
-            remaining = effect.last_played + effect.cooldown - now
-            self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
-            return
-        file = random.choice(effect.files)
-        self.log.debug("start %s → %s", name, file)
-        try:
-            data, rate = _read_wav(file)
-            volume = 10 ** (effect.gain / 20)
-            sd.play(data * volume, rate, blocking=False)
-            effect.last_played = now
-            self.log.debug("end %s", name)
-        except Exception:  # pragma: no cover
-            self.log.exception("sound playback failed")
+        # Защищаемся от гонок: один эффект может быть запрошен из нескольких
+        # потоков (например, при бурном обновлении эмоций).  Блокировка
+        # гарантирует, что cooldown будет проверен и обновлён атомарно.
+        with effect.lock:
+            now = time.monotonic()
+            if effect.last_played + effect.cooldown > now:
+                remaining = effect.last_played + effect.cooldown - now
+                self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
+                return
+            file = random.choice(effect.files)
+            self.log.debug("start %s → %s", name, file)
+            try:
+                data, rate = _read_wav(file)
+                volume = 10 ** (effect.gain / 20)
+                sd.play(data * volume, rate, blocking=False)
+                effect.last_played = now
+                self.log.debug("end %s", name)
+            except Exception:  # pragma: no cover
+                self.log.exception("sound playback failed")
 
     def play_idle_effect(self) -> None:
         """Явно воспроизводит короткое дыхание (используется в тестах)."""
