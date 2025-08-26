@@ -74,12 +74,16 @@ def listen(
     *,
     max_iterations: int | None = None,
     stop_event: threading.Event | None = None,
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """Запуск бесконечного long polling цикла.
 
     Параметр ``max_iterations`` используется в тестах для ограничения
     количества запросов к API.  Дополнительно можно передать ``stop_event``,
-    чтобы корректно завершить цикл из другого потока.
+    чтобы корректно завершить цикл из другого потока.  Если передан
+    ``loop``, обработчик команд будет выполняться в указанном цикле событий,
+    что позволяет делегировать работу основному event loop ассистента и
+    избегать проблем с временными циклами ``asyncio.run``.
     """
 
     offset = 0  # Указатель на последний обработанный update_id.
@@ -136,7 +140,20 @@ def listen(
                         from app.command_processing import va_respond as handler
                     token = set_request_source("telegram")
                     try:
-                        asyncio.run(handler(text))
+                        # При отсутствии внешнего ``loop`` каждое сообщение
+                        # обрабатывается отдельным временным циклом через
+                        # ``asyncio.run``.  Однако такой подход мешает
+                        # фоновой обработке уведомлений. Если же передан
+                        # ``loop`` — используем его, чтобы задание выполнилось
+                        # в основном event loop ассистента.
+                        if loop is None:
+                            asyncio.run(handler(text))
+                        else:
+                            fut = asyncio.run_coroutine_threadsafe(
+                                handler(text), loop
+                            )
+                            fut.result()  # дожидаемся завершения
+                            log.debug("handler executed in main loop")
                     finally:
                         reset_request_source(token)
                 except Exception:  # pragma: no cover - на всякий случай логируем
@@ -156,7 +173,10 @@ async def launch(*, stop_event: threading.Event | None = None) -> None:
     _RUNNING = True
     try:
         # ``listen`` блокирует поток, поэтому выполняем его в пуле потоков.
-        await asyncio.to_thread(listen, stop_event=stop_event)
+        # Передаём текущий event loop, чтобы обработчик команд выполнялся
+        # в нём и мог создавать фоновые задачи (TTS, метрики и т.д.).
+        loop = asyncio.get_running_loop()
+        await asyncio.to_thread(listen, stop_event=stop_event, loop=loop)
     except asyncio.CancelledError:
         # Отмена задачи при завершении приложения.
         log.info("telegram listener cancelled")
