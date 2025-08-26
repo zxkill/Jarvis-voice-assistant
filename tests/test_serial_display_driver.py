@@ -56,3 +56,96 @@ def test_serial_handshake_resends_cache(monkeypatch):
     driver.close()
 
     assert any(json.loads(w)["kind"] == "txt" for w in dummy.written)
+
+
+def test_single_write_error_keeps_port_open(monkeypatch):
+    """Одиночная ошибка записи не должна приводить к отключению."""
+
+    class WriteTimeout(Exception):
+        pass
+
+    class FailingSerial:
+        """Серийный порт, который всегда выбрасывает исключение при записи."""
+
+        def __init__(self):
+            self.is_open = True
+
+        def write(self, data):  # noqa: D401 - описано выше
+            raise WriteTimeout("Write timeout")
+
+        def close(self):
+            self.is_open = False
+
+    dummy = FailingSerial()
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial = types.SimpleNamespace(SerialException=WriteTimeout, tools=fake_tools)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    # Подменяем метод открытия порта, чтобы использовать наш фиктивный объект
+    monkeypatch.setattr(
+        SerialDisplayDriver,
+        "_open_serial",
+        lambda self, timeout=None: setattr(self, "ser", dummy),
+    )
+
+    driver = SerialDisplayDriver(port="dummy", max_write_failures=3)
+
+    item = DisplayItem(kind="txt", payload="hi")
+    driver.draw(item)  # попытка записи вызовет исключение
+
+    # После одной ошибки порт должен оставаться открытым и флаг не выставлен
+    assert not driver.disconnected.is_set(), "Не должно произойти отключение после одной ошибки"
+    assert dummy.is_open, "Порт не должен быть закрыт"
+
+    driver.close()
+
+
+def test_write_error_threshold_closes_port_and_sets_flag(monkeypatch):
+    """После превышения порога ошибок записи порт закрывается и выставляется флаг disconnect."""
+
+    class WriteTimeout(Exception):
+        pass
+
+    class FailingSerial:
+        """Серийный порт, имитирующий ошибку записи."""
+
+        def __init__(self):
+            self.is_open = True
+
+        def write(self, data):  # noqa: D401 - описано выше
+            raise WriteTimeout("Write timeout")
+
+        def close(self):
+            self.is_open = False
+
+    dummy = FailingSerial()
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial = types.SimpleNamespace(SerialException=WriteTimeout, tools=fake_tools)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    # Подменяем метод открытия порта, чтобы использовать наш фиктивный объект
+    monkeypatch.setattr(
+        SerialDisplayDriver,
+        "_open_serial",
+        lambda self, timeout=None: setattr(self, "ser", dummy),
+    )
+
+    driver = SerialDisplayDriver(port="dummy", max_write_failures=3)
+
+    item = DisplayItem(kind="txt", payload="hi")
+    # Совершаем несколько попыток записи, чтобы превысить порог ошибок
+    for _ in range(3):
+        driver.draw(item)
+
+    assert driver.disconnected.is_set(), "Флаг отключения должен быть установлен после N ошибок"
+    assert not dummy.is_open, "Порт должен быть закрыт после превышения порога"
+
+    driver.close()
