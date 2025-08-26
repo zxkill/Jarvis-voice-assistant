@@ -154,6 +154,63 @@ def test_write_error_threshold_closes_port_and_sets_flag(monkeypatch):
     driver.close()
 
 
+def test_write_failures_reset_after_reconnect(monkeypatch):
+    """Счётчик ошибок записи сбрасывается после переподключения."""
+
+    class WriteTimeout(Exception):
+        pass
+
+    class FailingSerial:
+        def __init__(self):
+            self.is_open = True
+
+        def write(self, data):
+            raise WriteTimeout("Write timeout")
+
+        def close(self):
+            self.is_open = False
+
+    failing = FailingSerial()
+    working = DummySerial()
+
+    serial_objs = [failing, working]
+
+    def serial_factory(*args, **kwargs):
+        return serial_objs.pop(0)
+
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    import display.drivers.serial as serial_module
+
+    monkeypatch.setattr(
+        serial_module,
+        "serial",
+        types.SimpleNamespace(Serial=serial_factory, SerialException=WriteTimeout),
+    )
+    monkeypatch.setattr(serial_module, "list_ports", fake_tools.list_ports)
+    from display.drivers.serial import SerialDisplayDriver
+
+    # Отключаем настоящий поток чтения, чтобы тест был синхронным
+    monkeypatch.setattr(SerialDisplayDriver, "_reader", lambda self: None)
+
+    driver = SerialDisplayDriver(port="dummy", max_write_failures=2)
+
+    item = DisplayItem(kind="txt", payload="hi")
+    for _ in range(2):
+        driver.draw(item)
+
+    assert driver.disconnected.is_set(), "Должно произойти отключение"
+    assert driver._write_failures == 2, "Счётчик ошибок должен достигнуть порога"
+
+    driver.disconnected.clear()
+    driver._open_serial()
+    assert driver._write_failures == 0, "Счётчик ошибок должен сбрасываться после переподключения"
+
+    driver.draw(item)
+    assert working.written, "После переподключения запись должна проходить"
+
+    driver.close()
+
+
 def test_non_json_lines_are_ignored(monkeypatch, capfd):
     """Строки без JSON должны игнорироваться и не увеличивать счётчик ошибок."""
 
@@ -224,6 +281,16 @@ def test_parse_json_line_recovers_missing_quotes():
 
     msg = _parse_json_line('{kind":"hello","payload":"ping"}')
     assert msg == {"kind": "hello", "payload": "ping"}
+
+
+def test_parse_json_line_recovers_missing_braces():
+    """Парсер должен восстанавливать потерянные фигурные скобки."""
+    from display.drivers.serial import _parse_json_line
+
+    msg1 = _parse_json_line('kind":"hello","payload":"ping"}')
+    msg2 = _parse_json_line('{"kind":"hello","payload":"ping"')
+    assert msg1 == {"kind": "hello", "payload": "ping"}
+    assert msg2 == {"kind": "hello", "payload": "ping"}
 
 
 def test_parse_json_line_strips_noise():

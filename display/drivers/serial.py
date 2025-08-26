@@ -32,12 +32,26 @@ def _parse_json_line(line: str) -> dict | None:
     Возвращает словарь при успехе или ``None`` при ошибке.
     """
 
-    # Находим границы возможного JSON
+    # Находим границы возможного JSON. Иногда прошивка теряет фигурные скобки
+    # в начале или конце строки, поэтому пытаемся восстановить их.
     idx = line.find("{")
     end = line.rfind("}")
-    if idx == -1 or end == -1 or end <= idx:
+
+    if idx == -1 and end != -1:
+        # Потеряна открывающая скобка: добавляем её и обрезаем строку.
+        clean = "{" + line[: end + 1]
+    elif idx != -1 and end == -1:
+        # Потеряна закрывающая скобка: добавляем её в конец.
+        clean = line[idx:] + "}"
+    elif idx == -1 or end == -1 or end <= idx:
+        # Скобки полностью отсутствуют или расположены некорректно.
         return None
-    clean = line[idx : end + 1]
+    else:
+        clean = line[idx : end + 1]
+
+    if clean != line:
+        # Логируем восстановленную строку для упрощения отладки.
+        log.debug("JSON recovered: %s -> %s", line, clean)
 
     # Добавляем кавычки вокруг ключей, если они потерялись в потоке
     if clean.startswith("{") and not clean.startswith('{"'):
@@ -179,6 +193,11 @@ class SerialDisplayDriver(DisplayDriver):
                 self._cache_sent = False
                 self.ready.clear()
                 self.disconnected.clear()
+                # После успешного открытия порта сбрасываем счётчик ошибок записи,
+                # чтобы новые попытки начинались "с чистого листа".
+                if self._write_failures:
+                    log.debug("Reset write failure counter after reconnect")
+                self._write_failures = 0
                 break
             except serial.SerialException as exc:
                 if timeout is not None and time.monotonic() - start >= timeout:
@@ -226,6 +245,9 @@ class SerialDisplayDriver(DisplayDriver):
                     if self.ser and self.ser.is_open:
                         log.warning("Closing serial port due to write failure")
                         self.ser.close()
+                        # Устанавливаем None, чтобы последующие попытки записи
+                        # не обращались к закрытому объекту.
+                        self.ser = None
                 except Exception:
                     # Логируем полную трассировку для упрощения отладки
                     log.exception("Error closing serial port after write failure")
@@ -286,6 +308,8 @@ class SerialDisplayDriver(DisplayDriver):
                 try:
                     if self.ser and self.ser.is_open:
                         self.ser.close()
+                    # Удаляем ссылку, чтобы предотвратить дальнейшие обращения
+                    self.ser = None
                 finally:
                     time.sleep(self.reconnect_delay)
                     self._open_serial()
