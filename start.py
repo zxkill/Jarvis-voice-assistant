@@ -269,8 +269,12 @@ async def main() -> None:
                             "Размер буфера перед повторным распознаванием: %d",
                             len(pcm_buffer),
                         )
+                        # Сбрасываем распознаватель и повторно «проигрываем»
+                        # накопленные кадры, чтобы не потерять начало слова
                         kaldi.Reset()
-                        kaldi.AcceptWaveform(b"".join(pcm_buffer) + pcm)
+                        for old_pcm in pcm_buffer:
+                            _ = kaldi.AcceptWaveform(old_pcm)
+                        _ = kaldi.AcceptWaveform(pcm)
                         log.info("Повторное распознавание выполнено")
                         pcm_buffer.clear()
 
