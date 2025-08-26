@@ -15,6 +15,11 @@ from rapidfuzz import fuzz
 from jarvis_skills import handle_utterance
 from core.nlp import normalize
 from working_tts import speak_async
+from core.request_source import get_request_source
+from core.logging_json import configure_logging
+
+# Инициализируем модульный логгер, чтобы отслеживать процесс разбора команд.
+log = configure_logging("app.command_processing")
 
 # ────────────────────────── КОНСТАНТЫ ──────────────────────────────
 # Слова, которыми пользователь обращается к ассистенту.
@@ -92,14 +97,27 @@ def _matches_activation(word: str) -> bool:
 def extract_cmd(text: str) -> str:
     """Выделить часть фразы после слова активации.
 
-    Если активация не обнаружена, возвращается пустая строка.
+    Для голосовых запросов требуется слово обращения «Джарвис».
+    Если команда пришла из Telegram, считаем, что она уже адресована
+    ассистенту, поэтому возвращаем текст без проверки.
+    При отсутствии активации у голосового запроса — вернётся пустая строка.
     """
+
     text = text.lower().strip()
     if not text:
         return ""
+
+    source = get_request_source()
+    if source == "telegram":
+        # Команды в Telegram не нуждаются в слове активации.
+        log.debug("telegram command: %r", text)
+        return text
+
     words = text.split()
     if _matches_activation(words[0]):
         return " ".join(words[1:]).strip()
+
+    log.debug("activation word missing: %r", text)
     return ""
 
 
