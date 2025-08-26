@@ -112,6 +112,9 @@ class SerialDisplayDriver(DisplayDriver):
         self._inq: Queue[tuple[str, str]] = Queue()
         self._running = threading.Event()
         self._running.set()
+        # Блокировка на запись в порт, чтобы исключить одновременные обращения
+        # из разных потоков и гонки при закрытии соединения
+        self._tx_lock = threading.Lock()
         self.ser: Optional[serial.Serial] = None
         self._cache_sent = False
         self._last_handshake = 0.0
@@ -217,40 +220,44 @@ class SerialDisplayDriver(DisplayDriver):
 
     def _send_json(self, kind: str, payload: str) -> None:
         """Write an arbitrary JSON message to the serial port."""
-        if not self.ser or not self.ser.is_open:
-            log.debug("Serial port not open, dropping frame kind=%s", kind)
-            return
-        msg = json.dumps({"kind": kind, "payload": payload})
-        log.debug("SER→M5 %s", msg)
-        try:
-            self.ser.write(msg.encode() + b"\n")
-            # Если запись прошла успешно, сбрасываем счётчик ошибок
-            if self._write_failures:
-                log.debug("Write recovered after %d failures", self._write_failures)
-            self._write_failures = 0
-        except serial.SerialException as exc:
-            # Ошибка записи: увеличиваем счётчик и решаем, нужно ли разрывать соединение
-            self._write_failures += 1
-            log.warning(
-                "Write error %d/%d: %s",
-                self._write_failures,
-                self.max_write_failures,
-                exc,
-            )
-            if self._write_failures >= self.max_write_failures:
-                # Превышен порог допустимых ошибок – считаем соединение потерянным
-                log.error("Write error threshold reached, disconnecting")
-                self.disconnected.set()
-                try:
-                    if self.ser and self.ser.is_open:
-                        log.warning("Closing serial port due to write failure")
-                        self.ser.close()
-                        # Устанавливаем None, чтобы последующие попытки записи
-                        # не обращались к закрытому объекту.
+        with self._tx_lock:
+            # Если порт уже закрыт, просто фиксируем факт и не пытаемся писать
+            if not self.ser or not self.ser.is_open:
+                log.debug("Serial port not open, dropping frame kind=%s", kind)
+                return
+
+            msg = json.dumps({"kind": kind, "payload": payload})
+            log.debug("SER→M5 %s", msg)
+            try:
+                self.ser.write(msg.encode() + b"\n")
+                # Если запись прошла успешно, сбрасываем счётчик ошибок
+                if self._write_failures:
+                    log.debug("Write recovered after %d failures", self._write_failures)
+                self._write_failures = 0
+            except serial.SerialException as exc:
+                # Ошибка записи: увеличиваем счётчик и решаем, нужно ли разрывать соединение
+                self._write_failures += 1
+                log.warning(
+                    "Write error %d/%d: %s",
+                    self._write_failures,
+                    self.max_write_failures,
+                    exc,
+                )
+                if self._write_failures >= self.max_write_failures:
+                    # Превышен порог допустимых ошибок – считаем соединение потерянным
+                    log.error("Write error threshold reached, disconnecting")
+                    self.disconnected.set()
+                    try:
+                        if self.ser and self.ser.is_open:
+                            log.warning("Closing serial port due to write failure")
+                            self.ser.close()
+                    except Exception:
+                        # Логируем полную трассировку ошибки закрытия
+                        log.exception("Error closing serial port after write failure")
+                    finally:
+                        # Удаляем ссылку на закрытый порт, чтобы другие потоки
+                        # не пытались писать в него и не получали ошибку
                         self.ser = None
-                except Exception:
-                    # Логируем полную трассировку для упрощения отладки
-                    log.exception("Error closing serial port after write failure")
 
     def _send_item(self, item: DisplayItem) -> None:
         """Serialize item as JSON and write to serial port."""
@@ -262,7 +269,17 @@ class SerialDisplayDriver(DisplayDriver):
         bad_json_count = 0  # счётчик подряд идущих ошибок парсинга
         while self._running.is_set():
             try:
-                chunk = self.ser.read(self.ser.in_waiting or 1)
+                s = self.ser
+                if not s or not s.is_open:
+                    # Порт недоступен: ждём переподключения и инициируем его
+                    log.warning("Serial port not ready, waiting for reconnect")
+                    self.disconnected.set()
+                    time.sleep(self.reconnect_delay)
+                    self._open_serial()
+                    buf = b""
+                    continue
+
+                chunk = s.read(s.in_waiting or 1)
                 if not chunk:
                     continue
                 buf += chunk
@@ -300,7 +317,7 @@ class SerialDisplayDriver(DisplayDriver):
                     payload = msg.get("payload", "")
                     self._inq.put((kind, payload))
                     self.on_event(kind, payload)
-            except (serial.SerialException, AttributeError) as exc:
+            except serial.SerialException as exc:
                 if not self._running.is_set():
                     break
                 log.warning("Connection lost: %s", exc)
@@ -308,7 +325,6 @@ class SerialDisplayDriver(DisplayDriver):
                 try:
                     if self.ser and self.ser.is_open:
                         self.ser.close()
-                    # Удаляем ссылку, чтобы предотвратить дальнейшие обращения
                     self.ser = None
                 finally:
                     time.sleep(self.reconnect_delay)

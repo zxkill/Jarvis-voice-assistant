@@ -46,6 +46,9 @@ def test_serial_handshake_resends_cache(monkeypatch):
     import importlib
     import display.drivers.serial as serial_module
     importlib.reload(serial_module)
+    import importlib
+    import display.drivers.serial as serial_module
+    importlib.reload(serial_module)
     from display.drivers.serial import SerialDisplayDriver
 
     driver = SerialDisplayDriver(port="dummy")
@@ -207,6 +210,52 @@ def test_write_failures_reset_after_reconnect(monkeypatch):
 
     driver.draw(item)
     assert working.written, "После переподключения запись должна проходить"
+
+    driver.close()
+
+
+def test_no_duplicate_threshold_logs(monkeypatch):
+    """После отключения счётчик ошибок не должен превышать порог."""
+
+    class WriteTimeout(Exception):
+        pass
+
+    class FailingSerial:
+        def __init__(self):
+            self.is_open = True
+
+        def write(self, data):
+            raise WriteTimeout("Write timeout")
+
+        def close(self):
+            self.is_open = False
+
+    dummy = FailingSerial()
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial = types.SimpleNamespace(SerialException=WriteTimeout, tools=fake_tools)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    # Отключаем реальный поток чтения, чтобы избежать гонок в тесте
+    monkeypatch.setattr(SerialDisplayDriver, "_reader", lambda self: None)
+    monkeypatch.setattr(
+        SerialDisplayDriver,
+        "_open_serial",
+        lambda self, timeout=None: setattr(self, "ser", dummy),
+    )
+
+    driver = SerialDisplayDriver(port="dummy", max_write_failures=3)
+    item = DisplayItem(kind="txt", payload="hi")
+
+    for _ in range(5):  # попыток больше порога
+        driver.draw(item)
+
+    # Счётчик должен остановиться на пороговом значении, даже если попыток было больше
+    assert driver._write_failures == driver.max_write_failures
+    assert driver.disconnected.is_set()
 
     driver.close()
 
