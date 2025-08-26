@@ -12,7 +12,8 @@ from typing import Any, Dict, List
 import asyncio
 from rapidfuzz import fuzz
 
-from jarvis_skills import handle_utterance
+import jarvis_skills
+handle_utterance = jarvis_skills.handle_utterance
 from core.nlp import normalize
 from working_tts import speak_async
 from core.request_source import get_request_source
@@ -153,6 +154,11 @@ async def va_respond(voice: str) -> bool:
     cmd = extract_cmd(voice)
     if not cmd:
         return False
+    # Сохраняем текущий event loop, чтобы jarvis_skills мог
+    # безопасно отправлять ответы из побочного потока.
+    getattr(jarvis_skills, "set_main_loop", lambda loop: None)(
+        asyncio.get_running_loop()
+    )
     # handle_utterance может блокировать, поэтому вызываем в отдельном потоке
     if await asyncio.to_thread(handle_utterance, cmd):
         return True

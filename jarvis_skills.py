@@ -23,6 +23,20 @@ from rapidfuzz import fuzz   # уже есть в requirements.txt
 from core.logging_json import configure_logging
 from core.nlp import normalize
 
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """Сохранить основной ``event loop`` для дальнейшего использования.
+
+    Это позволяет вызывать уведомления из других потоков, безопасно
+    перенаправляя их обратно в главный цикл приложения.
+    """
+
+    global _MAIN_LOOP
+    _MAIN_LOOP = loop
+    log.debug("main loop registered")
+
 log = configure_logging("skills.router")
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -138,6 +152,16 @@ def handle_utterance(text: str) -> bool:
                     log.info(
                         "skill %s replied: %r", best_func.__module__, reply
                     )
+                except RuntimeError:
+                    if _MAIN_LOOP is not None:
+                        _MAIN_LOOP.call_soon_threadsafe(voice_send, reply)
+                        log.info(
+                            "skill %s replied via main loop: %r",
+                            best_func.__module__,
+                            reply,
+                        )
+                    else:  # pragma: no cover - основной цикл не задан
+                        log.exception("failed to send skill reply: no event loop")
                 except Exception:  # pragma: no cover - логируем любые сбои
                     log.exception("failed to send skill reply")
 
