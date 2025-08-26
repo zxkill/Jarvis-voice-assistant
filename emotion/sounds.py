@@ -128,7 +128,12 @@ class EmotionSoundDriver:
         # файлов без повторного чтения с диска
         self._effects = _load_manifest()
         self._current: Emotion = Emotion.NEUTRAL
+        # Флаг присутствия пользователя перед камерой.  Пока человек в
+        # кадре, «вздыхать» не следует, чтобы не создавать впечатление,
+        # что ассистент устал от общения.
+        self._present: bool = False
         core_events.subscribe("emotion_changed", self._on_emotion_changed)
+        core_events.subscribe("presence.update", self._on_presence_update)
         # Фоновый поток воспроизводит короткие «дыхания» во время простоя.
         # Поток демонический, чтобы не блокировать завершение приложения.
         import threading
@@ -144,7 +149,10 @@ class EmotionSoundDriver:
             # Ждём случайную паузу, чтобы звуки не звучали по расписанию
             delay = random.uniform(effect.cooldown, effect.cooldown * 2 or 1.0)
             time.sleep(delay)
-            if self._current is Emotion.NEUTRAL:
+            # Воспроизводим «дыхание» только если никого нет в кадре и
+            # текущая эмоция нейтральна.  Иначе пользователю будет казаться,
+            # что ассистент вздыхает при виде собеседника.
+            if self._current is Emotion.NEUTRAL and not self._present:
                 self.play_idle_effect()
 
     def _play_effect(self, name: str) -> None:
@@ -172,7 +180,17 @@ class EmotionSoundDriver:
 
     def play_idle_effect(self) -> None:
         """Явно воспроизводит короткое дыхание (используется в тестах)."""
+        if self._present:
+            # Пользователь в кадре → пропускаем эффект, чтобы не
+            # провоцировать нежелательные вздохи.
+            self.log.debug("skip idle breath: user present")
+            return
         self._play_effect("IDLE_BREATH")
+
+    def _on_presence_update(self, event: core_events.Event) -> None:
+        """Обновление флага присутствия пользователя."""
+        self._present = bool(event.attrs.get("present"))
+        self.log.debug("presence %s", "present" if self._present else "absent")
 
     def _on_emotion_changed(self, event: core_events.Event) -> None:
         if sd is None:
