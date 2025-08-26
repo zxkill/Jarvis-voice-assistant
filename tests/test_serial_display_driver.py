@@ -1,9 +1,9 @@
 import json
+import sys
 import time
 import types
 
 from display import DisplayItem
-from display.drivers.serial import SerialDisplayDriver
 
 
 class DummySerial:
@@ -37,7 +37,13 @@ class DummySerial:
 def test_serial_handshake_resends_cache(monkeypatch):
     dummy = DummySerial()
     fake_serial = types.SimpleNamespace(Serial=lambda *a, **k: dummy, SerialException=Exception)
-    monkeypatch.setattr("display.drivers.serial.serial", fake_serial)
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial.tools = fake_tools
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    from display.drivers.serial import SerialDisplayDriver
 
     driver = SerialDisplayDriver(port="dummy")
     item = DisplayItem(kind="txt", payload="hi")
