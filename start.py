@@ -190,12 +190,17 @@ async def main() -> None:
     kaldi = vosk.KaldiRecognizer(model, 16000)
     recorder = PvRecorder(device_index=mic_idx, frame_length=512)
 
-    # Кольцевой буфер на ~1 секунду аудио.
+    # Кольцевой буфер на ~1.5 секунды аудио.
     # Храним последние PCM-кадры, чтобы при позднем обнаружении слова
     # активации повторно передать их в распознаватель и не потерять
-    # начало команды.
-    buffer_size = int(16000 / recorder.frame_length)  # кол-во кадров в секунде
+    # начало команды.  Запас в 1.5 с позволяет уверенно захватывать
+    # длинное слово «джарвис» даже на шумном микрофоне.
+    buffer_size = int(1.5 * 16000 / recorder.frame_length)
     pcm_buffer: deque[bytes] = deque(maxlen=buffer_size)
+    # Флаг, что слово активации уже было найдено и буфер «прокручен».
+    # Позволяет избежать многократных повторных распознаваний, когда
+    # ``PartialResult`` продолжает содержать «джарвис» несколько итераций подряд.
+    activated = False
 
     # 3. Приветственный звук (синхронно, чтобы не потерялся)
     await asyncio.to_thread(sounds.play_effect, "WAKE")
@@ -229,11 +234,17 @@ async def main() -> None:
         pcm_arr = array.array('h', raw_data)
         pcm = pcm_arr.tobytes()
         if kaldi.AcceptWaveform(pcm):
+            # Фраза завершена: собираем финальный текст.
             result = json.loads(kaldi.Result()).get('text', '')
             if not result:
                 kaldi.Reset()
                 pcm_buffer.clear()
+                activated = False
                 continue
+            if activated and not result.startswith("джарвис"):
+                # Иногда Vosk отбрасывает первое слово — возвращаем его вручную.
+                log.debug("Слово активации отсутствует в финальном тексте — добавляю")
+                result = f"джарвис {result}".strip()
             log.info("Услышано: %s", result)  # логируем каждую распознанную фразу
             if working_tts.is_playing:
                 # Во время озвучивания реагируем на «джарвис стоп» и просто «стоп»
@@ -242,6 +253,7 @@ async def main() -> None:
                     stop_mgr.trigger()
                 kaldi.Reset()
                 pcm_buffer.clear()
+                activated = False
                 continue
             cmd = extract_cmd(result)  # есть слово активации с небольшой погрешностью
             if cmd:
@@ -249,6 +261,7 @@ async def main() -> None:
                 asyncio.create_task(process_command(result))
             pcm_buffer.clear()
             kaldi.Reset()
+            activated = False
         else:
             part = json.loads(kaldi.PartialResult()).get('partial', '')
             if part:
@@ -263,7 +276,9 @@ async def main() -> None:
                     pcm_buffer.clear()
                 else:
                     # Проверяем, не появилось ли слово активации в промежуточном тексте
-                    if any(_matches_activation(w) for w in part.split()):
+                    if (not activated) and any(
+                        _matches_activation(w) for w in part.split()
+                    ):
                         log.info("Обнаружено слово активации в потоке: %s", part)
                         log.debug(
                             "Размер буфера перед повторным распознаванием: %d",
@@ -277,6 +292,7 @@ async def main() -> None:
                         _ = kaldi.AcceptWaveform(pcm)
                         log.info("Повторное распознавание выполнено")
                         pcm_buffer.clear()
+                        activated = True
 
         # Добавляем текущий кадр в кольцевой буфер и выводим его размер
         pcm_buffer.append(pcm)
