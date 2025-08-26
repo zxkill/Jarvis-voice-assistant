@@ -131,3 +131,149 @@ def test_voice_send_processes_queue(monkeypatch):
         voice._worker_task = None
 
     asyncio.run(run_test())
+    sys.modules.pop("working_tts", None)
+
+
+def test_voice_sends_telegram_when_listener_active(monkeypatch):
+    voice = _load_voice(monkeypatch)
+    sent = []
+    metrics = []
+
+    async def fake_speak_async(text, **kwargs):
+        pass
+
+    async def run_test():
+        monkeypatch.setattr(voice, "speak_async", fake_speak_async)
+        monkeypatch.setattr(voice, "inc_metric", lambda name: metrics.append(name))
+        monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
+        monkeypatch.setattr(voice.log, "info", lambda *a, **k: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram",
+            SimpleNamespace(send=lambda text: sent.append(text), _notifier=SimpleNamespace(_user_id=123)),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram_listener",
+            SimpleNamespace(is_active=lambda: True, USER_ID=123),
+        )
+
+        voice._queue = asyncio.Queue()
+        if voice._worker_task is not None:
+            voice._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await voice._worker_task
+            voice._worker_task = None
+
+        voice.send("hi")
+        await asyncio.wait_for(voice._queue.join(), timeout=1)
+
+        voice._worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await voice._worker_task
+        voice._worker_task = None
+
+    asyncio.run(run_test())
+
+    assert sent == ["hi"]
+    assert "telegram.outgoing" in metrics
+    sys.modules.pop("working_tts", None)
+
+
+def test_voice_not_send_when_listener_inactive(monkeypatch):
+    voice = _load_voice(monkeypatch)
+    sent = []
+
+    async def fake_speak_async(text, **kwargs):
+        pass
+
+    async def run_test():
+        monkeypatch.setattr(voice, "speak_async", fake_speak_async)
+        monkeypatch.setattr(voice, "inc_metric", lambda name: None)
+        monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
+        monkeypatch.setattr(voice.log, "info", lambda *a, **k: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram",
+            SimpleNamespace(send=lambda text: sent.append(text), _notifier=SimpleNamespace(_user_id=123)),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram_listener",
+            SimpleNamespace(is_active=lambda: False, USER_ID=123),
+        )
+
+        voice._queue = asyncio.Queue()
+        if voice._worker_task is not None:
+            voice._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await voice._worker_task
+            voice._worker_task = None
+
+        voice.send("hi")
+        await asyncio.wait_for(voice._queue.join(), timeout=1)
+
+        voice._worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await voice._worker_task
+        voice._worker_task = None
+
+    asyncio.run(run_test())
+
+    assert sent == []
+    sys.modules.pop("working_tts", None)
+
+
+def test_voice_logs_warning_on_telegram_error(monkeypatch):
+    voice = _load_voice(monkeypatch)
+    metrics = []
+    warnings = []
+
+    async def fake_speak_async(text, **kwargs):
+        pass
+
+    async def run_test():
+        monkeypatch.setattr(voice, "speak_async", fake_speak_async)
+        monkeypatch.setattr(voice, "inc_metric", lambda name: metrics.append(name))
+        monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
+
+        def fake_warning(msg, *a, **k):
+            warnings.append(msg % a if a else msg)
+
+        monkeypatch.setattr(voice.log, "warning", fake_warning)
+        monkeypatch.setattr(voice.log, "info", lambda *a, **k: None)
+
+        def raise_send(text):
+            raise RuntimeError("boom")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram",
+            SimpleNamespace(send=raise_send, _notifier=SimpleNamespace(_user_id=123)),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram_listener",
+            SimpleNamespace(is_active=lambda: True, USER_ID=123),
+        )
+
+        voice._queue = asyncio.Queue()
+        if voice._worker_task is not None:
+            voice._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await voice._worker_task
+            voice._worker_task = None
+
+        voice.send("hi")
+        await asyncio.wait_for(voice._queue.join(), timeout=1)
+
+        voice._worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await voice._worker_task
+        voice._worker_task = None
+
+    asyncio.run(run_test())
+
+    assert warnings and "telegram duplicate failed" in warnings[0]
+    assert "telegram.outgoing" not in metrics
+    sys.modules.pop("working_tts", None)

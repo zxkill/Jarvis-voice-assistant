@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from core.logging_json import configure_logging
-from core.metrics import set_metric
+from core.metrics import inc_metric, set_metric
 from working_tts import speak_async
 
 log = configure_logging("notifiers.voice")
@@ -18,8 +18,10 @@ log = configure_logging("notifiers.voice")
 _queue: asyncio.Queue[dict] = asyncio.Queue()
 # Задача-воркер, обрабатывающая очередь в фоне.
 _worker_task: asyncio.Task | None = None
-# Публикуем метрику длины очереди сразу при старте.
+# Публикуем метрики при старте: длина очереди и счётчик исходящих сообщений
+# в Telegram.
 set_metric("tts.queue_len", 0)
+set_metric("telegram.outgoing", 0)
 
 
 async def _worker() -> None:
@@ -35,6 +37,24 @@ async def _worker() -> None:
                 speed=item.get("speed"),
                 emotion=item.get("emotion"),
             )
+
+            # Если активен Telegram-слушатель и он работает с владельцем,
+            # дублируем текст голосового уведомления в личные сообщения.
+            try:
+                import importlib
+
+                tg = importlib.import_module("notifiers.telegram")
+                tl = importlib.import_module("notifiers.telegram_listener")
+
+                if getattr(tl, "is_active", lambda: False)() and getattr(
+                    tg._notifier, "_user_id", None
+                ) == getattr(tl, "USER_ID", None):
+                    tg.send(item["text"])
+                    log.info("duplicate telegram text=%r", item["text"])
+                    inc_metric("telegram.outgoing")
+            except Exception as exc:  # pragma: no cover - защита от сетевых ошибок
+                # Ошибки Telegram не должны мешать озвучиванию.
+                log.warning("telegram duplicate failed: %s", exc)
         except Exception:  # pragma: no cover - логируем неожиданные ошибки
             log.exception("voice TTS failure")
         finally:
