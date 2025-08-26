@@ -56,8 +56,11 @@ def test_activation_preserved_with_buffer():
     part = json.loads(kaldi.PartialResult())["partial"]
     assert any(_matches_activation(w) for w in part.split())
 
-    # При обнаружении активации повторно подаём буфер + текущий фрагмент
+    # При обнаружении активации повторно подаём кадры по отдельности,
+    # имитируя «прокрутку» буфера в реальном коде
     kaldi.Reset()
-    kaldi.AcceptWaveform(b"".join(buf) + pcm2)
+    for frame in buf:
+        kaldi.AcceptWaveform(frame)
+    kaldi.AcceptWaveform(pcm2)
     result = json.loads(kaldi.Result())["text"]
     assert result.startswith("джарвис")
