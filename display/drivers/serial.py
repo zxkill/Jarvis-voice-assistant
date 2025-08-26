@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import re
 import threading
 import time
 from queue import Empty, Queue
@@ -15,6 +16,52 @@ from core.logging_json import configure_logging
 from display import DisplayDriver, DisplayItem
 
 log = configure_logging("display.serial")
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def _parse_json_line(line: str) -> dict | None:
+    """
+    Попытаться восстановить и распарсить JSON, пришедший от M5Stack.
+
+    1. Отбрасывает мусор до первой фигурной скобки и после последней.
+    2. Добавляет кавычки вокруг ключей, если они были утеряны в потоке.
+
+    Возвращает словарь при успехе или ``None`` при ошибке.
+    """
+
+    # Находим границы возможного JSON. Иногда прошивка теряет фигурные скобки
+    # в начале или конце строки, поэтому пытаемся восстановить их.
+    idx = line.find("{")
+    end = line.rfind("}")
+
+    if idx == -1 and end != -1:
+        # Потеряна открывающая скобка: добавляем её и обрезаем строку.
+        clean = "{" + line[: end + 1]
+    elif idx != -1 and end == -1:
+        # Потеряна закрывающая скобка: добавляем её в конец.
+        clean = line[idx:] + "}"
+    elif idx == -1 or end == -1 or end <= idx:
+        # Скобки полностью отсутствуют или расположены некорректно.
+        return None
+    else:
+        clean = line[idx : end + 1]
+
+    if clean != line:
+        # Логируем восстановленную строку для упрощения отладки.
+        log.debug("JSON recovered: %s -> %s", line, clean)
+
+    # Добавляем кавычки вокруг ключей, если они потерялись в потоке
+    if clean.startswith("{") and not clean.startswith('{"'):
+        clean = '{"' + clean[1:]
+    clean = re.sub(r',\s*([A-Za-z_][A-Za-z0-9_]*)"?\s*:', r',"\1":', clean)
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return None
 
 # -----------------------------------------------------------------------------
 # Helper – autodetect serial port
@@ -65,6 +112,9 @@ class SerialDisplayDriver(DisplayDriver):
         self._inq: Queue[tuple[str, str]] = Queue()
         self._running = threading.Event()
         self._running.set()
+        # Блокировка на запись в порт, чтобы исключить одновременные обращения
+        # из разных потоков и гонки при закрытии соединения
+        self._tx_lock = threading.Lock()
         self.ser: Optional[serial.Serial] = None
         self._cache_sent = False
         self._last_handshake = 0.0
@@ -123,6 +173,10 @@ class SerialDisplayDriver(DisplayDriver):
                         self._cache_sent = False
                         self._push_cache()
                         self.ready.set()
+                        # После успешного рукопожатия просим устройство
+                        # отключить вывод логов в USB Serial, чтобы канал
+                        # использовался только для команд.
+                        self._send_json("log", "off")
                 self._send_json("hello", "pong")
             return
 
@@ -142,6 +196,11 @@ class SerialDisplayDriver(DisplayDriver):
                 self._cache_sent = False
                 self.ready.clear()
                 self.disconnected.clear()
+                # После успешного открытия порта сбрасываем счётчик ошибок записи,
+                # чтобы новые попытки начинались "с чистого листа".
+                if self._write_failures:
+                    log.debug("Reset write failure counter after reconnect")
+                self._write_failures = 0
                 break
             except serial.SerialException as exc:
                 if timeout is not None and time.monotonic() - start >= timeout:
@@ -161,48 +220,66 @@ class SerialDisplayDriver(DisplayDriver):
 
     def _send_json(self, kind: str, payload: str) -> None:
         """Write an arbitrary JSON message to the serial port."""
-        if not self.ser or not self.ser.is_open:
-            log.debug("Serial port not open, dropping frame kind=%s", kind)
-            return
-        msg = json.dumps({"kind": kind, "payload": payload})
-        log.debug("SER→M5 %s", msg)
-        try:
-            self.ser.write(msg.encode() + b"\n")
-            # Если запись прошла успешно, сбрасываем счётчик ошибок
-            if self._write_failures:
-                log.debug("Write recovered after %d failures", self._write_failures)
-            self._write_failures = 0
-        except serial.SerialException as exc:
-            # Ошибка записи: увеличиваем счётчик и решаем, нужно ли разрывать соединение
-            self._write_failures += 1
-            log.warning(
-                "Write error %d/%d: %s",
-                self._write_failures,
-                self.max_write_failures,
-                exc,
-            )
-            if self._write_failures >= self.max_write_failures:
-                # Превышен порог допустимых ошибок – считаем соединение потерянным
-                log.error("Write error threshold reached, disconnecting")
-                self.disconnected.set()
-                try:
-                    if self.ser and self.ser.is_open:
-                        log.warning("Closing serial port due to write failure")
-                        self.ser.close()
-                except Exception:
-                    # Логируем полную трассировку для упрощения отладки
-                    log.exception("Error closing serial port after write failure")
+        with self._tx_lock:
+            # Если порт уже закрыт, просто фиксируем факт и не пытаемся писать
+            if not self.ser or not self.ser.is_open:
+                log.debug("Serial port not open, dropping frame kind=%s", kind)
+                return
+
+            msg = json.dumps({"kind": kind, "payload": payload})
+            log.debug("SER→M5 %s", msg)
+            try:
+                self.ser.write(msg.encode() + b"\n")
+                # Если запись прошла успешно, сбрасываем счётчик ошибок
+                if self._write_failures:
+                    log.debug("Write recovered after %d failures", self._write_failures)
+                self._write_failures = 0
+            except serial.SerialException as exc:
+                # Ошибка записи: увеличиваем счётчик и решаем, нужно ли разрывать соединение
+                self._write_failures += 1
+                log.warning(
+                    "Write error %d/%d: %s",
+                    self._write_failures,
+                    self.max_write_failures,
+                    exc,
+                )
+                if self._write_failures >= self.max_write_failures:
+                    # Превышен порог допустимых ошибок – считаем соединение потерянным
+                    log.error("Write error threshold reached, disconnecting")
+                    self.disconnected.set()
+                    try:
+                        if self.ser and self.ser.is_open:
+                            log.warning("Closing serial port due to write failure")
+                            self.ser.close()
+                    except Exception:
+                        # Логируем полную трассировку ошибки закрытия
+                        log.exception("Error closing serial port after write failure")
+                    finally:
+                        # Удаляем ссылку на закрытый порт, чтобы другие потоки
+                        # не пытались писать в него и не получали ошибку
+                        self.ser = None
 
     def _send_item(self, item: DisplayItem) -> None:
         """Serialize item as JSON and write to serial port."""
         self._send_json(item.kind, item.payload)
 
     def _reader(self) -> None:
-        """Background thread: read lines, parse JSON, enqueue events."""
+        """Фоновый поток: читает строки, парсит JSON и ставит события в очередь."""
         buf = b""
+        bad_json_count = 0  # счётчик подряд идущих ошибок парсинга
         while self._running.is_set():
             try:
-                chunk = self.ser.read(self.ser.in_waiting or 1)
+                s = self.ser
+                if not s or not s.is_open:
+                    # Порт недоступен: ждём переподключения и инициируем его
+                    log.warning("Serial port not ready, waiting for reconnect")
+                    self.disconnected.set()
+                    time.sleep(self.reconnect_delay)
+                    self._open_serial()
+                    buf = b""
+                    continue
+
+                chunk = s.read(s.in_waiting or 1)
                 if not chunk:
                     continue
                 buf += chunk
@@ -217,27 +294,30 @@ class SerialDisplayDriver(DisplayDriver):
                         log.info("Board reboot detected")
                         self._cache_sent = False
 
-                    idx = line.find("{")
-                    end = line.rfind("}")
-                    if idx == -1 or end == -1:
+                    # Линии без JSON считаем диагностикой прошивки и пропускаем
+                    # Например, строки вида `[I] [SER] kind='track'`
+                    if "{" not in line or "}" not in line:
+                        log.info("M5 log: %s", line)
                         continue
-                    if idx > 0:
-                        log.debug("Discarding %d bytes of noise before JSON", idx)
-                        line = line[idx:]
-                        end -= idx
-                    if end < len(line) - 1:
-                        log.debug("Discarding %d bytes of noise after JSON", len(line) - end - 1)
-                        line = line[: end + 1]
 
-                    try:
-                        msg = json.loads(line)
-                        kind = msg.get("kind", "")
-                        payload = msg.get("payload", "")
-                        self._inq.put((kind, payload))
-                        self.on_event(kind, payload)
-                    except json.JSONDecodeError:
+                    msg = _parse_json_line(line)
+                    if msg is None:
+                        bad_json_count += 1
                         log.error("Bad JSON from M5: %s", line)
-            except (serial.SerialException, AttributeError) as exc:
+                        log.debug("Raw bytes: %s", raw)
+                        # Предупреждаем лишь один раз при достижении порога
+                        if bad_json_count == 5:
+                            log.warning(
+                                "Five consecutive JSON errors — waiting for resync"
+                            )
+                        continue
+
+                    bad_json_count = 0
+                    kind = msg.get("kind", "")
+                    payload = msg.get("payload", "")
+                    self._inq.put((kind, payload))
+                    self.on_event(kind, payload)
+            except serial.SerialException as exc:
                 if not self._running.is_set():
                     break
                 log.warning("Connection lost: %s", exc)
@@ -245,6 +325,7 @@ class SerialDisplayDriver(DisplayDriver):
                 try:
                     if self.ser and self.ser.is_open:
                         self.ser.close()
+                    self.ser = None
                 finally:
                     time.sleep(self.reconnect_delay)
                     self._open_serial()

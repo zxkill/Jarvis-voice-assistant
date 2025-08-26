@@ -35,7 +35,13 @@ public:
 
     const char* p = lvl == LogLevel::ERROR ? "[E] " :
                     lvl == LogLevel::WARN  ? "[W] " : "[I] ";
-    Serial.print(p); Serial.println(buf);
+    // По умолчанию логи не отправляются в USB Serial, чтобы не засорять
+    // канал управления. При необходимости их можно включить через
+    // enableSerialLogging().
+    if (instance().serial) {
+      Serial.print(p);
+      Serial.println(buf);
+    }
 
     auto& L = instance();
     if (!L.screen) return;
@@ -51,6 +57,8 @@ public:
   // ── управляем режимом ───────────────────────────────────────────
   static void enableScreenLogging(bool en) { instance().screen = en; }
   static void enableAutoPresent(bool en)   { instance().autoPush = en; }
+  // Включение/отключение отправки логов в USB Serial
+  static void enableSerialLogging(bool en) { instance().serial = en; }
 
   // ── показ лог-спрайта на дисплее ────────────────────────────────
   static void present() {
@@ -92,6 +100,7 @@ private:
   std::vector<String> lines;
   bool  screen   {true};
   bool  autoPush {true};
+  bool  serial   {false};  // отключаем вывод в Serial по умолчанию
 
   LGFX_Sprite spr{&M5.Display};
   bool        created{false};

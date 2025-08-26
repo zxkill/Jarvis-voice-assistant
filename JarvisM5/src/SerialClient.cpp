@@ -89,6 +89,13 @@ void SerialClient::handleJson_(const String& s) {
     servo_.updateFromError(dx, dy, dt);
     Logger::log(LogLevel::DEBUG, "[SER] track: dx=%.1f dy=%.1f dt=%u", dx, dy, (unsigned)dt);
   }
+  else if (!strcmp(kind, "log")) {
+    // Управление выводом логов в USB Serial: "on"/"off"
+    const char* t = d["payload"] | "off";
+    bool en = !strcmp(t, "on");
+    Logger::enableSerialLogging(en);
+    Logger::log(LogLevel::INFO, en ? "[SER] serial logging ON" : "[SER] serial logging OFF");
+  }
   else if (!strcmp(kind, "hello")) {
     // keep-alive от хоста, ничего делать не нужно
   }
