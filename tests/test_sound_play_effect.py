@@ -16,7 +16,23 @@ def test_play_effect(monkeypatch):
     effects = {
         "WAKE": sounds._Effect(files=["wake.wav"], gain=0.0, cooldown=0.0),
     }
-    monkeypatch.setattr(sounds, "_load_manifest", lambda: effects)
+    # Подменяем глобальный кеш эффектов, чтобы использовать тестовые данные
+    monkeypatch.setattr(sounds, "_EFFECTS", effects)
     sounds.play_effect("wake")
+    assert dummy_sd.calls == ["play"]
+
+
+def test_play_effect_respects_cooldown(monkeypatch):
+    """Повторный вызов не должен воспроизводить звук чаще cooldown."""
+
+    dummy_sd = DummySD()
+    monkeypatch.setattr(sounds, "sd", dummy_sd)
+    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    effect = sounds._Effect(files=["sigh.wav"], gain=0.0, cooldown=10.0)
+    monkeypatch.setattr(sounds, "_EFFECTS", {"SIGH": effect})
+
+    sounds.play_effect("sigh")
+    sounds.play_effect("sigh")  # вторая попытка до истечения cooldown
+
     assert dummy_sd.calls == ["play"]
 
