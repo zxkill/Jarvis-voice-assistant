@@ -19,7 +19,7 @@ import requests
 from core.config import load_config
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
-from app.command_processing import va_respond
+from core.request_source import set_request_source, reset_request_source
 
 # Инициализируем логгер для удобной отладки модуля.
 log = configure_logging("notifiers.telegram_listener")
@@ -37,8 +37,20 @@ log.info(
 
 # Формируем URL метода ``getUpdates`` с токеном бота.
 _API_URL = f"https://api.telegram.org/bot{_cfg.telegram.token}/getUpdates"
-# Разрешённый Telegram ID пользователя.
+# Разрешённый Telegram ID пользователя (владелец бота).
 _USER_ID = _cfg.user.telegram_user_id
+# Публичный алиас, чтобы другие модули могли проверить ID получателя.
+USER_ID = _USER_ID
+# Ссылка на обработчик команд; используется для подмены в тестах.
+va_respond = None  # type: ignore[assignment]
+# Флаг активности слушателя; используется для условной отправки дублирующих
+# сообщений из голосового канала.
+_RUNNING = False
+
+
+def is_active() -> bool:
+    """Возвращает ``True``, если слушатель сейчас запущен."""
+    return _RUNNING
 
 
 class _DummyResponse:
@@ -113,7 +125,14 @@ def listen(
                 inc_metric("telegram.incoming")
                 log.info("incoming command: %r", text)
                 try:
-                    asyncio.run(va_respond(text))
+                    handler = va_respond
+                    if handler is None:  # импортируем по требованию
+                        from app.command_processing import va_respond as handler
+                    token = set_request_source("telegram")
+                    try:
+                        asyncio.run(handler(text))
+                    finally:
+                        reset_request_source(token)
                 except Exception:  # pragma: no cover - на всякий случай логируем
                     log.exception("va_respond failed")
         except (requests.RequestException, ValueError) as exc:
@@ -126,7 +145,9 @@ def listen(
 async def launch(*, stop_event: threading.Event | None = None) -> None:
     """Асинхронный запуск слушателя в отдельном потоке."""
 
+    global _RUNNING
     log.info("telegram listener started")
+    _RUNNING = True
     try:
         # ``listen`` блокирует поток, поэтому выполняем его в пуле потоков.
         await asyncio.to_thread(listen, stop_event=stop_event)
@@ -140,5 +161,6 @@ async def launch(*, stop_event: threading.Event | None = None) -> None:
         raise
     finally:
         # Отмечаем завершение работы слушателя.
+        _RUNNING = False
         log.info("telegram listener stopped")
 

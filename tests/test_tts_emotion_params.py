@@ -4,6 +4,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from core.request_source import set_request_source, reset_request_source
 
 
 async def _dummy_speak_async(text: str, *, pitch=None, speed=None, emotion=None, loop=None):
@@ -39,6 +40,8 @@ def test_voice_passes_emotion_params(monkeypatch):
         monkeypatch.setattr(voice, "speak_async", fake_speak_async)
         monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
 
+        token = set_request_source("voice")
+
         # Сбрасываем очередь и воркер перед тестом
         voice._queue = asyncio.Queue()
         if voice._worker_task is not None:
@@ -49,6 +52,7 @@ def test_voice_passes_emotion_params(monkeypatch):
 
         voice.send("hi", pitch=1.3, speed=1.1, emotion="happy")
         await asyncio.wait_for(voice._queue.join(), timeout=1)
+        reset_request_source(token)
 
         assert captured == {
             "text": "hi",
