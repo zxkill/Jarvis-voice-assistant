@@ -107,9 +107,15 @@ def listen(
                 continue
 
             for update in data.get("result", []):
-                # Обновляем offset, чтобы следующий запрос начинался с
-                # непрочитанных обновлений.
-                offset = max(offset, update.get("update_id", 0) + 1)
+                # ``update_id`` используется для расчёта ``offset``.
+                update_id = update.get("update_id", 0)
+                # Если сервер по какой‑то причине прислал уже обработанное
+                # обновление — пропускаем его, чтобы не выполнять команду дважды.
+                if update_id < offset:
+                    log.debug("duplicate update_id: %s", update_id)
+                    continue
+                # Сдвигаем ``offset`` на следующий ID.
+                offset = update_id + 1
                 message = update.get("message") or {}
                 chat_id = (message.get("chat") or {}).get("id")
                 text = message.get("text")
