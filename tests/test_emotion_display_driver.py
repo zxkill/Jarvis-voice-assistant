@@ -1,7 +1,7 @@
 """Тесты для EmotionDisplayDriver.
 
-Проверяем корректную отрисовку эмоции ``TIRED`` на дисплее, когда
-аппаратная часть M5Stack не поддерживает соответствующую иконку.
+Убеждаемся, что эмоция ``TIRED`` рисуется собственной иконкой
+на обновлённой прошивке M5Stack без текстовых костылей.
 """
 
 import core.events as core_events
@@ -25,8 +25,8 @@ class _DummyDisplayDriver:
         return
 
 
-def test_tired_fallback(monkeypatch):
-    """Эмоция ``TIRED`` должна отображаться как ``Sleepy`` + текст."""
+def test_tired_native(monkeypatch):
+    """Эмоция ``TIRED`` должна передаваться как отдельная иконка."""
 
     # очищаем глобальных подписчиков между тестами
     core_events._subscribers.clear()
@@ -44,11 +44,11 @@ def test_tired_fallback(monkeypatch):
     # публикуем событие усталости
     core_events.publish(core_events.Event(kind="emotion_changed", attrs={"emotion": Emotion.TIRED}))
 
-    # должны получить две отрисовки: sleepy + текст
-    assert dummy.calls[0].kind == "emotion" and dummy.calls[0].payload == Emotion.SLEEPY.value
-    assert dummy.calls[1].kind == "text" and "zZ" in dummy.calls[1].payload
+    # должны получить очистку текста и отрисовку новой иконки
+    assert dummy.calls[0].kind == "text" and dummy.calls[0].payload is None
+    assert dummy.calls[1].kind == "emotion" and dummy.calls[1].payload == Emotion.TIRED.value
 
-    # смена эмоции должна очистить текст и показать новую иконку
+    # смена эмоции должна аналогично очистить текст и показать новую иконку
     core_events.publish(core_events.Event(kind="emotion_changed", attrs={"emotion": Emotion.HAPPY}))
     assert dummy.calls[2].kind == "text" and dummy.calls[2].payload is None
     assert dummy.calls[3].kind == "emotion" and dummy.calls[3].payload == Emotion.HAPPY.value

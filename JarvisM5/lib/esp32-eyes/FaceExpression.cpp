@@ -132,15 +132,23 @@ void FaceExpression::GoTo_Unimpressed()
 
 void FaceExpression::GoTo_Sleepy()
 {
-	ClearVariations();
-	_face.RightEye.TransitionTo(Preset_Sleepy);
-	_face.LeftEye.TransitionTo(Preset_Sleepy_Alt);
+        ClearVariations();
+        _face.RightEye.TransitionTo(Preset_Sleepy);
+        _face.LeftEye.TransitionTo(Preset_Sleepy_Alt);
+}
+
+void FaceExpression::GoTo_Tired()
+{
+        // Усталость: глаза почти закрыты
+        ClearVariations();
+        _face.RightEye.TransitionTo(Preset_Tired);
+        _face.LeftEye.TransitionTo(Preset_Tired_Alt);
 }
 
 void FaceExpression::GoTo_Suspicious()
 {
-	ClearVariations();
-	_face.RightEye.TransitionTo(Preset_Suspicious);
+        ClearVariations();
+        _face.RightEye.TransitionTo(Preset_Suspicious);
 	_face.LeftEye.TransitionTo(Preset_Suspicious_Alt);
 }
 

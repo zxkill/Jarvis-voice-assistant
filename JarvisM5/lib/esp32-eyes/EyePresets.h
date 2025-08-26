@@ -261,24 +261,56 @@ static const EyeConfig Preset_Sleepy = {
 };
 
 static const EyeConfig Preset_Sleepy_Alt = {
-	.OffsetX = 0,
-	.OffsetY = -2,
-	.Height = 8,
-	.Width = 40,
-	.Slope_Top = -0.5,
-	.Slope_Bottom = -0.5,
-	.Radius_Top = 3,
-	.Radius_Bottom = 3,
-	.Inverse_Radius_Top = 0,
-	.Inverse_Radius_Bottom = 0,
-	.Inverse_Offset_Top = 0,
-	.Inverse_Offset_Bottom = 0
+        .OffsetX = 0,
+        .OffsetY = -2,
+        .Height = 8,
+        .Width = 40,
+        .Slope_Top = -0.5,
+        .Slope_Bottom = -0.5,
+        .Radius_Top = 3,
+        .Radius_Bottom = 3,
+        .Inverse_Radius_Top = 0,
+        .Inverse_Radius_Bottom = 0,
+        .Inverse_Offset_Top = 0,
+        .Inverse_Offset_Bottom = 0
+};
+
+// Более узкие глаза для отображения глубокой усталости
+static const EyeConfig Preset_Tired = {
+        .OffsetX = 0,
+        .OffsetY = -4,
+        .Height = 6,
+        .Width = 40,
+        .Slope_Top = -0.5,
+        .Slope_Bottom = -0.5,
+        .Radius_Top = 3,
+        .Radius_Bottom = 3,
+        .Inverse_Radius_Top = 0,
+        .Inverse_Radius_Bottom = 0,
+        .Inverse_Offset_Top = 0,
+        .Inverse_Offset_Bottom = 0
+};
+
+// Вариант для левого глаза — ещё более закрытый
+static const EyeConfig Preset_Tired_Alt = {
+        .OffsetX = 0,
+        .OffsetY = -4,
+        .Height = 4,
+        .Width = 40,
+        .Slope_Top = -0.5,
+        .Slope_Bottom = -0.5,
+        .Radius_Top = 3,
+        .Radius_Bottom = 3,
+        .Inverse_Radius_Top = 0,
+        .Inverse_Radius_Bottom = 0,
+        .Inverse_Offset_Top = 0,
+        .Inverse_Offset_Bottom = 0
 };
 
 static const EyeConfig Preset_Suspicious = {
-	.OffsetX = 0,
-	.OffsetY = 0,
-	.Height = 22,
+        .OffsetX = 0,
+        .OffsetY = 0,
+        .Height = 22,
 	.Width = 40,
 	.Slope_Top = 0,
 	.Slope_Bottom = 0,

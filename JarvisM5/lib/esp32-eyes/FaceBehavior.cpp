@@ -75,11 +75,12 @@ void FaceBehavior::GoToEmotion(eEmotions emotion) {
     case eEmotions::Frustrated: _face.Expression.GoTo_Frustrated(); break;
     case eEmotions::Unimpressed: _face.Expression.GoTo_Unimpressed(); break;
     case eEmotions::Sleepy: _face.Expression.GoTo_Sleepy(); break;
+    case eEmotions::Tired: _face.Expression.GoTo_Tired(); break; // новая эмоция
     case eEmotions::Suspicious: _face.Expression.GoTo_Suspicious(); break;
     case eEmotions::Squint: _face.Expression.GoTo_Squint(); break;
     case eEmotions::Furious: _face.Expression.GoTo_Furious(); break;
     case eEmotions::Scared: _face.Expression.GoTo_Scared(); break;
     case eEmotions::Awe: _face.Expression.GoTo_Awe(); break;
     default: break;
-	}
+        }
 }
