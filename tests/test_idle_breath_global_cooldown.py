@@ -1,6 +1,5 @@
 """Проверяем, что глобальный таймер предотвращает повтор дыхания."""
 
-import threading
 import emotion.sounds as sounds
 
 
@@ -21,15 +20,18 @@ def test_global_idle_breath_cooldown(monkeypatch):  # type: ignore[no-untyped-de
     monkeypatch.setattr(sounds, "sd", dummy_sd)
     monkeypatch.setattr(sounds, "_read_wav", lambda path: (0.0, 44100))
 
-    # Отключаем фоновые потоки, чтобы тест был детерминированным
-    class SilentThread:
+    # Отключаем фоновый таймер, чтобы тест был детерминированным
+    class SilentTimer:
         def __init__(self, *a, **k):  # type: ignore[no-untyped-def]
             pass
 
         def start(self) -> None:  # type: ignore[no-untyped-def]
             pass
 
-    monkeypatch.setattr(threading, "Thread", SilentThread)
+        def cancel(self) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+    monkeypatch.setattr(sounds.threading, "Timer", lambda *a, **k: SilentTimer())
 
     # Сбрасываем глобальную метку времени на далёкое прошлое,
     # чтобы первый вызов не был пропущен из-за глобального интервала.

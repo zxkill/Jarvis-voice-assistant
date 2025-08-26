@@ -12,9 +12,10 @@ import random
 import time
 import wave
 import inspect
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from threading import Lock
 
 try:  # ``numpy`` может быть недоступен в некоторых средах
@@ -234,29 +235,49 @@ class EmotionSoundDriver:
         self._present: bool = False
         core_events.subscribe("emotion_changed", self._on_emotion_changed)
         core_events.subscribe("presence.update", self._on_presence_update)
-        # Фоновый поток воспроизводит короткие «дыхания» во время простоя.
-        # Поток демонический, чтобы не блокировать завершение приложения.
-        import threading
+        # Таймер, планирующий редкое воспроизведение "дыхания".  Он
+        # перезапускается при каждом изменении эмоции или флага присутствия,
+        # чтобы звук не звучал, пока пользователь рядом.
+        self._breath_timer: Optional[threading.Timer] = None
+        self._schedule_idle_breath()
 
-        threading.Thread(target=self._idle_loop, daemon=True).start()
+    def _schedule_idle_breath(self) -> None:
+        """Переустанавливает таймер фонового дыхания.
 
-    def _idle_loop(self) -> None:
-        """Фоновый цикл, периодически запускающий короткое дыхание."""
+        Звук планируется только при нейтральной эмоции и отсутствии
+        пользователя перед камерой.  При любых изменениях условия таймер
+        отменяется и запускается вновь, чтобы исключить лишние воспроизведения.
+        """
+
+        if self._breath_timer:
+            self._breath_timer.cancel()
+            self._breath_timer = None
+
+        if self._current is not Emotion.NEUTRAL or self._present:
+            self.log.debug(
+                "idle breath not scheduled: emotion=%s present=%s",
+                self._current,
+                self._present,
+            )
+            return
+
         effect = self._effects.get("IDLE_BREATH")
-        if not effect:
-            return  # в манифесте нет описания — работать нечему
-        while True:
-            # Минимальное ожидание — 15 минут, даже если в манифесте задан
-            # меньший интервал.  Это защищает от случайных повторов звука.
+        base = MIN_IDLE_BREATH_COOLDOWN
+        if effect:
             base = max(effect.cooldown, MIN_IDLE_BREATH_COOLDOWN)
-            delay = random.uniform(base, base * 2)
-            self.log.debug("idle breath scheduled in %.1fs", delay)
-            time.sleep(delay)
-            # Воспроизводим «дыхание» только если никого нет в кадре и
-            # текущая эмоция нейтральна.  Иначе пользователю будет казаться,
-            # что ассистент вздыхает при виде собеседника.
-            if self._current is Emotion.NEUTRAL and not self._present:
-                self.play_idle_effect()
+        delay = random.uniform(base, base * 2)
+        self.log.debug("idle breath scheduled in %.1fs", delay)
+        self._breath_timer = threading.Timer(delay, self._on_idle_breath_timer)
+        self._breath_timer.daemon = True
+        self._breath_timer.start()
+
+    def _on_idle_breath_timer(self) -> None:
+        """Колбэк таймера: воспроизводит дыхание и планирует следующее."""
+
+        self._breath_timer = None
+        if self._current is Emotion.NEUTRAL and not self._present:
+            self.play_idle_effect()
+        self._schedule_idle_breath()
 
     def _play_effect(self, name: str) -> None:
         """Воспроизводит эффект из заранее загруженного словаря."""
@@ -321,6 +342,8 @@ class EmotionSoundDriver:
         """Обновление флага присутствия пользователя."""
         self._present = bool(event.attrs.get("present"))
         self.log.debug("presence %s", "present" if self._present else "absent")
+        # При появлении пользователя или его уходе перепланируем дыхание.
+        self._schedule_idle_breath()
 
     def _on_emotion_changed(self, event: core_events.Event) -> None:
         if sd is None:
@@ -330,3 +353,5 @@ class EmotionSoundDriver:
         self._current = emotion
         key = _ALIASES.get(emotion, emotion.name)
         self._play_effect(key)
+        # Каждая смена эмоции влияет на расписание дыхания.
+        self._schedule_idle_breath()
