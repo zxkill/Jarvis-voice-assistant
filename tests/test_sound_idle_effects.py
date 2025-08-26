@@ -53,3 +53,19 @@ def test_idle_effect_with_cooldown(monkeypatch, capsys):  # type: ignore[no-unty
     driver.play_idle_effect()
     assert len(dummy_sd.calls) == 2
 
+
+def test_idle_effect_repeat(monkeypatch):  # type: ignore[no-untyped-def]
+    """Повторный запуск по параметру repeat воспроизводит звук несколько раз."""
+
+    dummy_sd = DummySD()
+    monkeypatch.setattr(sounds, "sd", dummy_sd)
+    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0.0, 44100))
+    driver = sounds.EmotionSoundDriver()
+    driver._effects = {
+        "IDLE_BREATH": sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=0.0, repeat=2)
+    }
+
+    driver.play_idle_effect()
+
+    assert dummy_sd.calls == [(0.0, 44100), (0.0, 44100)]
+
