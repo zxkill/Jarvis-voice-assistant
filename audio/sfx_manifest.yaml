@@ -131,3 +131,21 @@ WAKE:
   files:
     - audio/sfx/wake/mixkit_futuristic_door_open.wav
     - audio/sfx/wake/mixkit_machine_activation_short.wav
+
+IDLE_BREATH:
+  gain_db: -18
+  cooldown_ms: 5000
+  files:
+    - audio/sfx/idle/breath_soft.wav
+
+YAWN:
+  gain_db: -9
+  cooldown_ms: 6000
+  files:
+    - audio/sfx/sleepy/yawn_short.wav
+
+SIGH:
+  gain_db: -9
+  cooldown_ms: 6000
+  files:
+    - audio/sfx/sad/sigh_short.wav
