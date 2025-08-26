@@ -251,12 +251,19 @@ class SerialDisplayDriver(DisplayDriver):
                         log.info("Board reboot detected")
                         self._cache_sent = False
 
+                    # Линии без JSON считаем диагностикой прошивки и пропускаем
+                    # Например, строки вида `[I] [SER] kind='track'`
+                    if "{" not in line or "}" not in line:
+                        log.info("M5 log: %s", line)
+                        continue
+
                     msg = _parse_json_line(line)
                     if msg is None:
                         bad_json_count += 1
                         log.error("Bad JSON from M5: %s", line)
                         log.debug("Raw bytes: %s", raw)
-                        if bad_json_count >= 5:
+                        # Предупреждаем лишь один раз при достижении порога
+                        if bad_json_count == 5:
                             log.warning(
                                 "Five consecutive JSON errors — waiting for resync"
                             )

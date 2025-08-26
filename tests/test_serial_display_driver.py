@@ -151,6 +151,35 @@ def test_write_error_threshold_closes_port_and_sets_flag(monkeypatch):
     driver.close()
 
 
+def test_non_json_lines_are_ignored(monkeypatch, capfd):
+    """Строки без JSON должны игнорироваться и не увеличивать счётчик ошибок."""
+
+    dummy = DummySerial()
+    fake_serial = types.SimpleNamespace(Serial=lambda *a, **k: dummy, SerialException=Exception)
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial.tools = fake_tools
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    driver = SerialDisplayDriver(port="dummy")
+    # Подбрасываем в буфер строку без фигурных скобок
+    dummy.feed(b"[I] [SER] kind='track'\n")
+    time.sleep(0.3)
+
+    # Считываем логи до закрытия и после, чтобы ничего не потерять
+    err = capfd.readouterr().err
+    driver.close()
+    err += capfd.readouterr().err
+
+    # Драйвер должен проигнорировать строку и не записать событие в очередь
+    assert driver._inq.empty(), "Очередь событий должна быть пустой"
+    # В логах не должно появиться сообщения о некорректном JSON
+    assert "Bad JSON" not in err, "Не должно быть ошибок JSON"
+
+
 def test_parse_json_line_recovers_missing_quotes():
     """Парсер должен восстанавливать ключи без кавычек."""
     from display.drivers.serial import _parse_json_line
