@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import re
 import threading
 import time
 from queue import Empty, Queue
@@ -15,6 +16,38 @@ from core.logging_json import configure_logging
 from display import DisplayDriver, DisplayItem
 
 log = configure_logging("display.serial")
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def _parse_json_line(line: str) -> dict | None:
+    """
+    Попытаться восстановить и распарсить JSON, пришедший от M5Stack.
+
+    1. Отбрасывает мусор до первой фигурной скобки и после последней.
+    2. Добавляет кавычки вокруг ключей, если они были утеряны в потоке.
+
+    Возвращает словарь при успехе или ``None`` при ошибке.
+    """
+
+    # Находим границы возможного JSON
+    idx = line.find("{")
+    end = line.rfind("}")
+    if idx == -1 or end == -1 or end <= idx:
+        return None
+    clean = line[idx : end + 1]
+
+    # Добавляем кавычки вокруг ключей, если они потерялись в потоке
+    if clean.startswith("{") and not clean.startswith('{"'):
+        clean = '{"' + clean[1:]
+    clean = re.sub(r',\s*([A-Za-z_][A-Za-z0-9_]*)"?\s*:', r',"\1":', clean)
+
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return None
 
 # -----------------------------------------------------------------------------
 # Helper – autodetect serial port
@@ -198,8 +231,9 @@ class SerialDisplayDriver(DisplayDriver):
         self._send_json(item.kind, item.payload)
 
     def _reader(self) -> None:
-        """Background thread: read lines, parse JSON, enqueue events."""
+        """Фоновый поток: читает строки, парсит JSON и ставит события в очередь."""
         buf = b""
+        bad_json_count = 0  # счётчик подряд идущих ошибок парсинга
         while self._running.is_set():
             try:
                 chunk = self.ser.read(self.ser.in_waiting or 1)
@@ -217,26 +251,22 @@ class SerialDisplayDriver(DisplayDriver):
                         log.info("Board reboot detected")
                         self._cache_sent = False
 
-                    idx = line.find("{")
-                    end = line.rfind("}")
-                    if idx == -1 or end == -1:
-                        continue
-                    if idx > 0:
-                        log.debug("Discarding %d bytes of noise before JSON", idx)
-                        line = line[idx:]
-                        end -= idx
-                    if end < len(line) - 1:
-                        log.debug("Discarding %d bytes of noise after JSON", len(line) - end - 1)
-                        line = line[: end + 1]
-
-                    try:
-                        msg = json.loads(line)
-                        kind = msg.get("kind", "")
-                        payload = msg.get("payload", "")
-                        self._inq.put((kind, payload))
-                        self.on_event(kind, payload)
-                    except json.JSONDecodeError:
+                    msg = _parse_json_line(line)
+                    if msg is None:
+                        bad_json_count += 1
                         log.error("Bad JSON from M5: %s", line)
+                        log.debug("Raw bytes: %s", raw)
+                        if bad_json_count >= 5:
+                            log.warning(
+                                "Five consecutive JSON errors — waiting for resync"
+                            )
+                        continue
+
+                    bad_json_count = 0
+                    kind = msg.get("kind", "")
+                    payload = msg.get("payload", "")
+                    self._inq.put((kind, payload))
+                    self.on_event(kind, payload)
             except (serial.SerialException, AttributeError) as exc:
                 if not self._running.is_set():
                     break

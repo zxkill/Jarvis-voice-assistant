@@ -149,3 +149,26 @@ def test_write_error_threshold_closes_port_and_sets_flag(monkeypatch):
     assert not dummy.is_open, "Порт должен быть закрыт после превышения порога"
 
     driver.close()
+
+
+def test_parse_json_line_recovers_missing_quotes():
+    """Парсер должен восстанавливать ключи без кавычек."""
+    from display.drivers.serial import _parse_json_line
+
+    msg = _parse_json_line('{kind":"hello","payload":"ping"}')
+    assert msg == {"kind": "hello", "payload": "ping"}
+
+
+def test_parse_json_line_strips_noise():
+    """Парсер корректно вырезает мусор вокруг JSON."""
+    from display.drivers.serial import _parse_json_line
+
+    msg = _parse_json_line('xxx{"kind":"hello","payload":"ready"}yyy')
+    assert msg == {"kind": "hello", "payload": "ready"}
+
+
+def test_parse_json_line_returns_none_on_failure():
+    """При невозможности парсинга возвращается None."""
+    from display.drivers.serial import _parse_json_line
+
+    assert _parse_json_line('broken') is None
