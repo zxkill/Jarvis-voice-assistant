@@ -163,7 +163,17 @@ class SerialDisplayDriver(DisplayDriver):
         try:
             self.ser.write(msg.encode() + b"\n")
         except serial.SerialException as exc:
+            # При возникновении ошибки записи считаем соединение потерянным
+            # и закрываем порт, чтобы поток чтения инициировал переподключение.
             log.error("Write error: %s", exc)
+            self.disconnected.set()
+            try:
+                if self.ser and self.ser.is_open:
+                    log.warning("Closing serial port due to write failure")
+                    self.ser.close()
+            except Exception:
+                # Логируем полную трассировку для упрощения отладки
+                log.exception("Error closing serial port after write failure")
 
     def _send_item(self, item: DisplayItem) -> None:
         """Serialize item as JSON and write to serial port."""
