@@ -52,23 +52,15 @@ async def _worker() -> None:
                 emotion=item.get("emotion"),
             )
 
-            # Если активен Telegram-слушатель и он работает с владельцем,
-            # дублируем текст голосового уведомления в личные сообщения.
-            try:
-                import importlib
-
-                tg = importlib.import_module("notifiers.telegram")
-                tl = importlib.import_module("notifiers.telegram_listener")
-
-                if getattr(tl, "is_active", lambda: False)() and getattr(
-                    tg._notifier, "_user_id", None
-                ) == getattr(tl, "USER_ID", None):
-                    tg.send(item["text"])
-                    log.info("duplicate telegram text=%r", item["text"])
-                    inc_metric("telegram.outgoing")
-            except Exception as exc:  # pragma: no cover - защита от сетевых ошибок
-                # Ошибки Telegram не должны мешать озвучиванию.
-                log.warning("telegram duplicate failed: %s", exc)
+            # Ранее здесь дублировались голосовые уведомления в Telegram.
+            # По требованию пользователя отключаем такую логику: ответ
+            # приходит только через тот канал, откуда поступил запрос.
+            # Для удобства отладки фиксируем это событие в логах.
+            log.debug(
+                "skip telegram duplicate for voice source=%s text=%r",
+                source,
+                item["text"],
+            )
         except Exception:  # pragma: no cover - логируем неожиданные ошибки
             log.exception("voice TTS failure")
         finally:
