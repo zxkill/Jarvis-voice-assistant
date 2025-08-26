@@ -15,6 +15,7 @@ import json
 import signal
 import sys
 import threading
+from collections import deque
 from typing import Any
 
 from display import DisplayItem, init_driver
@@ -96,6 +97,7 @@ async def main() -> None:
         extract_cmd,
         is_stop_cmd,
         va_respond,
+        _matches_activation,
     )
     from app.presence_session import setup_presence_session
     from app.gui import gui_loop
@@ -188,6 +190,13 @@ async def main() -> None:
     kaldi = vosk.KaldiRecognizer(model, 16000)
     recorder = PvRecorder(device_index=mic_idx, frame_length=512)
 
+    # Кольцевой буфер на ~1 секунду аудио.
+    # Храним последние PCM-кадры, чтобы при позднем обнаружении слова
+    # активации повторно передать их в распознаватель и не потерять
+    # начало команды.
+    buffer_size = int(16000 / recorder.frame_length)  # кол-во кадров в секунде
+    pcm_buffer: deque[bytes] = deque(maxlen=buffer_size)
+
     # 3. Приветственный звук (синхронно, чтобы не потерялся)
     await asyncio.to_thread(sounds.play_effect, "WAKE")
     driver.draw(DisplayItem(kind="mode", payload="run"))
@@ -219,11 +228,11 @@ async def main() -> None:
         raw_data = await asyncio.to_thread(recorder.read)
         pcm_arr = array.array('h', raw_data)
         pcm = pcm_arr.tobytes()
-
         if kaldi.AcceptWaveform(pcm):
             result = json.loads(kaldi.Result()).get('text', '')
             if not result:
                 kaldi.Reset()
+                pcm_buffer.clear()
                 continue
             log.info("Услышано: %s", result)  # логируем каждую распознанную фразу
             if working_tts.is_playing:
@@ -232,11 +241,13 @@ async def main() -> None:
                     working_tts.stop_speaking()
                     stop_mgr.trigger()
                 kaldi.Reset()
+                pcm_buffer.clear()
                 continue
             cmd = extract_cmd(result)  # есть слово активации с небольшой погрешностью
             if cmd:
                 publish(Event(kind="speech.recognized", attrs={"text": result}))
                 asyncio.create_task(process_command(result))
+            pcm_buffer.clear()
             kaldi.Reset()
         else:
             part = json.loads(kaldi.PartialResult()).get('partial', '')
@@ -249,7 +260,23 @@ async def main() -> None:
                     working_tts.stop_speaking()
                     stop_mgr.trigger()
                     kaldi.Reset()
+                    pcm_buffer.clear()
+                else:
+                    # Проверяем, не появилось ли слово активации в промежуточном тексте
+                    if any(_matches_activation(w) for w in part.split()):
+                        log.info("Обнаружено слово активации в потоке: %s", part)
+                        log.debug(
+                            "Размер буфера перед повторным распознаванием: %d",
+                            len(pcm_buffer),
+                        )
+                        kaldi.Reset()
+                        kaldi.AcceptWaveform(b"".join(pcm_buffer) + pcm)
+                        log.info("Повторное распознавание выполнено")
+                        pcm_buffer.clear()
 
+        # Добавляем текущий кадр в кольцевой буфер и выводим его размер
+        pcm_buffer.append(pcm)
+        log.debug("Размер кольцевого буфера: %d", len(pcm_buffer))
 
 if __name__ == "__main__":
     try:
