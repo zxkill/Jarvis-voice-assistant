@@ -154,8 +154,13 @@ class EmotionManager:
         )
 
     def _on_speech_started(self, event: core_events.Event) -> None:
-        """Отметить, что началось воспроизведение речи."""
+        """Отметить, что началось воспроизведение речи.
+
+        Дополняем событие текущей эмоцией, чтобы TTS и другие подписчики
+        могли учитывать состояние персонажа при воспроизведении."""
         self._speech_active = True
+        event.attrs["emotion"] = self._state.current
+        log.debug("speech.synthesis_started emotion=%s", self._state.current.value)
 
     def _on_speech_finished(self, event: core_events.Event) -> None:
         """Опубликовать отложенную эмоцию после завершения речи."""

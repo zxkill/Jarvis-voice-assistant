@@ -13,8 +13,9 @@ from working_tts import speak_async
 
 log = configure_logging("notifiers.voice")
 
-# Очередь текстов на озвучивание.
-_queue: asyncio.Queue[str] = asyncio.Queue()
+# Очередь запросов на озвучивание.  Каждый элемент — словарь с полями
+# ``text``, ``pitch``, ``speed`` и ``emotion``.
+_queue: asyncio.Queue[dict] = asyncio.Queue()
 # Задача-воркер, обрабатывающая очередь в фоне.
 _worker_task: asyncio.Task | None = None
 # Публикуем метрику длины очереди сразу при старте.
@@ -22,18 +23,21 @@ set_metric("tts.queue_len", 0)
 
 
 async def _worker() -> None:
-    """Бесконечный цикл, извлекающий тексты из очереди и озвучивающий их."""
+    """Бесконечный цикл, озвучивающий запросы из очереди."""
     while True:
-        # Получаем следующий текст из очереди (ожидаем, если её нет)
-        text = await _queue.get()
+        # Получаем следующий элемент из очереди; структура описана выше.
+        item = await _queue.get()
         try:
-            # Обновляем метрику длины очереди и запускаем TTS
             set_metric("tts.queue_len", _queue.qsize())
-            await speak_async(text)
+            await speak_async(
+                item["text"],
+                pitch=item.get("pitch"),
+                speed=item.get("speed"),
+                emotion=item.get("emotion"),
+            )
         except Exception:  # pragma: no cover - логируем неожиданные ошибки
             log.exception("voice TTS failure")
         finally:
-            # Сообщаем очереди об обработке элемента и снова обновляем метрику
             _queue.task_done()
             set_metric("tts.queue_len", _queue.qsize())
 
@@ -45,17 +49,29 @@ def start() -> None:
         _worker_task = asyncio.create_task(_worker())
 
 
-def say(text: str) -> None:
-    """Добавить *text* в очередь на озвучивание."""
-    _queue.put_nowait(text)
+def say(text: str, *, pitch: float | None = None, speed: float | None = None, emotion: str | None = None) -> None:
+    """Добавить *text* в очередь на озвучивание вместе с параметрами.
+
+    ``pitch`` и ``speed`` задаются как коэффициенты, ``emotion`` — имя
+    пресета из :data:`working_tts.TTS_PRESETS`.
+    """
+    _queue.put_nowait({"text": text, "pitch": pitch, "speed": speed, "emotion": emotion})
+    log.debug("queued voice text=%r emotion=%s pitch=%s speed=%s", text, emotion, pitch, speed)
     set_metric("tts.queue_len", _queue.qsize())
 
 
-def send(text: str) -> None:
+def send(
+    text: str,
+    *,
+    pitch: float | None = None,
+    speed: float | None = None,
+    emotion: str | None = None,
+) -> None:
     """Публичная обёртка над :func:`say`.
 
     При первом вызове автоматически запускает воркер, чтобы TTS начал
-    обрабатывать очередь сообщений.
+    обрабатывать очередь сообщений.  Дополнительные параметры передаются
+    в :func:`working_tts.speak_async`.
     """
     start()
-    say(text)
+    say(text, pitch=pitch, speed=speed, emotion=emotion)

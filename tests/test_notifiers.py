@@ -30,7 +30,7 @@ def _load_telegram(monkeypatch):
 
 
 def _load_voice(monkeypatch):
-    async def dummy_speak_async(text: str):
+    async def dummy_speak_async(text: str, *, pitch=None, speed=None, emotion=None, loop=None):
         pass
 
     dummy_module = SimpleNamespace(speak_async=dummy_speak_async)
@@ -103,7 +103,7 @@ def test_voice_send_processes_queue(monkeypatch):
     voice = _load_voice(monkeypatch)
     spoken = []
 
-    async def fake_speak_async(text):
+    async def fake_speak_async(text, **kwargs):
         spoken.append(text)
 
     async def run_test():
