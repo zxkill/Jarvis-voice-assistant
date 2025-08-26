@@ -134,7 +134,9 @@ WAKE:
 
 IDLE_BREATH:
   gain_db: -18
-  cooldown_ms: 5000
+  # Ограничиваем воспроизведение короткого дыхания одним разом в 15 минут,
+  # чтобы звук не раздражал пользователя при долгом простое.
+  cooldown_ms: 900000
   files:
     - audio/sfx/idle/breath_soft.wav
 

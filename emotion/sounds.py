@@ -61,6 +61,12 @@ _ALIASES: Dict[Any, str] = {
     "SIGH": "SIGH",                 # явный вызов вздоха
 }
 
+# Минимальный интервал для повторного воспроизведения "дыхания".
+# Значение в секундах, соответствует 15 минутам.  Даже если в YAML-файле
+# указан меньший ``cooldown``, мы принудительно увеличим его до этого
+# порога, чтобы избежать навязчивых повторов звука.
+MIN_IDLE_BREATH_COOLDOWN = 15 * 60
+
 @dataclass
 class _Effect:
     files: List[str]
@@ -92,6 +98,17 @@ def _load_manifest() -> Dict[str, _Effect]:
         else:
             key = str(name).upper()
         effects[key] = _Effect(files=files, gain=gain, cooldown=cooldown, repeat=repeat)
+    # Принудительно повышаем ``cooldown`` для дыхания, если он меньше
+    # минимального допустимого значения.  Это защищает от случайного
+    # указания слишком маленького интервала в конфигурации.
+    breath = effects.get("IDLE_BREATH")
+    if breath and breath.cooldown < MIN_IDLE_BREATH_COOLDOWN:
+        log.debug(
+            "increase IDLE_BREATH cooldown from %.1fs to %.1fs",
+            breath.cooldown,
+            MIN_IDLE_BREATH_COOLDOWN,
+        )
+        breath.cooldown = MIN_IDLE_BREATH_COOLDOWN
     return effects
 
 
