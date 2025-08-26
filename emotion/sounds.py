@@ -67,6 +67,14 @@ _ALIASES: Dict[Any, str] = {
 # порога, чтобы избежать навязчивых повторов звука.
 MIN_IDLE_BREATH_COOLDOWN = 15 * 60
 
+# Временная метка последнего глобального воспроизведения "дыхания".
+# Используется, чтобы исключить повтор эффекта при наличии нескольких
+# экземпляров драйвера или прямых вызовов `play_effect("IDLE_BREATH")`.
+_idle_breath_last: float = 0.0
+# Общая блокировка позволяет атомарно проверять и обновлять значение
+# `_idle_breath_last` между потоками.
+_idle_breath_lock = Lock()
+
 @dataclass
 class _Effect:
     files: List[str]
@@ -173,12 +181,22 @@ def play_effect(name: str | Emotion) -> None:
     if not effect or not effect.files:
         return
 
-    # Блокируем обработку эффекта, чтобы несколько потоков не смогли
-    # одновременно обойти проверку cooldown и повторно проиграть звук.
-    with effect.lock:
+    # Для дыхания используем глобальную блокировку, чтобы разные части
+    # приложения не воспроизвели звук почти одновременно.
+    lock = _idle_breath_lock if key == "IDLE_BREATH" else effect.lock
+    with lock:
         now = time.monotonic()
-        if effect.last_played + effect.cooldown > now:
-            remaining = effect.last_played + effect.cooldown - now
+        if key == "IDLE_BREATH":
+            global _idle_breath_last
+            if _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN > now:
+                remaining = _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN - now
+                log.debug("skip %s due to global cooldown %.2fs", key, remaining)
+                return
+        cooldown = effect.cooldown
+        if key == "IDLE_BREATH":
+            cooldown = max(cooldown, MIN_IDLE_BREATH_COOLDOWN)
+        if effect.last_played + cooldown > now:
+            remaining = effect.last_played + cooldown - now
             log.debug("skip %s due to cooldown %.2fs", key, remaining)
             return
 
@@ -189,6 +207,8 @@ def play_effect(name: str | Emotion) -> None:
             data, rate = _read_wav(file)
             volume = 10 ** (effect.gain / 20)
             effect.last_played = now
+            if key == "IDLE_BREATH":
+                _idle_breath_last = now
             # Повторяем звук ``repeat`` раз.  При значении >1 блокируемся до
             # окончания каждого проигрывания, чтобы они не накладывались.
             for i in range(effect.repeat):
@@ -226,8 +246,11 @@ class EmotionSoundDriver:
         if not effect:
             return  # в манифесте нет описания — работать нечему
         while True:
-            # Ждём случайную паузу, чтобы звуки не звучали по расписанию
-            delay = random.uniform(effect.cooldown, effect.cooldown * 2 or 1.0)
+            # Минимальное ожидание — 15 минут, даже если в манифесте задан
+            # меньший интервал.  Это защищает от случайных повторов звука.
+            base = max(effect.cooldown, MIN_IDLE_BREATH_COOLDOWN)
+            delay = random.uniform(base, base * 2)
+            self.log.debug("idle breath scheduled in %.1fs", delay)
             time.sleep(delay)
             # Воспроизводим «дыхание» только если никого нет в кадре и
             # текущая эмоция нейтральна.  Иначе пользователю будет казаться,
@@ -243,13 +266,27 @@ class EmotionSoundDriver:
         effect = self._effects.get(name)
         if not effect or not effect.files:
             return
-        # Защищаемся от гонок: один эффект может быть запрошен из нескольких
-        # потоков (например, при бурном обновлении эмоций).  Блокировка
-        # гарантирует, что cooldown будет проверен и обновлён атомарно.
-        with effect.lock:
+        # Для эффекта "дыхания" используем глобальную блокировку и таймер,
+        # чтобы предотвратить повтор даже при наличии нескольких экземпляров
+        # драйвера.  Для остальных эффектов достаточно собственных блокировок.
+        lock = _idle_breath_lock if name == "IDLE_BREATH" else effect.lock
+        with lock:
             now = time.monotonic()
-            if effect.last_played + effect.cooldown > now:
-                remaining = effect.last_played + effect.cooldown - now
+            if name == "IDLE_BREATH":
+                global _idle_breath_last
+                # Учитываем глобальный cooldown в 15 минут
+                if _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN > now:
+                    remaining = _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN - now
+                    self.log.debug(
+                        "skip %s due to global cooldown %.2fs", name, remaining
+                    )
+                    return
+            # Проверяем локальный cooldown конкретного эффекта
+            cooldown = effect.cooldown
+            if name == "IDLE_BREATH":
+                cooldown = max(cooldown, MIN_IDLE_BREATH_COOLDOWN)
+            if effect.last_played + cooldown > now:
+                remaining = effect.last_played + cooldown - now
                 self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
                 return
             file = random.choice(effect.files)
@@ -259,6 +296,8 @@ class EmotionSoundDriver:
                 data, rate = _read_wav(file)
                 volume = 10 ** (effect.gain / 20)
                 effect.last_played = now
+                if name == "IDLE_BREATH":
+                    _idle_breath_last = now
                 # Аналогичный цикл повторения для методов драйвера.
                 for i in range(effect.repeat):
                     self.log.debug("start %s → %s [%d/%d]", name, file, i + 1, effect.repeat)
@@ -274,6 +313,8 @@ class EmotionSoundDriver:
             # провоцировать нежелательные вздохи.
             self.log.debug("skip idle breath: user present")
             return
+        # `_play_effect` дополнительно проверяет глобальный таймер и не
+        # допускает повтор чаще одного раза в 15 минут.
         self._play_effect("IDLE_BREATH")
 
     def _on_presence_update(self, event: core_events.Event) -> None:

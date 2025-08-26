@@ -22,6 +22,13 @@ def test_play_idle_respects_presence(monkeypatch):
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
     # Создаём драйвер и подменяем воспроизведение эффекта на запись вызова.
     driver = sounds.EmotionSoundDriver()
+    monkeypatch.setattr(sounds, "_idle_breath_last", -sounds.MIN_IDLE_BREATH_COOLDOWN)
+    driver._effects = {
+        "IDLE_BREATH": sounds._Effect(
+            files=["breath.wav"], gain=0.0, cooldown=0.0,
+            last_played=-sounds.MIN_IDLE_BREATH_COOLDOWN,
+        )
+    }
     monkeypatch.setattr(driver, "_play_effect", lambda name: dummy_sd.calls.append(name))
 
     # Без пользователя в кадре дыхание должно воспроизводиться.

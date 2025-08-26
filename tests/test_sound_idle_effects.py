@@ -29,8 +29,15 @@ def test_idle_effect_with_cooldown(monkeypatch, capsys):  # type: ignore[no-unty
     monkeypatch.setattr(sounds, "_read_wav", fake_read)
 
     driver = sounds.EmotionSoundDriver()
+    # Сбрасываем глобальный таймер в прошлое, чтобы первый вызов не пропускался.
+    monkeypatch.setattr(sounds, "_idle_breath_last", -sounds.MIN_IDLE_BREATH_COOLDOWN)
     driver._effects = {
-        "IDLE_BREATH": sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=1.0)
+        "IDLE_BREATH": sounds._Effect(
+            files=["breath.wav"],
+            gain=0.0,
+            cooldown=1.0,
+            last_played=-sounds.MIN_IDLE_BREATH_COOLDOWN,
+        )
     }
     driver.log.setLevel("DEBUG")
 
@@ -49,7 +56,7 @@ def test_idle_effect_with_cooldown(monkeypatch, capsys):  # type: ignore[no-unty
     captured = capsys.readouterr()
     assert "skip IDLE_BREATH" in captured.err
 
-    now[0] += 1.5  # превышаем cooldown
+    now[0] += sounds.MIN_IDLE_BREATH_COOLDOWN + 1.5  # превышаем и локальный, и глобальный интервал
     driver.play_idle_effect()
     assert len(dummy_sd.calls) == 2
 
