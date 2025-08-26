@@ -37,10 +37,15 @@ MAX_CHARS: int = 180
 # Пауза в секундах, добавляемая в конец каждого чанка, чтобы не обрезать фразу
 TAIL_PAD_SEC: float = 0.3
 # Преднастроенные "эмоции"/тона (громкость, скорость, пауза)
+# Преднастроенные параметры для эмоциональной озвучки.
+# ``pitch`` и ``speed`` регулируют высоту голоса и скорость воспроизведения,
+# ``volume`` отвечает за громкость, а ``pause`` — за длину тишины в конце
+# чанка.  Значения подобраны эмпирически и служат отправной точкой для
+# дальнейшей настройки пользователем.
 TTS_PRESETS = {
-    "neutral": {"volume": 1.0, "speed": 1.0, "pause": TAIL_PAD_SEC},
-    "happy": {"volume": 1.2, "speed": 1.2, "pause": 0.2},
-    "sad": {"volume": 0.8, "speed": 0.9, "pause": 0.5},
+    "neutral": {"volume": 1.0, "speed": 1.0, "pitch": 1.0, "pause": TAIL_PAD_SEC},
+    "happy": {"volume": 1.2, "speed": 1.2, "pitch": 1.1, "pause": 0.2},
+    "sad": {"volume": 0.8, "speed": 0.8, "pitch": 0.9, "pause": 0.5},
 }
 # Можно включить GPU, если доступно
 USE_CUDA: bool = False
@@ -149,6 +154,25 @@ def _ndarray_to_float32(audio: np.ndarray) -> np.ndarray:
     return audio.astype(np.float32, copy=False) / 32767.0 if audio.size else audio
 
 
+def _apply_pitch(audio: np.ndarray, pitch: float) -> np.ndarray:
+    """Простейшее изменение высоты голоса путём ресемплинга массива.
+
+    Такой подход меняет и длительность сигнала, но для наших целей
+    достаточно, поскольку эффект требуется лишь для передачи общего
+    настроения (радость, грусть и т.п.).  При ``pitch`` == 1.0 массив
+    возвращается без изменений.
+    """
+    if pitch == 1.0 or audio.size == 0:
+        return audio
+
+    # Формируем массив индексов с учётом коэффициента ``pitch`` и
+    # выбираем соответствующие сэмплы.  При ``pitch`` > 1 голос становится
+    # выше и короче, при ``pitch`` < 1 — ниже и длиннее.
+    idx = np.round(np.arange(0, audio.size, 1 / pitch)).astype(int)
+    idx = idx[idx < audio.size]
+    return audio[idx]
+
+
 def _cache_path(text: str) -> Path:
     """Возвращает путь к файлу в кэше для заданного текста.
 
@@ -205,22 +229,41 @@ def working_tts(
     max_chars: int = MAX_CHARS,
     save_wav: str | None = None,        # ← новый арг.
     preset: str = "neutral",
+    pitch: float | None = None,
+    speed: float | None = None,
+    emotion: str | None = None,
 ) -> None:
-    """Озвучивает *text*; при *save_wav* пишет итоговый WAV-файл."""
+    """Озвучивает *text*; при *save_wav* пишет итоговый WAV-файл.
+
+    Дополнительные параметры позволяют управлять эмоциональной окраской
+    речи:
+
+    * ``pitch``  — коэффициент изменения высоты голоса (1.0 по умолчанию);
+    * ``speed``  — множитель скорости воспроизведения;
+    * ``emotion`` — название пресета из :data:`TTS_PRESETS`.
+    """
     global is_playing
     is_playing = True
     core_events.publish(
-        core_events.Event(kind="speech.synthesis_started", attrs={"text": text})
+        core_events.Event(
+            kind="speech.synthesis_started",
+            attrs={"text": text, "emotion": emotion or preset},
+        )
     )
     _STOP_EVENT.clear()
     # Приводим исходный текст к удобному для синтеза виду:
     # 1) числа → слова, 2) убираем пробелы в числах, 3) транслитерация
     norm = translit(remove_spaces_in_numbers(numbers_to_words(text)), "ru")
     log.info("Озвучиваем строку длиной %d символов (preset=%s)", len(norm), preset)
-    cfg = TTS_PRESETS.get(preset, TTS_PRESETS["neutral"])
+    cfg = TTS_PRESETS.get(emotion or preset, TTS_PRESETS["neutral"])
     vol = cfg["volume"]
-    speed = cfg["speed"]
+    speed = speed if speed is not None else cfg["speed"]
+    pitch = pitch if pitch is not None else cfg["pitch"]
     pause = cfg["pause"]
+
+    log.info(
+        "Эмоция=%s | pitch=%.2f | speed=%.2f", (emotion or preset), pitch, speed
+    )
 
     now = time.time()
     # Периодическая очистка устаревшего кэша
@@ -273,6 +316,8 @@ def working_tts(
             _save_wav(str(cache_file), pcm_i16_pad)
             log.debug("Чанк %d сохранён в кэш %s", i, cache_file)
 
+        # Применяем изменение высоты голоса согласно коэффициенту ``pitch``
+        pcm_i16_pad = _apply_pitch(pcm_i16_pad, pitch)
         playback_parts.append(pcm_i16_pad)
         audio_f32 = pcm_i16_pad.astype(np.float32) / 32767.0
         if vol != 1.0:
@@ -304,6 +349,8 @@ def working_tts(
     full_audio = np.concatenate(playback_parts) if playback_parts else np.zeros(0, np.int16)
     if save_wav:
         _save_wav(save_wav, full_audio)
+    total_duration = full_audio.size / (SAMPLE_RATE * speed) if speed else 0.0
+    log.info("Озвучивание завершено: длительность %.2f с", total_duration)
     is_playing = False
     core_events.publish(core_events.Event(kind="speech.synthesis_finished"))
     _STOP_EVENT.clear()
@@ -315,6 +362,9 @@ async def speak_async(
     text: str,
     *,
     preset: str = "neutral",
+    pitch: float | None = None,
+    speed: float | None = None,
+    emotion: str | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """Неблокирующая озвучка: `working_tts` выполняется в пуле потоков."""
@@ -322,7 +372,7 @@ async def speak_async(
     from functools import partial
 
     loop = loop or asyncio.get_running_loop()
-    func = partial(working_tts, text, preset=preset)
+    func = partial(working_tts, text, preset=preset, pitch=pitch, speed=speed, emotion=emotion)
     # Используем отдельный executor, чтобы не блокировать поток
     # чтения с микрофона, работающий через asyncio.to_thread
     await loop.run_in_executor(_EXECUTOR, func)
