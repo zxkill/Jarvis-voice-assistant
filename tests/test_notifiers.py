@@ -135,7 +135,8 @@ def test_voice_send_processes_queue(monkeypatch):
     sys.modules.pop("working_tts", None)
 
 
-def test_voice_sends_telegram_when_listener_active(monkeypatch):
+def test_voice_no_telegram_when_listener_active(monkeypatch):
+    """Голосовой ответ не дублируется в Telegram даже при активном слушателе."""
     voice = _load_voice(monkeypatch)
     sent = []
     metrics = []
@@ -176,21 +177,23 @@ def test_voice_sends_telegram_when_listener_active(monkeypatch):
 
     asyncio.run(run_test())
 
-    assert sent == ["hi"]
-    assert "telegram.outgoing" in metrics
+    assert sent == []
+    assert metrics == []
     sys.modules.pop("working_tts", None)
 
 
 def test_voice_not_send_when_listener_inactive(monkeypatch):
+    """Без активного слушателя Telegram сообщений также нет."""
     voice = _load_voice(monkeypatch)
     sent = []
+    metrics = []
 
     async def fake_speak_async(text, **kwargs):
         pass
 
     async def run_test():
         monkeypatch.setattr(voice, "speak_async", fake_speak_async)
-        monkeypatch.setattr(voice, "inc_metric", lambda name: None)
+        monkeypatch.setattr(voice, "inc_metric", lambda name: metrics.append(name))
         monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
         monkeypatch.setattr(voice.log, "info", lambda *a, **k: None)
         monkeypatch.setitem(
@@ -222,10 +225,12 @@ def test_voice_not_send_when_listener_inactive(monkeypatch):
     asyncio.run(run_test())
 
     assert sent == []
+    assert metrics == []
     sys.modules.pop("working_tts", None)
 
 
 def test_voice_logs_warning_on_telegram_error(monkeypatch):
+    """При ошибке отправки текста в Telegram логируется предупреждение."""
     voice = _load_voice(monkeypatch)
     metrics = []
     warnings = []
@@ -265,8 +270,10 @@ def test_voice_logs_warning_on_telegram_error(monkeypatch):
                 await voice._worker_task
             voice._worker_task = None
 
+        token = set_request_source("telegram")
         voice.send("hi")
         await asyncio.wait_for(voice._queue.join(), timeout=1)
+        reset_request_source(token)
 
         voice._worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -275,7 +282,7 @@ def test_voice_logs_warning_on_telegram_error(monkeypatch):
 
     asyncio.run(run_test())
 
-    assert warnings and "telegram duplicate failed" in warnings[0]
+    assert warnings and "telegram reply failed" in warnings[0]
     assert "telegram.outgoing" not in metrics
     sys.modules.pop("working_tts", None)
 
