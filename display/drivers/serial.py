@@ -156,6 +156,10 @@ class SerialDisplayDriver(DisplayDriver):
                         self._cache_sent = False
                         self._push_cache()
                         self.ready.set()
+                        # После успешного рукопожатия просим устройство
+                        # отключить вывод логов в USB Serial, чтобы канал
+                        # использовался только для команд.
+                        self._send_json("log", "off")
                 self._send_json("hello", "pong")
             return
 

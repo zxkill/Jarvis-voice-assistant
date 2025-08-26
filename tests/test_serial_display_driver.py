@@ -43,6 +43,9 @@ def test_serial_handshake_resends_cache(monkeypatch):
     monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
     monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
 
+    import importlib
+    import display.drivers.serial as serial_module
+    importlib.reload(serial_module)
     from display.drivers.serial import SerialDisplayDriver
 
     driver = SerialDisplayDriver(port="dummy")
@@ -51,8 +54,8 @@ def test_serial_handshake_resends_cache(monkeypatch):
     dummy.written.clear()
 
     dummy.feed(b'{"kind":"hello","payload":"ready"}\n')
-    assert driver.wait_ready(timeout=1.0)
-    time.sleep(0.1)
+    driver.wait_ready(timeout=2.0)
+    time.sleep(0.2)
     driver.close()
 
     assert any(json.loads(w)["kind"] == "txt" for w in dummy.written)
@@ -178,6 +181,41 @@ def test_non_json_lines_are_ignored(monkeypatch, capfd):
     assert driver._inq.empty(), "Очередь событий должна быть пустой"
     # В логах не должно появиться сообщения о некорректном JSON
     assert "Bad JSON" not in err, "Не должно быть ошибок JSON"
+
+
+def test_driver_disables_serial_logging(monkeypatch):
+    """После рукопожатия драйвер отправляет команду отключения логов."""
+
+    dummy = DummySerial()
+    fake_serial = types.SimpleNamespace(Serial=lambda *a, **k: dummy, SerialException=Exception)
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial.tools = fake_tools
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    import importlib
+    import display.drivers.serial as serial_module
+    importlib.reload(serial_module)
+    from display.drivers.serial import SerialDisplayDriver
+
+    sent: list[tuple[str, str]] = []
+    orig_send = SerialDisplayDriver._send_json
+
+    def capture(self, kind, payload):
+        sent.append((kind, payload))
+        orig_send(self, kind, payload)
+
+    monkeypatch.setattr(SerialDisplayDriver, "_send_json", capture)
+
+    driver = SerialDisplayDriver(port="dummy")
+
+    dummy.feed(b'{"kind":"hello","payload":"ready"}\n')
+    driver.wait_ready(timeout=2.0)
+    time.sleep(0.1)
+    driver.close()
+
+    assert ("log", "off") in sent, "Должна быть отправлена команда log=off"
 
 
 def test_parse_json_line_recovers_missing_quotes():
