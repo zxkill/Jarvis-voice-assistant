@@ -36,3 +36,17 @@ def test_play_effect_respects_cooldown(monkeypatch):
 
     assert dummy_sd.calls == ["play"]
 
+
+def test_play_effect_repeat(monkeypatch):
+    """При указании repeat звук должен проигрываться несколько раз."""
+
+    dummy_sd = DummySD()
+    monkeypatch.setattr(sounds, "sd", dummy_sd)
+    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    effect = sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=0.0, repeat=3)
+    monkeypatch.setattr(sounds, "_EFFECTS", {"BREATH": effect})
+
+    sounds.play_effect("breath")
+
+    assert dummy_sd.calls == ["play", "play", "play"]
+
