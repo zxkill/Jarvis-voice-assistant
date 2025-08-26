@@ -81,7 +81,10 @@ FACE_STABLE_SEC = 1.0
 NO_FACE_SCAN_SEC = 8.0
 SCAN_H_RANGE_PX = 320.0
 SCAN_V_RANGE_PX = 60.0
-SCAN_SPEED_PX_PER_SEC = 40.0
+# Скорость горизонтального сканирования камеры в пикселях в секунду.
+# Меньшее значение обеспечивает плавный медленный обзор комнаты,
+# чтобы камера не «пролетала» мимо появляющегося лица.
+SCAN_SPEED_PX_PER_SEC = 15.0
 SCAN_HOLD_SEC = 1.0
 SCAN_V_PERIOD_SEC = 10.0
 SCAN_TOTAL_SEC = 30.0
@@ -468,7 +471,8 @@ class PresenceDetector:
                             scan_hold_until = now
                         # во сне камера не двигается
                     elif dt_absent > NO_FACE_SCAN_SEC and mode != "scanning":
-                        # Лица нет уже достаточно долго → начинаем поиск
+                        # Лица нет уже достаточно долго → начинаем медленный обзор комнаты
+                        log.info("no face for %.1fs → start slow scan", dt_absent)
                         publish(Event(kind="emotion_changed", attrs={"emotion": Emotion.SUSPICIOUS}))
                         mode = "scanning"
                         scan_start = now
@@ -482,20 +486,20 @@ class PresenceDetector:
                         dt_ms = 0 if _last_sent_ms is None else (now_ms - _last_sent_ms)
                         _last_sent_ms = now_ms
                         dt_sec = dt_ms / 1000.0
-                        if now >= scan_hold_until:
-                            scan_pos += scan_dir * SCAN_SPEED_PX_PER_SEC * dt_sec
-                            if scan_pos >= SCAN_H_RANGE_PX:
-                                scan_pos = SCAN_H_RANGE_PX
-                                scan_dir = -1
-                                scan_hold_until = now + SCAN_HOLD_SEC
-                            elif scan_pos <= -SCAN_H_RANGE_PX:
-                                scan_pos = -SCAN_H_RANGE_PX
-                                scan_dir = 1
-                                scan_hold_until = now + SCAN_HOLD_SEC
+
+                        scan_pos, scan_dir, scan_hold_until = _scan_update(
+                            scan_pos, scan_dir, now, scan_hold_until, dt_sec
+                        )
+
                         # Вертикальное движение описываем синусоидой, чтобы
                         # взгляд плавно "скользил" вверх-вниз.
-                        dy = SCAN_V_RANGE_PX * math.sin(2 * math.pi * (now - scan_start) / SCAN_V_PERIOD_SEC)
+                        dy = SCAN_V_RANGE_PX * math.sin(
+                            2 * math.pi * (now - scan_start) / SCAN_V_PERIOD_SEC
+                        )
                         _send_track(scan_pos, dy, dt_ms)
+                        log.debug(
+                            "scan pos=%.1f dir=%d hold_until=%.1f", scan_pos, scan_dir, scan_hold_until
+                        )
                         if now - scan_start > SCAN_TOTAL_SEC:
                             # Полный обзор завершён → уходим спать на случайный
                             # интервал и показываем эмоцию сонливости.
@@ -524,6 +528,33 @@ class PresenceDetector:
             if cv2 is not None:
                 cv2.destroyAllWindows()
             _update_track(False, 0.0, 0.0, 0)
+
+
+def _scan_update(
+    scan_pos: float,
+    scan_dir: int,
+    now: float,
+    hold_until: float,
+    dt_sec: float,
+) -> tuple[float, int, float]:
+    """Обновляет позицию и направление горизонтального сканирования.
+
+    Возвращает новую позицию, направление и момент, до которого нужно
+    удерживать серву на краю. Эта функция выделена отдельно, чтобы
+    её было проще тестировать и отлаживать.
+    """
+
+    if now >= hold_until:
+        scan_pos += scan_dir * SCAN_SPEED_PX_PER_SEC * dt_sec
+        if scan_pos >= SCAN_H_RANGE_PX:
+            scan_pos = SCAN_H_RANGE_PX
+            scan_dir = -1
+            hold_until = now + SCAN_HOLD_SEC
+        elif scan_pos <= -SCAN_H_RANGE_PX:
+            scan_pos = -SCAN_H_RANGE_PX
+            scan_dir = 1
+            hold_until = now + SCAN_HOLD_SEC
+    return scan_pos, scan_dir, hold_until
 
 
 def _send_track(dx_px: float, dy_px: float, dt_ms: int) -> None:
