@@ -128,15 +128,26 @@ def handle_utterance(text: str) -> bool:
         try:
             reply = best_func(text)
             if isinstance(reply, str) and reply.strip():
-                from working_tts import working_tts
-                working_tts(reply)
+                # Используем универсальный уведомитель, который
+                # автоматически отправит ответ голосом или текстом
+                # в зависимости от источника запроса (голос/Telegram).
+                from notifiers.voice import send as voice_send
 
-                # сохраняем диалог в краткосрочном контексте
+                try:
+                    voice_send(reply)
+                    log.info(
+                        "skill %s replied: %r", best_func.__module__, reply
+                    )
+                except Exception:  # pragma: no cover - логируем любые сбои
+                    log.exception("failed to send skill reply")
+
+                # сохраняем диалог в краткосрочном контексте для последующего
+                # анализа, чтобы ассистент мог помнить недавние реплики.
                 try:
                     from context.short_term import add as ctx_add
 
                     ctx_add({"user": text, "reply": reply})
-                except Exception:
+                except Exception:  # pragma: no cover - контекст не критичен
                     pass
 
                 return True
