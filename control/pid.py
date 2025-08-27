@@ -93,9 +93,14 @@ class PID:
         # Интегральная составляющая с антивиндапом
         self._integral += error * dt
         if self.integral_limit is not None:
+            before = self._integral
             self._integral = _clamp(
                 self._integral, (-self.integral_limit, self.integral_limit)
             )
+            if self._integral != before:
+                logger.debug(
+                    "Integral clamped: %.3f -> %.3f", before, self._integral
+                )
         i = self.ki * self._integral
 
         # Дифференциальная составляющая
@@ -116,7 +121,10 @@ class PID:
         )
 
         # Ограничение по насыщению
+        before = output
         output = _clamp(output, self.output_limits)
+        if output != before:
+            logger.debug("Output clamped: %.3f -> %.3f", before, output)
 
         # Ограничение скорости изменения выхода
         if self.max_output_rate is not None:

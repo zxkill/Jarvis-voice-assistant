@@ -145,6 +145,22 @@ pytest tests/test_utils_distributions.py tests/test_utils_rate_limiter.py
 
 ---
 
+## Управление движением
+
+Модуль `control` содержит инструменты низкоуровневого управления:
+
+* `pid.PID` — PID‑регулятор Python с антивиндапом и лимитом скорости выхода.
+* `motion_profile.MotionProfile` — профиль движения с ограничением ускорения и джерка.
+* `scan_patterns.idle_scan` — синусоидальные и треугольные паттерны IdleScan с добавлением гауссовского шума.
+
+Проверить работу можно тестами:
+
+```bash
+pytest tests/test_control_pid.py tests/test_motion_profile.py tests/test_scan_patterns.py
+```
+
+---
+
 ## Аппаратные требования
 
 | Компонент |          Минимум         |        Рекомендовано       |
