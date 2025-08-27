@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import random
+import uuid  # Генерация trace_id для сквозного логирования
 from typing import Dict, List
 
 from core.events import Event, publish, subscribe
@@ -13,7 +14,11 @@ from memory.writer import add_suggestion
 from memory.reader import get_feedback_stats_by_type
 
 log = configure_logging("analysis.suggestions")
+# Регистрируем все поддерживаемые метрики. При старте они обнуляются
 set_metric("suggestions.queued", 0)
+set_metric("suggestions.responded", 0)
+set_metric("suggestions.accepted", 0)
+set_metric("suggestions.declined", 0)
 
 # --- Отслеживание присутствия ---------------------------------------------
 # Флаг текущего присутствия пользователя.
@@ -83,12 +88,52 @@ def _on_presence(event: Event) -> None:
 subscribe("presence.update", _on_presence)
 
 
+def _on_feedback(event: Event) -> None:
+    """Обработать отзыв пользователя и запустить адаптацию частоты подсказок."""
+
+    trace_id = event.attrs.get("trace_id")
+    suggestion_id = event.attrs.get("suggestion_id")
+    accepted = bool(event.attrs.get("accepted"))
+    # Логируем получение отклика и его результат
+    log.info(
+        "feedback received",
+        extra={
+            "ctx": {
+                "suggestion_id": suggestion_id,
+                "accepted": accepted,
+                "trace_id": trace_id,
+            }
+        },
+    )
+    # После каждого отклика пересчитываем вероятности показов,
+    # чтобы система быстрее подстраивалась под пользователя.
+    _refresh_probabilities()
+    log.info(
+        "probabilities adapted",
+        extra={"ctx": {"trace_id": trace_id}},
+    )
+
+
+# Подписываемся на события отклика пользователя
+subscribe("suggestion.response", _on_feedback)
+
+
 def _emit(text: str, reason_code: str) -> int:
     """Сохранить подсказку и опубликовать событие."""
+
+    # Для каждой подсказки генерируется уникальный ``trace_id``,
+    # который позволит отследить цепочку «генерация → отправка → ответ → адаптация».
+    trace_id = uuid.uuid4().hex
     suggestion_id = add_suggestion(text, reason_code)
     log.info(
         "suggestion queued",
-        extra={"ctx": {"reason_code": reason_code, "text": text}},
+        extra={
+            "ctx": {
+                "reason_code": reason_code,
+                "text": text,
+                "trace_id": trace_id,
+            }
+        },
     )
     inc_metric("suggestions.queued")
     publish(
@@ -98,6 +143,7 @@ def _emit(text: str, reason_code: str) -> int:
                 "text": text,
                 "reason_code": reason_code,
                 "suggestion_id": suggestion_id,
+                "trace_id": trace_id,
             },
         )
     )

@@ -21,6 +21,7 @@ from core.logging_json import configure_logging
 from core import events as core_events
 from memory.writer import add_suggestion_feedback
 from proactive.engine import is_awaiting_response, pop_awaiting
+from core.metrics import inc_metric
 
 # Инициализируем модульный логгер, чтобы отслеживать процесс разбора команд.
 log = configure_logging("app.command_processing")
@@ -74,23 +75,35 @@ def process_suggestion_answer(text: str) -> None:
         log.debug("нет ожидания подсказки, пропускаем ответ: %r", text)
         return
     suggestion_id = awaiting.get("id")
+    trace_id = awaiting.get("trace_id")
     log.info(
         "processing suggestion answer",
-        extra={"ctx": {"suggestion_id": suggestion_id, "text": text}},
+        extra={"ctx": {"suggestion_id": suggestion_id, "text": text, "trace_id": trace_id}},
     )
     accepted = _is_positive_answer(text)
     # Сохраняем отзыв пользователя в памяти.
     add_suggestion_feedback(suggestion_id, text, accepted)
+    # Фиксируем метрики реакции пользователя
+    inc_metric("suggestions.responded")
+    if accepted:
+        inc_metric("suggestions.accepted")
+    else:
+        inc_metric("suggestions.declined")
     # Публикуем событие для остальных компонентов системы.
     core_events.publish(
         core_events.Event(
             kind="suggestion.response",
-            attrs={"suggestion_id": suggestion_id, "text": text, "accepted": accepted},
+            attrs={
+                "suggestion_id": suggestion_id,
+                "text": text,
+                "accepted": accepted,
+                "trace_id": trace_id,
+            },
         )
     )
     log.debug(
         "suggestion response published",
-        extra={"ctx": {"suggestion_id": suggestion_id, "accepted": accepted}},
+        extra={"ctx": {"suggestion_id": suggestion_id, "accepted": accepted, "trace_id": trace_id}},
     )
 
 
