@@ -15,6 +15,7 @@ from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from proactive.policy import Policy
 from memory.db import get_connection, get_last_smalltalk_ts, set_last_smalltalk_ts
+from memory.writer import add_suggestion_feedback
 from core import events as core_events
 from skills.chit_chat_ru import random_phrase
 
@@ -29,6 +30,7 @@ class ProactiveEngine:
         idle_threshold_sec: int = 300,
         smalltalk_interval_sec: int = 3600,
         check_period_sec: int = 30,
+        response_timeout_sec: int = 10,
     ) -> None:
         # ``policy`` определяет канал доставки подсказок.
         self.policy = policy
@@ -40,13 +42,22 @@ class ProactiveEngine:
         self.idle_threshold_sec = idle_threshold_sec
         self.smalltalk_interval_sec = smalltalk_interval_sec
         self.check_period_sec = check_period_sec
+        # Таймаут ожидания ответа пользователя на подсказку.
+        self.response_timeout_sec = response_timeout_sec
+        # Состояние ожидания ответа: хранит ID подсказки и таймер.
+        self._awaiting: dict | None = None
         self.log = configure_logging("proactive.engine")
         set_metric("suggestions.sent", 0)
         set_metric("suggestions.failed", 0)
         # Подписываемся на новые подсказки, обновления присутствия и команды.
         core_events.subscribe("suggestion.created", self._on_suggestion)
         core_events.subscribe("presence.update", self._on_presence)
+        # Подписка на распознанную речь используется и для обновления таймера,
+        # и для фиксации возможного ответа на подсказку.
         core_events.subscribe("speech.recognized", self._on_command)
+        core_events.subscribe("speech.recognized", self._on_user_response)
+        # Сообщения из Telegram также могут быть реакцией на подсказку.
+        core_events.subscribe("telegram.message", self._on_user_response)
         # Фоновая проверка тишины запускается в отдельном потоке.
         threading.Thread(target=self._idle_loop, daemon=True).start()
 
@@ -119,6 +130,9 @@ class ProactiveEngine:
             )
         if sent:
             self._mark_processed(suggestion_id)
+            # Если у подсказки есть ID — ожидаем ответ пользователя.
+            if suggestion_id:
+                self._await_response(suggestion_id, text)
 
     # ------------------------------------------------------------------
     def _send(
@@ -225,3 +239,99 @@ class ProactiveEngine:
                 "UPDATE suggestions SET processed = 1 WHERE id = ?",
                 (suggestion_id,),
             )
+
+    # ------------------------------------------------------------------
+    def _await_response(self, suggestion_id: int, text: str) -> None:
+        """Перейти в режим ожидания ответа пользователя.
+
+        Запускается таймер и публикуется событие изменения контекста,
+        чтобы другие компоненты могли знать, что система ждёт реакцию.
+        """
+
+        # Отменяем предыдущий таймер, если он ещё активен, чтобы не получить
+        # несколько одновременных ожиданий.
+        if self._awaiting and (timer := self._awaiting.get("timer")):
+            timer.cancel()
+
+        timer = threading.Timer(self.response_timeout_sec, self._response_timeout)
+        self._awaiting = {"id": suggestion_id, "text": text, "timer": timer}
+        timer.start()
+        # Публикуем событие о переходе в режим ожидания ответа.
+        core_events.publish(
+            core_events.Event(
+                kind="context.set",
+                attrs={"state": "awaiting_suggestion_response", "suggestion_id": suggestion_id},
+            )
+        )
+        self.log.debug(
+            "awaiting response",
+            extra={"ctx": {"suggestion_id": suggestion_id, "timeout_sec": self.response_timeout_sec}},
+        )
+
+    # ------------------------------------------------------------------
+    def _response_timeout(self) -> None:
+        """Обработать истечение времени ожидания ответа."""
+        if not self._awaiting:
+            return
+        suggestion_id = self._awaiting.get("id")
+        self._awaiting = None
+        self.log.info(
+            "response timeout",
+            extra={"ctx": {"suggestion_id": suggestion_id}},
+        )
+
+    # ------------------------------------------------------------------
+    def _on_user_response(self, event: core_events.Event) -> None:
+        """Проверить, является ли текст ответом на ожидаемую подсказку."""
+        if not self._awaiting:
+            return
+        text = (event.attrs.get("text") or "").strip()
+        if not text:
+            return
+        suggestion_id = self._awaiting["id"]
+        timer = self._awaiting.get("timer")
+        if timer:
+            timer.cancel()
+        self._awaiting = None
+        accepted = self._is_positive(text)
+        # Сохраняем отзыв и публикуем событие для остальных компонентов.
+        add_suggestion_feedback(suggestion_id, text, accepted)
+        core_events.publish(
+            core_events.Event(
+                kind="suggestion.response",
+                attrs={
+                    "suggestion_id": suggestion_id,
+                    "text": text,
+                    "accepted": accepted,
+                },
+            )
+        )
+        self.log.info(
+            "response received",
+            extra={
+                "ctx": {
+                    "suggestion_id": suggestion_id,
+                    "accepted": accepted,
+                }
+            },
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_positive(text: str) -> bool:
+        """Определить, является ли ответ пользователя положительным.
+
+        Простейшая эвристика по ключевым словам: ``да``, ``ок``,
+        ``хорошо`` трактуются как согласие. Всё остальное считается
+        отказом.  Логику можно расширять при необходимости.
+        """
+
+        text = text.lower()
+        positives = ("да", "ок", "хорошо", "ладно")
+        negatives = ("нет", "не", "потом", "позже")
+        if any(word in text for word in positives):
+            return True
+        if any(word in text for word in negatives):
+            return False
+        # По умолчанию считаем ответ отрицательным, чтобы не завышать статистику.
+        return False
