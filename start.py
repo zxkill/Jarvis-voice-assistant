@@ -166,6 +166,9 @@ async def main() -> None:
             frame_interval_ms=app_cfg.presence.frame_interval_ms,
             absent_after_sec=app_cfg.intel.absent_after_sec,
         )
+        # Запускаем детектор в отдельном потоке. Внутри используется OpenCV,
+        # поэтому при отсутствии библиотеки или камеры модуль просто
+        # выводит предупреждение и завершает поток.
         threading.Thread(target=detector.run, daemon=True).start()
 
     # --- Проактивная политика и движок ---------------------------------
