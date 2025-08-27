@@ -54,3 +54,14 @@ def test_frame_rotation_and_validation():
     # недопустимый угол должен приводить к ValueError
     with pytest.raises(ValueError):
         PresenceDetector(frame_rotation=45)
+
+
+def test_detection_params_validation():
+    """Параметры каскада должны валидироваться."""
+
+    with pytest.raises(ValueError):
+        PresenceDetector(scale_factor=1.0)
+    with pytest.raises(ValueError):
+        PresenceDetector(min_neighbors=-1)
+    with pytest.raises(ValueError):
+        PresenceDetector(min_size=(0, 50))

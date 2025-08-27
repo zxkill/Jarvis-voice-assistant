@@ -62,6 +62,10 @@ class PresenceDetector:
         show_window: bool = True,
         window_size: Tuple[int, int] = (800, 600),
         frame_rotation: int = 0,
+        scale_factor: float = 1.1,
+        min_neighbors: int = 8,
+        min_size: Tuple[int, int] = (80, 80),
+        require_eyes: bool = True,
     ) -> None:
         """Создать объект детектора присутствия.
 
@@ -73,6 +77,10 @@ class PresenceDetector:
         :param absent_after_sec: сколько секунд отсутствия лица считать уходом пользователя
         :param window_size: размер окна отладки ``(ширина, высота)``
         :param frame_rotation: поворот кадра по часовой стрелке (0/90/180/270 градусов)
+        :param scale_factor: коэффициент масштабирования каскада; больше — меньше ложных срабатываний
+        :param min_neighbors: сколько соседних прямоугольников требуется для принятия объекта за лицо
+        :param min_size: минимальный размер лица ``(ширина, высота)`` в пикселях
+        :param require_eyes: дополнительно проверять наличие глаз, чтобы отсеять посторонние объекты
         """
 
         # Параметры сглаживания
@@ -98,6 +106,17 @@ class PresenceDetector:
             raise ValueError("frame_rotation must be 0, 90, 180 or 270 degrees")
         # фиксированный поворот помогает, если камера установлена боком
         self.frame_rotation = frame_rotation
+        # Параметры каскадного детектора лица
+        if scale_factor <= 1.0:
+            raise ValueError("scale_factor must be > 1.0")
+        if min_neighbors < 0:
+            raise ValueError("min_neighbors must be >= 0")
+        if min_size[0] <= 0 or min_size[1] <= 0:
+            raise ValueError("min_size must contain positive values")
+        self.scale_factor = scale_factor
+        self.min_neighbors = min_neighbors
+        self.min_size = min_size
+        self.require_eyes = require_eyes
         # Событие для остановки фонового потока
         self._stop = threading.Event()
 
@@ -162,11 +181,15 @@ class PresenceDetector:
             return
 
         log.info(
-            "Запуск детектора присутствия (camera_index=%s, interval=%d ms, window=%s, rotation=%d)",
+            "Запуск детектора присутствия (camera_index=%s, interval=%d ms, window=%s, rotation=%d, scale=%.2f, neighbors=%d, min_size=%s, require_eyes=%s)",
             self.camera_index,
             self.frame_interval_ms,
             self.show_window,
             self.frame_rotation,
+            self.scale_factor,
+            self.min_neighbors,
+            self.min_size,
+            self.require_eyes,
         )
 
         cap = cv2.VideoCapture(self.camera_index)
@@ -177,6 +200,14 @@ class PresenceDetector:
         classifier = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        eye_classifier = None
+        if self.require_eyes:
+            eye_classifier = cv2.CascadeClassifier(
+                cv2.data.haarcascades + "haarcascade_eye.xml"
+            )
+            if eye_classifier.empty():  # pragma: no cover - зависит от установки OpenCV
+                log.warning("Не удалось загрузить каскад глаз, проверка отключена")
+                eye_classifier = None
         # Если требуется, создаём отдельное окно для отладки нужного размера
         if self.show_window:
             cv2.namedWindow("jarvis_presence", cv2.WINDOW_NORMAL)
@@ -199,19 +230,34 @@ class PresenceDetector:
                 frame = cv2.rotate(frame, rotate_flag)
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = classifier.detectMultiScale(gray, 1.3, 5)
+            faces = classifier.detectMultiScale(
+                gray,
+                self.scale_factor,
+                self.min_neighbors,
+                minSize=self.min_size,
+            )
+            validated = []
+            for (x, y, w, h) in faces:
+                if eye_classifier is not None:
+                    roi = gray[y : y + h, x : x + w]
+                    eyes = eye_classifier.detectMultiScale(roi)
+                    if len(eyes) < 2:
+                        log.debug("face rejected: eyes not found at x=%d y=%d w=%d h=%d", x, y, w, h)
+                        continue
+                validated.append((x, y, w, h))
+            faces = validated
             detected = len(faces) > 0
 
             dx_px = dy_px = 0.0
             if detected:
                 x, y, w, h = faces[0]
-                # Смещение центра лица относительно центра кадра в пикселях:
-                # положительное ``dx_px`` означает, что лицо правее центра,
+                # Смещение центра лица относительно центра кадра в пикселях.
+                # Положительное ``dx_px`` означает, что лицо правее центра,
                 # положительное ``dy_px`` — выше центра.
                 dx_px = (x + w / 2) - frame.shape[1] / 2
                 dy_px = (y + h / 2) - frame.shape[0] / 2
                 log.debug(
-                    "face detected at x=%d y=%d w=%d h=%d dx=%.1f dy=%.1f",
+                    "face accepted at x=%d y=%d w=%d h=%d dx=%.1f dy=%.1f",
                     x,
                     y,
                     w,
