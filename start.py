@@ -165,6 +165,8 @@ async def main() -> None:
             camera_index=app_cfg.presence.camera_index,
             frame_interval_ms=app_cfg.presence.frame_interval_ms,
             absent_after_sec=app_cfg.intel.absent_after_sec,
+            show_window=app_cfg.presence.show_window,
+            frame_rotation=app_cfg.presence.frame_rotation,
         )
         # Запускаем детектор в отдельном потоке. Внутри используется OpenCV,
         # поэтому при отсутствии библиотеки или камеры модуль просто
