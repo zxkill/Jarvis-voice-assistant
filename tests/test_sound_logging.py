@@ -24,6 +24,8 @@ def test_play_effect_logs_caller(monkeypatch, caplog):
     monkeypatch.setattr(sounds, "is_quiet_now", lambda: False)
     monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
     monkeypatch.setattr(sounds, "_EFFECTS", {"WAKE": sounds._Effect(files=["wake.wav"], gain=0.0, cooldown=0.0)})
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
 
     def trigger() -> None:
         sounds.play_effect("wake")
@@ -46,6 +48,8 @@ def test_driver_logs_caller(monkeypatch, caplog):
     monkeypatch.setattr(sounds, "is_quiet_now", lambda: False)
     monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
 
     driver = sounds.EmotionSoundDriver()
     # Сбрасываем глобальный таймер, чтобы не влиять на результат теста.

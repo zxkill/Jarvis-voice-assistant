@@ -7,6 +7,7 @@
 #  ffmpeg -v error -i "$f" -ac 1 -ar 44100 -af loudnorm=I=-16:TP=-1.5:LRA=11 "$out"
 #done
 
+global_rate_limit_ms: 500  # не более одного эффекта в полсекунды
 
 IDLE:
   gain_db: -8
