@@ -22,3 +22,10 @@ def test_triangle_pattern():
     """Треугольный паттерн без шума детерминирован."""
     pattern = idle_scan("triangle", length=4, amplitude=1.0, frequency=1.0)
     assert pattern == pytest.approx([0.0, 1.0, 0.0, -1.0])
+
+
+def test_noise_randomness():
+    """Шум делает последовательности различными."""
+    pattern1 = idle_scan("sine", length=50, noise_std=0.5)
+    pattern2 = idle_scan("sine", length=50, noise_std=0.5)
+    assert pattern1 != pattern2

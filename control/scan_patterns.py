@@ -67,6 +67,12 @@ def idle_scan(
 
     if noise_std > 0:
         pattern = [p + random.gauss(0, noise_std) for p in pattern]
+        logger.debug("Noise applied with std=%.3f", noise_std)
 
-    logger.debug("IdleScan generated %d points", len(pattern))
+    logger.debug(
+        "IdleScan generated %d points: min=%.3f max=%.3f", 
+        len(pattern),
+        min(pattern) if pattern else 0.0,
+        max(pattern) if pattern else 0.0,
+    )
     return pattern

@@ -64,13 +64,21 @@ class MotionProfile:
         # Вычисляем джерк, ограничивая его
         jerk = desired_acc - self.acceleration
         jerk_limit = self.max_jerk * dt
-        jerk = _clamp(jerk, (-jerk_limit, jerk_limit))
+        clamped_jerk = _clamp(jerk, (-jerk_limit, jerk_limit))
+        if clamped_jerk != jerk:
+            logger.debug("Jerk clamped: %.3f -> %.3f", jerk, clamped_jerk)
+        jerk = clamped_jerk
         self.acceleration += jerk
 
         # Ограничиваем ускорение
+        before_acc = self.acceleration
         self.acceleration = _clamp(
             self.acceleration, (-self.max_acceleration, self.max_acceleration)
         )
+        if self.acceleration != before_acc:
+            logger.debug(
+                "Acceleration clamped: %.3f -> %.3f", before_acc, self.acceleration
+            )
 
         # Интегрируем скорость
         self.velocity += self.acceleration * dt
