@@ -106,6 +106,32 @@ def process_suggestion_answer(text: str) -> None:
         extra={"ctx": {"suggestion_id": suggestion_id, "accepted": accepted, "trace_id": trace_id}},
     )
 
+    # В зависимости от результата ответа публикуем событие
+    # ``dialog.success`` или ``dialog.failure``. Это позволяет системе
+    # эмоций и метрикам реагировать на исход диалога, а ``trace_id``
+    # обеспечивает сквозную корреляцию всех связанных событий.
+    dialog_kind = "dialog.success" if accepted else "dialog.failure"
+    core_events.publish(
+        core_events.Event(
+            kind=dialog_kind,
+            attrs={
+                "text": text,
+                "suggestion_id": suggestion_id,
+                "trace_id": trace_id,
+            },
+        )
+    )
+    log.debug(
+        "dialog result event published",
+        extra={
+            "ctx": {
+                "suggestion_id": suggestion_id,
+                "result": dialog_kind,
+                "trace_id": trace_id,
+            }
+        },
+    )
+
 
 async def execute_cmd(cmd: str, voice: str) -> bool:
     """Обработать простые встроенные команды, не требующие навыков.

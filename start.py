@@ -215,18 +215,24 @@ async def main() -> None:
         """Выполняет распознанную команду в отдельной задаче."""
         trace_id = new_trace_id()
         TRACE_ID.set(trace_id)
-        log.info("[CMD] %s", text)
-        publish(Event(kind="user_query_started", attrs={"text": text}))
+        # Логируем входящую команду вместе с trace_id для последующего трекинга.
+        log.info("[CMD] %s", text, extra={"ctx": {"trace_id": trace_id}})
+        publish(Event(kind="user_query_started", attrs={"text": text, "trace_id": trace_id}))
         try:
             handled = await va_respond(text)
         except Exception as exc:  # pragma: no cover - защита от неожиданных ошибок
             log.exception("command error: %s", exc)
-            publish(Event(kind="dialog.failure", attrs={"text": text, "error": str(exc)}))
+            publish(
+                Event(
+                    kind="dialog.failure",
+                    attrs={"text": text, "error": str(exc), "trace_id": trace_id},
+                )
+            )
         else:
             kind = "dialog.success" if handled else "dialog.failure"
-            publish(Event(kind=kind, attrs={"text": text}))
+            publish(Event(kind=kind, attrs={"text": text, "trace_id": trace_id}))
         finally:
-            publish(Event(kind="user_query_ended", attrs={"text": text}))
+            publish(Event(kind="user_query_ended", attrs={"text": text, "trace_id": trace_id}))
 
     while True:
         # Читаем с микрофона в отдельном потоке, чтобы не блокировать event loop
