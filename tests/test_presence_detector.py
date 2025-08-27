@@ -47,6 +47,10 @@ def test_run_without_cv2(monkeypatch):
 def test_frame_rotation_and_validation():
     """Поворот кадра задаётся параметром ``frame_rotation`` и валидируется."""
 
+    # по умолчанию камера должна быть повернута на 270°
+    det_default = PresenceDetector(show_window=False)
+    assert det_default.frame_rotation == 270
+
     # допустимое значение — просто проверяем, что run() завершится без ошибок
     det = PresenceDetector(show_window=False, frame_rotation=90)
     det.run()

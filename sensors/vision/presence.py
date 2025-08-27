@@ -61,7 +61,7 @@ class PresenceDetector:
         absent_after_sec: int = 5,
         show_window: bool = True,
         window_size: Tuple[int, int] = (800, 600),
-        frame_rotation: int = 0,
+        frame_rotation: int = 270,
         scale_factor: float = 1.1,
         min_neighbors: int = 8,
         min_size: Tuple[int, int] = (80, 80),
@@ -77,6 +77,7 @@ class PresenceDetector:
         :param absent_after_sec: сколько секунд отсутствия лица считать уходом пользователя
         :param window_size: размер окна отладки ``(ширина, высота)``
         :param frame_rotation: поворот кадра по часовой стрелке (0/90/180/270 градусов)
+            по умолчанию 270°, что удобно при боковом креплении камеры
         :param scale_factor: коэффициент масштабирования каскада; больше — меньше ложных срабатываний
         :param min_neighbors: сколько соседних прямоугольников требуется для принятия объекта за лицо
         :param min_size: минимальный размер лица ``(ширина, высота)`` в пикселях
@@ -104,7 +105,8 @@ class PresenceDetector:
 
         if frame_rotation not in (0, 90, 180, 270):
             raise ValueError("frame_rotation must be 0, 90, 180 or 270 degrees")
-        # фиксированный поворот помогает, если камера установлена боком
+        # фиксированный поворот помогает, если камера установлена боком;
+        # по умолчанию выбираем 270°, так как камера чаще всего повернута влево
         self.frame_rotation = frame_rotation
         # Параметры каскадного детектора лица
         if scale_factor <= 1.0:
