@@ -1,0 +1,3 @@
+valence_factor: 1.0
+arousal_factor: 1.0
+ema_alpha: 0.5
