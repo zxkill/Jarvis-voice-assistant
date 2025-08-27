@@ -1,6 +1,7 @@
 import time
 import threading
 import types
+import asyncio
 from collections import defaultdict
 
 import pytest
@@ -57,22 +58,26 @@ def _engine(monkeypatch, timeout=1.0):
 def test_positive_response_speech(monkeypatch):
     engine = _engine(monkeypatch)
     feedback = []
-    monkeypatch.setattr(
-        "proactive.engine.add_suggestion_feedback",
-        lambda sid, text, acc: feedback.append((sid, text, acc)),
-    )
     events = []
     core_events.subscribe("suggestion.response", lambda e: events.append(e))
+
+    # Импортируем модуль команд после создания движка, чтобы он знал о нём.
+    import app.command_processing as cp
+
+    monkeypatch.setattr(cp, "handle_utterance", lambda cmd: False)
+    monkeypatch.setattr(cp, "execute_cmd", lambda cmd, voice: False)
+    monkeypatch.setattr(cp, "normalize", lambda x: x)
+    monkeypatch.setattr(cp, "add_suggestion_feedback", lambda sid, text, acc: feedback.append((sid, text, acc)))
 
     core_events.publish(
         core_events.Event(
             kind="suggestion.created", attrs={"text": "выпей воды", "suggestion_id": 1}
         )
     )
-    core_events.publish(
-        core_events.Event(kind="speech.recognized", attrs={"text": "ок"})
-    )
-    time.sleep(0.1)
+
+    # Ответ пользователя обрабатывается через ``va_respond`` и не попадает
+    # в общую цепочку команд.
+    asyncio.run(cp.va_respond("джарвис ок"))
 
     assert feedback == [(1, "ок", True)]
     assert events and events[0].attrs["accepted"] is True
