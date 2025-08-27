@@ -1,0 +1,5 @@
+# Тип драйвера для вывода информации
+# Возможные значения: console, serial, websocket
+driver: console
+# Порт для последовательного драйвера, например COM3 или /dev/ttyUSB0
+serial_port: null
