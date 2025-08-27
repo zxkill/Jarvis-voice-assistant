@@ -1,9 +1,27 @@
 import core.events as events
+import sensors.vision.face_tracker as ft
 from sensors.vision.presence import PresenceDetector
 
 
-def test_presence_triggers_face_tracker():
+class DummyDriver:
+    def __init__(self):
+        self.items = []
+
+    def draw(self, item):  # pragma: no cover - тривиальный метод
+        self.items.append(item)
+
+    def process_events(self):  # pragma: no cover - не используется
+        return
+
+
+def test_presence_triggers_face_tracker(monkeypatch):
     """presence.update и vision.face_tracker публикуются согласованно."""
+    driver = DummyDriver()
+    monkeypatch.setattr(ft, "get_driver", lambda: driver)
+    ft._driver = None
+    ft._last_sent_ms = None
+    ft._tracking_active = False
+
     events._subscribers.clear()
     events._global_subscribers.clear()
     presence_events = []

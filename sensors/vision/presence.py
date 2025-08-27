@@ -155,16 +155,24 @@ class PresenceDetector:
             log.debug("Presence confidence=%.2f", self.state.confidence)
 
     # ------------------------------------------------------------------
-    def process_detection(self, detected: bool, x: float | None = None, y: float | None = None) -> None:
+    def process_detection(
+        self,
+        detected: bool,
+        x: float | None = None,
+        y: float | None = None,
+        frame_width: float = 1.0,
+        frame_height: float = 1.0,
+    ) -> None:
         """Обрабатывает результат детекции лица.
 
         Вызывается из ``run`` и упрощает тестирование — можно передавать
-        фиктивные координаты без обращения к камере.
+        фиктивные координаты без обращения к камере. При необходимости
+        можно указать размеры кадра для корректных track-команд.
         """
 
         self._update_state(detected)
         if detected and self.state.present:
-            self.tracker.update((x or 0.0, y or 0.0))
+            self.tracker.update((x or 0.0, y or 0.0), frame_width, frame_height)
         else:
             self.tracker.update(None)
 
@@ -196,7 +204,8 @@ class PresenceDetector:
                 rel_bb = face.location_data.relative_bounding_box
                 cx = rel_bb.xmin + rel_bb.width / 2
                 cy = rel_bb.ymin + rel_bb.height / 2
-                self.process_detection(True, cx, cy)
+                h, w = frame_bgr.shape[:2]
+                self.process_detection(True, cx, cy, w, h)
             else:
                 self.process_detection(False)
 
