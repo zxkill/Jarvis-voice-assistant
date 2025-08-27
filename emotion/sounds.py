@@ -32,6 +32,7 @@ from emotion.state import Emotion
 from core.logging_json import configure_logging
 from core import events as core_events
 from core.quiet import is_quiet_now
+from utils.rate_limiter import RateLimiter
 
 try:  # ``sounddevice`` может быть недоступен в среде тестирования
     import sounddevice as sd  # type: ignore
@@ -47,6 +48,11 @@ log = configure_logging("emotion.sound")
 # воспроизведения и тем самым исключать многократное повторение звука,
 # например, «вздоха».
 _EFFECTS: Dict[str, _Effect] | None = None
+
+# Текущая палитра звуковых эффектов, задаётся менеджером настроения.
+_CURRENT_PALETTE: str = ""
+# Глобальный лимитер частоты воспроизведения любых эффектов.
+_GLOBAL_LIMITER: RateLimiter | None = None
 
 
 # соответствие некоторых эмоций и строковых ключей записи в манифесте
@@ -93,6 +99,13 @@ def _load_manifest() -> Dict[str, _Effect]:
         data = yaml.safe_load(MANIFEST_PATH.read_text("utf-8")) or {}
     except Exception:  # pragma: no cover - повреждённый YAML
         return {}
+
+    global _GLOBAL_LIMITER
+
+    # Извлекаем глобальный лимит частоты воспроизведения.
+    rate_ms = float(data.pop("global_rate_limit_ms", 0))
+    if rate_ms > 0:
+        _GLOBAL_LIMITER = RateLimiter(1, rate_ms / 1000.0)
 
     effects: Dict[str, _Effect] = {}
     for name, cfg in data.items():
@@ -155,13 +168,39 @@ def _caller_name() -> str:
     """
 
     frame = inspect.currentframe()
-    # Поднимаемся на два уровня вверх: _caller_name -> вызывающая функция
+    # Поднимаемся на два уровня вверх: _caller_name -> play_effect -> вызвавшая функция
     for _ in range(2):
         if frame is None or frame.f_back is None:
             return "<unknown>"
         frame = frame.f_back
+    # Если посредником была наша внутренняя обёртка ``_play_effect``,
+    # поднимаемся ещё на один уровень, чтобы увидеть реального инициатора.
+    if frame and frame.f_code.co_name == "_play_effect" and frame.f_back:
+        frame = frame.f_back
     module = frame.f_globals.get("__name__", "<unknown>")
     return f"{module}.{frame.f_code.co_name}"
+
+
+def _resolve_effect(key: str) -> Optional[tuple[str, _Effect]]:
+    """Подбирает эффект с учётом текущей палитры.
+
+    Сначала ищем вариант ``<PAL>:<KEY>`` в соответствии с выбранной
+    политикой настроения, затем падаем обратно на базовый ``<KEY>``.
+    Возвращаем пару из итогового ключа и объекта эффекта либо ``None``,
+    если подходящий эффект не найден.
+    """
+
+    effects = _get_effects()
+    palette = _CURRENT_PALETTE.upper() if _CURRENT_PALETTE else ""
+    if palette:
+        pal_key = f"{palette}:{key}"
+        eff = effects.get(pal_key)
+        if eff and eff.files:
+            return pal_key, eff
+    eff = effects.get(key)
+    if eff and eff.files:
+        return key, eff
+    return None
 
 
 def play_effect(name: str | Emotion) -> None:
@@ -171,51 +210,56 @@ def play_effect(name: str | Emotion) -> None:
         log.debug("skip effect %s: quiet=%s", name, is_quiet_now())
         return  # звук недоступен или тихие часы
 
-    effects = _get_effects()
-    # разрешаем использовать псевдонимы; сначала преобразуем имя в верхний
-    # регистр, затем пытаемся найти его в словаре ``_ALIASES``
+    # Разрешаем использовать псевдонимы; сначала преобразуем имя в верхний
+    # регистр, затем пытаемся найти его в словаре ``_ALIASES``.
     key_obj: Any = name
     if not isinstance(name, Emotion):
         key_obj = str(name).upper()
     key = _ALIASES.get(key_obj, key_obj if isinstance(key_obj, str) else key_obj.name)
-    effect = effects.get(str(key).upper())
-    if not effect or not effect.files:
+
+    resolved = _resolve_effect(str(key).upper())
+    if not resolved:
         return
+    eff_key, effect = resolved
+    base_key = eff_key.split(":")[-1]
 
     # Для дыхания используем глобальную блокировку, чтобы разные части
     # приложения не воспроизвели звук почти одновременно.
-    lock = _idle_breath_lock if key == "IDLE_BREATH" else effect.lock
+    lock = _idle_breath_lock if base_key == "IDLE_BREATH" else effect.lock
     with lock:
         now = time.monotonic()
-        if key == "IDLE_BREATH":
+        if base_key == "IDLE_BREATH":
             global _idle_breath_last
             if _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN > now:
                 remaining = _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN - now
-                log.debug("skip %s due to global cooldown %.2fs", key, remaining)
+                log.debug("skip %s due to global cooldown %.2fs", eff_key, remaining)
                 return
         cooldown = effect.cooldown
-        if key == "IDLE_BREATH":
+        if base_key == "IDLE_BREATH":
             cooldown = max(cooldown, MIN_IDLE_BREATH_COOLDOWN)
         if effect.last_played + cooldown > now:
             remaining = effect.last_played + cooldown - now
-            log.debug("skip %s due to cooldown %.2fs", key, remaining)
+            log.debug("skip %s due to cooldown %.2fs", eff_key, remaining)
+            return
+        if _GLOBAL_LIMITER and not _GLOBAL_LIMITER.allow():
+            log.debug("skip %s due to global rate limit", eff_key)
             return
 
         file = random.choice(effect.files)
         caller = _caller_name()
-        log.info("play %s (%s) by %s x%d", key, file, caller, effect.repeat)
+        log.info("play %s (%s) by %s x%d", eff_key, file, caller, effect.repeat)
         try:
             data, rate = _read_wav(file)
             volume = 10 ** (effect.gain / 20)
             effect.last_played = now
-            if key == "IDLE_BREATH":
+            if base_key == "IDLE_BREATH":
                 _idle_breath_last = now
             # Повторяем звук ``repeat`` раз.  При значении >1 блокируемся до
             # окончания каждого проигрывания, чтобы они не накладывались.
             for i in range(effect.repeat):
-                log.debug("start %s → %s [%d/%d]", key, file, i + 1, effect.repeat)
+                log.debug("start %s → %s [%d/%d]", eff_key, file, i + 1, effect.repeat)
                 sd.play(data * volume, rate, blocking=effect.repeat > 1)
-                log.debug("end %s [%d/%d]", key, i + 1, effect.repeat)
+                log.debug("end %s [%d/%d]", eff_key, i + 1, effect.repeat)
         except Exception:  # pragma: no cover
             log.exception("sound playback failed")
 
@@ -225,9 +269,9 @@ class EmotionSoundDriver:
 
     def __init__(self) -> None:
         self.log = configure_logging("emotion.sound")
-        # Предзагружаем манифест, чтобы иметь доступ к cooldown и спискам
-        # файлов без повторного чтения с диска
-        self._effects = _load_manifest()
+        # Используем общий кеш эффектов, чтобы делиться информацией о
+        # времени последнего воспроизведения между экземплярами драйвера.
+        self._effects = _get_effects()
         self._current: Emotion = Emotion.NEUTRAL
         # Флаг присутствия пользователя перед камерой.  Пока человек в
         # кадре, «вздыхать» не следует, чтобы не создавать впечатление,
@@ -261,7 +305,8 @@ class EmotionSoundDriver:
             )
             return
 
-        effect = self._effects.get("IDLE_BREATH")
+        resolved = _resolve_effect("IDLE_BREATH")
+        effect = resolved[1] if resolved else None
         base = MIN_IDLE_BREATH_COOLDOWN
         if effect:
             base = max(effect.cooldown, MIN_IDLE_BREATH_COOLDOWN)
@@ -280,52 +325,8 @@ class EmotionSoundDriver:
         self._schedule_idle_breath()
 
     def _play_effect(self, name: str) -> None:
-        """Воспроизводит эффект из заранее загруженного словаря."""
-        if sd is None or is_quiet_now():
-            self.log.debug("skip %s: quiet=%s", name, is_quiet_now())
-            return
-        effect = self._effects.get(name)
-        if not effect or not effect.files:
-            return
-        # Для эффекта "дыхания" используем глобальную блокировку и таймер,
-        # чтобы предотвратить повтор даже при наличии нескольких экземпляров
-        # драйвера.  Для остальных эффектов достаточно собственных блокировок.
-        lock = _idle_breath_lock if name == "IDLE_BREATH" else effect.lock
-        with lock:
-            now = time.monotonic()
-            if name == "IDLE_BREATH":
-                global _idle_breath_last
-                # Учитываем глобальный cooldown в 15 минут
-                if _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN > now:
-                    remaining = _idle_breath_last + MIN_IDLE_BREATH_COOLDOWN - now
-                    self.log.debug(
-                        "skip %s due to global cooldown %.2fs", name, remaining
-                    )
-                    return
-            # Проверяем локальный cooldown конкретного эффекта
-            cooldown = effect.cooldown
-            if name == "IDLE_BREATH":
-                cooldown = max(cooldown, MIN_IDLE_BREATH_COOLDOWN)
-            if effect.last_played + cooldown > now:
-                remaining = effect.last_played + cooldown - now
-                self.log.debug("skip %s due to cooldown %.2fs", name, remaining)
-                return
-            file = random.choice(effect.files)
-            caller = _caller_name()
-            self.log.info("play %s (%s) by %s x%d", name, file, caller, effect.repeat)
-            try:
-                data, rate = _read_wav(file)
-                volume = 10 ** (effect.gain / 20)
-                effect.last_played = now
-                if name == "IDLE_BREATH":
-                    _idle_breath_last = now
-                # Аналогичный цикл повторения для методов драйвера.
-                for i in range(effect.repeat):
-                    self.log.debug("start %s → %s [%d/%d]", name, file, i + 1, effect.repeat)
-                    sd.play(data * volume, rate, blocking=effect.repeat > 1)
-                    self.log.debug("end %s [%d/%d]", name, i + 1, effect.repeat)
-            except Exception:  # pragma: no cover
-                self.log.exception("sound playback failed")
+        """Обёртка над :func:`play_effect` для подмены в тестах."""
+        play_effect(name)
 
     def play_idle_effect(self) -> None:
         """Явно воспроизводит короткое дыхание (используется в тестах)."""
@@ -352,6 +353,12 @@ class EmotionSoundDriver:
         emotion: Emotion = event.attrs["emotion"]
         self._current = emotion
         key = _ALIASES.get(emotion, emotion.name)
+        # Обновляем текущую палитру звуков, если менеджер передал её в событии.
+        palette = event.attrs.get("sfx_palette")
+        if isinstance(palette, str):
+            global _CURRENT_PALETTE
+            _CURRENT_PALETTE = palette.upper()
+            self.log.debug("set palette %s", _CURRENT_PALETTE)
         self._play_effect(key)
         # Каждая смена эмоции влияет на расписание дыхания.
         self._schedule_idle_breath()

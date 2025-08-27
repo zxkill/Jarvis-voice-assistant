@@ -28,6 +28,8 @@ def test_play_effect_thread_safe(monkeypatch):
     effect = sounds._Effect(files=["sigh.wav"], gain=0.0, cooldown=10.0)
     # Подменяем глобальный кеш эффектов тестовым экземпляром
     monkeypatch.setattr(sounds, "_EFFECTS", {"SIGH": effect})
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         list(pool.map(lambda _: sounds.play_effect("sigh"), range(5)))

@@ -18,6 +18,8 @@ def test_play_effect(monkeypatch):
     }
     # Подменяем глобальный кеш эффектов, чтобы использовать тестовые данные
     monkeypatch.setattr(sounds, "_EFFECTS", effects)
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
     sounds.play_effect("wake")
     assert dummy_sd.calls == ["play"]
 
@@ -30,6 +32,8 @@ def test_play_effect_respects_cooldown(monkeypatch):
     monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
     effect = sounds._Effect(files=["sigh.wav"], gain=0.0, cooldown=10.0)
     monkeypatch.setattr(sounds, "_EFFECTS", {"SIGH": effect})
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
 
     sounds.play_effect("sigh")
     sounds.play_effect("sigh")  # вторая попытка до истечения cooldown
@@ -45,6 +49,8 @@ def test_play_effect_repeat(monkeypatch):
     monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
     effect = sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=0.0, repeat=3)
     monkeypatch.setattr(sounds, "_EFFECTS", {"BREATH": effect})
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
 
     sounds.play_effect("breath")
 
