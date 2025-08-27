@@ -20,6 +20,7 @@ from core.config import load_config
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from core.request_source import set_request_source, reset_request_source
+from core import events as core_events
 
 # Инициализируем логгер для удобной отладки модуля.
 log = configure_logging("notifiers.telegram_listener")
@@ -131,9 +132,14 @@ def listen(
                     )
                     continue
 
-                # Фиксируем метрику и передаём команду на обработку.
+                # Фиксируем метрику, публикуем событие и передаём команду на обработку.
                 inc_metric("telegram.incoming")
                 log.info("incoming command: %r", text)
+                # Публикуем событие, чтобы другие подсистемы (например, проактивный
+                # движок) могли реагировать на сообщения пользователя.
+                core_events.publish(
+                    core_events.Event(kind="telegram.message", attrs={"text": text})
+                )
                 try:
                     handler = va_respond
                     if handler is None:  # импортируем по требованию

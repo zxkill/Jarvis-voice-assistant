@@ -70,3 +70,77 @@ def test_va_respond_processes_telegram_without_alias(monkeypatch):
     asyncio.run(run())
     assert called["cmd"] == "проверка"
 
+
+def test_suggestion_answer_bypasses_handlers(monkeypatch):
+    """Ответ на подсказку не должен попадать в обычный обработчик команд."""
+
+    cp = _load_cp(monkeypatch)
+
+    from proactive.engine import ProactiveEngine
+    from proactive.policy import Policy, PolicyConfig
+    import threading
+    import types
+
+    class DummyPolicy(Policy):
+        def __init__(self) -> None:
+            super().__init__(PolicyConfig())
+
+        def choose_channel(self, present: bool, now=None):  # type: ignore[override]
+            return "voice"
+
+    # Блокируем запуск фонового потока ``_idle_loop``.
+    real_thread = threading.Thread
+
+    def fake_thread(*a, **k):
+        target = k.get("target")
+        if target is not None:
+            return types.SimpleNamespace(start=lambda: None)
+        return real_thread(*a, **k)
+
+    monkeypatch.setattr(threading, "Thread", fake_thread)
+    engine = ProactiveEngine(
+        DummyPolicy(),
+        idle_threshold_sec=10**6,
+        smalltalk_interval_sec=10**6,
+        check_period_sec=10**6,
+        response_timeout_sec=1,
+    )
+    monkeypatch.setattr(threading, "Thread", real_thread)
+
+    # Имитируем ожидание ответа на подсказку.
+    engine._await_response(1, "выпей воды")
+
+    called = {"skill": False, "cmd": False}
+    monkeypatch.setattr(
+        cp,
+        "handle_utterance",
+        lambda cmd: (called.__setitem__("skill", True), False)[1],
+    )
+    monkeypatch.setattr(
+        cp,
+        "execute_cmd",
+        lambda cmd, voice: (called.__setitem__("cmd", True), False)[1],
+    )
+
+    feedback: list = []
+    monkeypatch.setattr(
+        cp,
+        "add_suggestion_feedback",
+        lambda sid, text, acc: feedback.append((sid, text, acc)),
+    )
+
+    events: list = []
+    from core import events as core_events
+
+    core_events.subscribe("suggestion.response", lambda e: events.append(e))
+
+    async def run():
+        assert await cp.va_respond("джарвис ок") is True
+
+    asyncio.run(run())
+
+    assert called["skill"] is False
+    assert called["cmd"] is False
+    assert feedback == [(1, "ок", True)]
+    assert events and events[0].attrs["suggestion_id"] == 1
+
