@@ -39,6 +39,22 @@ SCHEMA = [
     )
     """,
     """
+    -- Таблица для хранения откликов пользователей на подсказки
+    CREATE TABLE IF NOT EXISTS suggestion_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        suggestion_id INTEGER NOT NULL,
+        response_text TEXT,
+        accepted INTEGER NOT NULL,
+        ts INTEGER NOT NULL,
+        FOREIGN KEY (suggestion_id) REFERENCES suggestions(id) ON DELETE CASCADE
+    )
+    """,
+    """
+    -- Индекс ускоряет выборку отзывов по ID подсказки
+    CREATE INDEX IF NOT EXISTS idx_suggestion_feedback_suggestion_id
+        ON suggestion_feedback(suggestion_id)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS timers (
         label   TEXT PRIMARY KEY,
         typ     TEXT NOT NULL,

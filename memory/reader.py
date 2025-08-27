@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import logging
+
 from .db import get_connection
+
+
+# Логгер модуля для подробной отладки запросов
+logger = logging.getLogger(__name__)
 
 
 def get_event_counts(start_ts: int, end_ts: int, bucket_seconds: int = 3600) -> list[tuple[int, int]]:
@@ -35,3 +41,52 @@ def pop_suggestion() -> str | None:
             return None
         conn.execute("UPDATE suggestions SET processed = 1 WHERE id = ?", (row["id"],))
         return str(row["text"])
+
+
+def get_suggestion_feedback(suggestion_id: int) -> list[dict]:
+    """Получить список отзывов по конкретной подсказке.
+
+    Возвращает упорядоченный по времени список словарей с полями записи.
+    Если отзывов нет, возвращается пустой список.
+    """
+
+    logger.debug("Запрос отзывов для подсказки id=%s", suggestion_id)
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, suggestion_id, response_text, accepted, ts
+            FROM suggestion_feedback
+            WHERE suggestion_id = ?
+            ORDER BY ts
+            """,
+            (suggestion_id,),
+        ).fetchall()
+        feedback = [dict(r) for r in rows]
+        logger.debug("Найдено отзывов: %d", len(feedback))
+        return feedback
+
+
+def get_feedback_stats() -> dict[str, int]:
+    """Вернуть агрегированную статистику по отзывам на подсказки.
+
+    Результат содержит количество принятых и отклонённых подсказок.
+    """
+
+    logger.debug("Запрос агрегированной статистики по отзывам")
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN accepted = 1 THEN 1 ELSE 0 END) AS accepted_count,
+                SUM(CASE WHEN accepted = 0 THEN 1 ELSE 0 END) AS rejected_count
+            FROM suggestion_feedback
+            """,
+        ).fetchone()
+        accepted_count = int(row["accepted_count"] or 0)
+        rejected_count = int(row["rejected_count"] or 0)
+        logger.debug(
+            "Статистика: принятых=%d, отклонённых=%d",
+            accepted_count,
+            rejected_count,
+        )
+        return {"accepted": accepted_count, "rejected": rejected_count}
