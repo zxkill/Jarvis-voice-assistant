@@ -59,6 +59,8 @@ class PresenceDetector:
         camera_index: Optional[int] = None,
         frame_interval_ms: int = 500,
         absent_after_sec: int = 5,
+        show_window: bool = False,
+        frame_rotation: int = 90,
     ) -> None:
         """Создать объект детектора присутствия.
 
@@ -84,6 +86,21 @@ class PresenceDetector:
         self.camera_index = camera_index
         self.frame_interval_ms = frame_interval_ms
         self.absent_after_sec = absent_after_sec
+        # Нужно ли показывать отладочное окно с изображением
+        self.show_window = show_window
+        # Поворот кадра; допускаются только кратные 90 градусы значения
+        if frame_rotation not in (0, 90, 180, 270):
+            raise ValueError("frame_rotation must be 0, 90, 180 or 270 degrees")
+        self.frame_rotation = frame_rotation
+        # Код поворота OpenCV для выбранного угла (None — без поворота)
+        self._rotate_code = (
+            {
+                0: None,
+                90: cv2.ROTATE_90_COUNTERCLOCKWISE if cv2 else None,
+                180: cv2.ROTATE_180 if cv2 else None,
+                270: cv2.ROTATE_90_CLOCKWISE if cv2 else None,
+            }
+        )[frame_rotation]
 
         # Событие для остановки фонового потока
         self._stop = threading.Event()
@@ -171,6 +188,10 @@ class PresenceDetector:
                 time.sleep(self.frame_interval_ms / 1000)
                 continue
 
+            # Поворачиваем изображение, если это требуется конфигурацией
+            if self._rotate_code is not None:
+                frame = cv2.rotate(frame, self._rotate_code)
+
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = classifier.detectMultiScale(gray, 1.3, 5)
             detected = len(faces) > 0
@@ -187,6 +208,18 @@ class PresenceDetector:
 
             self.update(detected, dx_px, dy_px, dt_ms)
 
+            if self.show_window:
+                # Отображаем кадр и прямоугольник вокруг найденного лица
+                if detected:
+                    cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
+                cv2.namedWindow("Jarvis-View", cv2.WINDOW_NORMAL)
+                cv2.resizeWindow("Jarvis-View", 800, 600)
+                cv2.imshow("Jarvis-View", frame)
+                # Закрываем окно при нажатии 'q'
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    log.info("'q' pressed — stopping detector")
+                    break
+
             # Если лицо исчезло и длительное время не возвращается,
             # явно сигнализируем об отсутствии пользователя.
             if (
@@ -200,6 +233,8 @@ class PresenceDetector:
             time.sleep(self.frame_interval_ms / 1000)
 
         cap.release()
+        if self.show_window:
+            cv2.destroyAllWindows()
         log.info("Детектор присутствия остановлен")
 
     # ------------------------------------------------------------------
