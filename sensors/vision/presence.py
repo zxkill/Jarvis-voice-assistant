@@ -500,7 +500,12 @@ class PresenceDetector:
                         _last_sent_ms = now_ms
                         dt_sec = dt_ms / 1000.0
 
-                        scan_pos, scan_dir, scan_hold_until = _scan_update(
+                        # Обновляем позицию горизонтального обзора и сразу
+                        # получаем приращение ``dx`` — именно его нужно
+                        # отправить в драйвер, чтобы серва моментально
+                        # изменила направление на краях, не дожидаясь
+                        # перехода через ноль.
+                        scan_pos, scan_dir, scan_hold_until, dx = _scan_update(
                             scan_pos, scan_dir, now, scan_hold_until, dt_sec
                         )
 
@@ -509,9 +514,15 @@ class PresenceDetector:
                         dy = SCAN_V_RANGE_PX * math.sin(
                             2 * math.pi * (now - scan_start) / SCAN_V_PERIOD_SEC
                         )
-                        _send_track(scan_pos, dy, dt_ms)
+                        # Передаём в драйвер только приращение по горизонтали,
+                        # иначе серва продолжит вращаться в одном направлении.
+                        _send_track(dx, dy, dt_ms)
                         log.debug(
-                            "scan pos=%.1f dir=%d hold_until=%.1f", scan_pos, scan_dir, scan_hold_until
+                            "scan pos=%.1f dir=%d hold_until=%.1f dx=%.1f",
+                            scan_pos,
+                            scan_dir,
+                            scan_hold_until,
+                            dx,
                         )
                         if now - scan_start > SCAN_TOTAL_SEC:
                             # Полный обзор завершён → уходим спать на случайный
@@ -549,25 +560,30 @@ def _scan_update(
     now: float,
     hold_until: float,
     dt_sec: float,
-) -> tuple[float, int, float]:
+) -> tuple[float, int, float, float]:
     """Обновляет позицию и направление горизонтального сканирования.
 
-    Возвращает новую позицию, направление и момент, до которого нужно
-    удерживать серву на краю. Эта функция выделена отдельно, чтобы
-    её было проще тестировать и отлаживать.
+    Возвращает кортеж ``(pos, dir, hold_until, dx)``, где ``dx`` —
+    приращение по горизонтали, которое необходимо отправить в драйвер
+    сервопривода.  Использование приращения позволяет немедленно
+    поменять направление движения на краю, не ожидая, пока ``pos``
+    перейдёт через ноль.
     """
 
+    dx = 0.0
     if now >= hold_until:
-        scan_pos += scan_dir * SCAN_SPEED_PX_PER_SEC * dt_sec
-        if scan_pos >= SCAN_H_RANGE_PX:
-            scan_pos = SCAN_H_RANGE_PX
+        new_pos = scan_pos + scan_dir * SCAN_SPEED_PX_PER_SEC * dt_sec
+        if new_pos >= SCAN_H_RANGE_PX:
+            new_pos = SCAN_H_RANGE_PX
             scan_dir = -1
             hold_until = now + SCAN_HOLD_SEC
-        elif scan_pos <= -SCAN_H_RANGE_PX:
-            scan_pos = -SCAN_H_RANGE_PX
+        elif new_pos <= -SCAN_H_RANGE_PX:
+            new_pos = -SCAN_H_RANGE_PX
             scan_dir = 1
             hold_until = now + SCAN_HOLD_SEC
-    return scan_pos, scan_dir, hold_until
+        dx = new_pos - scan_pos
+        scan_pos = new_pos
+    return scan_pos, scan_dir, hold_until, dx
 
 
 def _send_track(dx_px: float, dy_px: float, dt_ms: int) -> None:
