@@ -81,8 +81,12 @@ class ProactiveEngine:
         # чтобы другие модули могли проверить состояние ожидания.
         global _engine_instance
         _engine_instance = self
+        # Регистрируем метрики отправки и откликов пользователя
         set_metric("suggestions.sent", 0)
         set_metric("suggestions.failed", 0)
+        set_metric("suggestions.responded", 0)
+        set_metric("suggestions.accepted", 0)
+        set_metric("suggestions.declined", 0)
         # Подписываемся на новые подсказки, обновления присутствия и команды.
         core_events.subscribe("suggestion.created", self._on_suggestion)
         core_events.subscribe("presence.update", self._on_presence)
@@ -114,6 +118,7 @@ class ProactiveEngine:
         suggestion_id = int(event.attrs.get("suggestion_id", 0))
         period = event.attrs.get("period")
         weekday = event.attrs.get("weekday")
+        trace_id = event.attrs.get("trace_id")  # сквозной идентификатор цепочки
         # Берём флаг присутствия из события, чтобы корректно
         # обработать подсказки, сгенерированные в режиме ``absent``.
         present = bool(event.attrs.get("present", self.present))
@@ -127,6 +132,7 @@ class ProactiveEngine:
                     "period": period,
                     "weekday": weekday,
                     "present": present,
+                    "trace_id": trace_id,
                 }
             },
         )
@@ -141,6 +147,7 @@ class ProactiveEngine:
                     "suggestion_id": suggestion_id,
                     "channel": channel,
                     "present": present,
+                    "trace_id": trace_id,
                 }
             },
         )
@@ -159,14 +166,21 @@ class ProactiveEngine:
         sent = False
         for ch in channels:
             sent = (
-                self._send(ch, text, reason_code=reason_code, period=period, weekday=weekday)
+                self._send(
+                    ch,
+                    text,
+                    reason_code=reason_code,
+                    period=period,
+                    weekday=weekday,
+                    trace_id=trace_id,
+                )
                 or sent
             )
         if sent:
             self._mark_processed(suggestion_id)
             # Если у подсказки есть ID — ожидаем ответ пользователя.
             if suggestion_id:
-                self._await_response(suggestion_id, text)
+                self._await_response(suggestion_id, text, trace_id)
 
     # ------------------------------------------------------------------
     def _send(
@@ -177,6 +191,7 @@ class ProactiveEngine:
         reason_code: str,
         period: str | None,
         weekday: str | None,
+        trace_id: str | None,
     ) -> bool:
         """Отправить текст через указанный канал."""
         try:
@@ -196,6 +211,7 @@ class ProactiveEngine:
                         "reason_code": reason_code,
                         "period": period,
                         "weekday": weekday,
+                        "trace_id": trace_id,
                     }
                 },
             )
@@ -205,7 +221,7 @@ class ProactiveEngine:
             # Любая ошибка уведомления логируется, но не выбрасывается.
             self.log.exception(
                 "send failed",
-                extra={"ctx": {"channel": channel}},
+                extra={"ctx": {"channel": channel, "trace_id": trace_id}},
             )
             inc_metric("suggestions.failed")
             return False
@@ -275,7 +291,7 @@ class ProactiveEngine:
             )
 
     # ------------------------------------------------------------------
-    def _await_response(self, suggestion_id: int, text: str) -> None:
+    def _await_response(self, suggestion_id: int, text: str, trace_id: str | None) -> None:
         """Перейти в режим ожидания ответа пользователя.
 
         Запускается таймер и публикуется событие изменения контекста,
@@ -288,18 +304,34 @@ class ProactiveEngine:
             timer.cancel()
 
         timer = threading.Timer(self.response_timeout_sec, self._response_timeout)
-        self._awaiting = {"id": suggestion_id, "text": text, "timer": timer}
+        # Сохраняем информацию о ожидаемом ответе вместе с ``trace_id``
+        self._awaiting = {
+            "id": suggestion_id,
+            "text": text,
+            "timer": timer,
+            "trace_id": trace_id,
+        }
         timer.start()
         # Публикуем событие о переходе в режим ожидания ответа.
         core_events.publish(
             core_events.Event(
                 kind="context.set",
-                attrs={"state": "awaiting_suggestion_response", "suggestion_id": suggestion_id},
+                attrs={
+                    "state": "awaiting_suggestion_response",
+                    "suggestion_id": suggestion_id,
+                    "trace_id": trace_id,
+                },
             )
         )
         self.log.debug(
             "awaiting response",
-            extra={"ctx": {"suggestion_id": suggestion_id, "timeout_sec": self.response_timeout_sec}},
+            extra={
+                "ctx": {
+                    "suggestion_id": suggestion_id,
+                    "timeout_sec": self.response_timeout_sec,
+                    "trace_id": trace_id,
+                }
+            },
         )
 
     # ------------------------------------------------------------------
@@ -308,10 +340,11 @@ class ProactiveEngine:
         if not self._awaiting:
             return
         suggestion_id = self._awaiting.get("id")
+        trace_id = self._awaiting.get("trace_id")
         self._awaiting = None
         self.log.info(
             "response timeout",
-            extra={"ctx": {"suggestion_id": suggestion_id}},
+            extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}},
         )
 
     # ------------------------------------------------------------------
@@ -323,6 +356,7 @@ class ProactiveEngine:
         if not text:
             return
         suggestion_id = self._awaiting["id"]
+        trace_id = self._awaiting.get("trace_id")
         timer = self._awaiting.get("timer")
         if timer:
             timer.cancel()
@@ -337,6 +371,7 @@ class ProactiveEngine:
                     "suggestion_id": suggestion_id,
                     "text": text,
                     "accepted": accepted,
+                    "trace_id": trace_id,
                 },
             )
         )
@@ -346,9 +381,16 @@ class ProactiveEngine:
                 "ctx": {
                     "suggestion_id": suggestion_id,
                     "accepted": accepted,
+                    "trace_id": trace_id,
                 }
             },
         )
+        # Обновляем метрики откликов
+        inc_metric("suggestions.responded")
+        if accepted:
+            inc_metric("suggestions.accepted")
+        else:
+            inc_metric("suggestions.declined")
 
     # ------------------------------------------------------------------
     @staticmethod
