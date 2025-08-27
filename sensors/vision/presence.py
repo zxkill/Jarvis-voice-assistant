@@ -48,10 +48,7 @@ _last_sent_ms: int | None = None
 # Был ли ранее активен трекинг — чтобы остановить сервоприводы при потере цели
 _tracking_active = False
 
-# Настройки визуализации и обработки
-DEBUG_GUI = True  # показывать окно OpenCV
-ROTATE_90 = True
-ROTATE_CODE = cv2.ROTATE_90_COUNTERCLOCKWISE if cv2 else 0  # pragma: no cover
+# Базовые настройки обработки изображения и геометрии камеры
 FOV_DEG_X = 38.0
 FOV_DEG_Y = 62.0
 SMOOTH_ALPHA = 0.0
@@ -134,6 +131,8 @@ class PresenceDetector:
         alpha: float = 0.2,
         present_th: float = 0.6,
         absent_th: float = 0.4,
+        show_window: bool = True,
+        frame_rotation: int = 270,
     ) -> None:
         # Индекс камеры из секции [PRESENCE] конфигурации
         self.camera_index = camera_index
@@ -147,6 +146,30 @@ class PresenceDetector:
         self.present_th = present_th
         # Порог для смены состояния на "отсутствует"
         self.absent_th = absent_th
+
+        # Параметры визуализации
+        self.show_window = show_window
+        if frame_rotation not in (0, 90, 180, 270):
+            raise ValueError("frame_rotation must be 0/90/180/270")
+        self.frame_rotation = frame_rotation
+        # Код поворота для OpenCV; при значении 0 вращение не требуется
+        if cv2 is not None:
+            self._rotate_code = {
+                0: None,
+                90: cv2.ROTATE_90_CLOCKWISE,
+                180: cv2.ROTATE_180,
+                270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+            }[frame_rotation]
+        else:  # pragma: no cover - отсутствует в тестовой среде
+            self._rotate_code = None
+
+        log.debug(
+            "PresenceDetector init: camera=%s interval_ms=%s rotation=%s window=%s",
+            camera_index,
+            frame_interval_ms,
+            frame_rotation,
+            show_window,
+        )
 
         # Текущее состояние
         self.state = PresenceState()
@@ -256,6 +279,12 @@ class PresenceDetector:
         if not self._ensure_camera():
             return
 
+        log.info(
+            "Запускаю детектор присутствия: rotation=%d°, show_window=%s",
+            self.frame_rotation,
+            self.show_window,
+        )
+
         # Инициализация MediaPipe
         mp_face = mp.solutions.face_detection.FaceDetection(
             model_selection=1,
@@ -270,7 +299,8 @@ class PresenceDetector:
 
         dt_target = self.frame_interval_ms / 1000.0
         yaw_prev = pitch_prev = 0.0
-        fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if ROTATE_90 else (FOV_DEG_X, FOV_DEG_Y)
+        rotated = self.frame_rotation in (90, 270)
+        fov_x, fov_y = (FOV_DEG_Y, FOV_DEG_X) if rotated else (FOV_DEG_X, FOV_DEG_Y)
         last_face_ts = time.monotonic() - FACE_ABSENT_HAPPY_SEC
         # ``stable_start`` хранит момент начала устойчивой детекции лица,
         # чтобы отфильтровать кратковременные ложные срабатывания.
@@ -304,8 +334,8 @@ class PresenceDetector:
                     time.sleep(dt_target)
                     continue
 
-                if ROTATE_90:
-                    frame_bgr = cv2.rotate(frame_bgr, ROTATE_CODE)
+                if self._rotate_code is not None:
+                    frame_bgr = cv2.rotate(frame_bgr, self._rotate_code)
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
                 kind = None
@@ -436,7 +466,7 @@ class PresenceDetector:
                     if mode != "tracking":
                         mode = "tracking"
 
-                    if DEBUG_GUI:
+                    if self.show_window:
                         color = (0, 255, 0) if kind == "face" else (0, 165, 255)
                         pt1 = (int(x_rel * fw), int(y_rel * fh))
                         pt2 = (int((x_rel + w_rel) * fw), int((y_rel + h_rel) * fh))
@@ -536,7 +566,7 @@ class PresenceDetector:
 
                 self._update_state(kind if detected else None)
 
-                if DEBUG_GUI:
+                if self.show_window:
                     cv2.imshow("Jarvis-View", frame_bgr)
                     if cv2.waitKey(1) & 0xFF == 27:
                         log.info("Esc pressed → stopping detector")
