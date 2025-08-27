@@ -156,12 +156,11 @@ class ProactiveEngine:
             self._mark_processed(suggestion_id)
             return
 
-        # Если выбран голосовой канал, дополнительно отправляем сообщение
-        # в Telegram как резервный вариант. Подсказка считается
-        # обработанной, если хотя бы один канал отправил её успешно.
+        # Подсказку отправляем только по одному каналу, выбранному политикой.
+        # Ранее голосовые уведомления дублировались в Telegram «на всякий случай»,
+        # но практика показала, что это приводит к лишнему шуму и путанице.
+        # Поэтому теперь отказались от дублирования, оставляя лишь основной канал.
         channels = [channel]
-        if channel == "voice":
-            channels.append("telegram")
 
         sent = False
         for ch in channels:
@@ -391,6 +390,32 @@ class ProactiveEngine:
             inc_metric("suggestions.accepted")
         else:
             inc_metric("suggestions.declined")
+        # После фиксации ответа отправляем пользователю небольшое подтверждение
+        # в Telegram, чтобы он видел, что система приняла реплику.  Это помогает
+        # при удалённом управлении и упрощает отладку.
+        try:
+            from notifiers import telegram as notifier
+
+            reply = (
+                "Отлично, записал" if accepted else "Хорошо, отложим"
+            )
+            notifier.send(reply)
+            self.log.debug(
+                "ack sent",
+                extra={
+                    "ctx": {
+                        "suggestion_id": suggestion_id,
+                        "accepted": accepted,
+                        "trace_id": trace_id,
+                    }
+                },
+            )
+        except Exception:
+            # Логируем, но не прерываем обработку при ошибке отправки подтверждения.
+            self.log.exception(
+                "ack failed",
+                extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}},
+            )
 
     # ------------------------------------------------------------------
     @staticmethod

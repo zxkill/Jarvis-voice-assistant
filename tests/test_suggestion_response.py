@@ -2,6 +2,7 @@ import time
 import threading
 import types
 import asyncio
+import sys
 from collections import defaultdict
 import inspect
 from collections import namedtuple
@@ -82,11 +83,16 @@ def test_positive_response_speech(monkeypatch):
     core_events.subscribe("suggestion.response", lambda e: events.append(e))
 
     # Импортируем модуль команд после создания движка, чтобы он знал о нём.
-    # Модуль ``app.command_processing`` зависит от ``sounddevice`` (PortAudio),
-    # поэтому подменяем его заглушкой, чтобы избежать необходимости
-    # системной библиотеки в тестах.
-    import sys
+    # ``app.command_processing`` тянет за собой зависимости ``sounddevice`` и
+    # ``jarvis_skills``.  Подменяем их заглушками, чтобы тесты не требовали
+    # установки тяжелых библиотек.
     sys.modules.setdefault("sounddevice", types.SimpleNamespace())
+    sys.modules.setdefault(
+        "jarvis_skills",
+        types.SimpleNamespace(handle_utterance=lambda cmd: False, set_main_loop=lambda loop: None),
+    )
+    sys.modules.setdefault("core.nlp", types.SimpleNamespace(normalize=lambda x: x))
+    sys.modules.setdefault("working_tts", types.SimpleNamespace(speak_async=lambda *a, **k: None))
     import app.command_processing as cp
 
     monkeypatch.setattr(cp, "handle_utterance", lambda cmd: False)
@@ -119,6 +125,9 @@ def test_negative_response_telegram(monkeypatch):
     feedback = []
     events: list[core_events.Event] = []
     core_events.subscribe("suggestion.response", lambda e: events.append(e))
+    # Подменяем отправку подтверждений в Telegram, чтобы избежать реальных сетевых вызовов
+    fake_tg = types.SimpleNamespace(send=lambda text: None)
+    monkeypatch.setitem(sys.modules, "notifiers.telegram", fake_tg)
     monkeypatch.setattr(
         "proactive.engine.add_suggestion_feedback",
         lambda sid, text, acc: feedback.append((sid, text, acc)),
@@ -141,6 +150,33 @@ def test_negative_response_telegram(monkeypatch):
     assert core_metrics.get_metric("suggestions.responded") == 1.0
     assert core_metrics.get_metric("suggestions.accepted") == 0.0
     assert core_metrics.get_metric("suggestions.declined") == 1.0
+
+
+def test_positive_response_telegram(monkeypatch):
+    """Проверяем, что положительный ответ через Telegram сохраняется и подтверждается."""
+    engine = _engine(monkeypatch)
+    feedback = []
+    acks: list[str] = []
+    # Заглушаем запись в БД и перехватываем текст подтверждения
+    monkeypatch.setattr(
+        "proactive.engine.add_suggestion_feedback",
+        lambda sid, text, acc: feedback.append((sid, text, acc)),
+    )
+    fake_tg = types.SimpleNamespace(send=lambda text: acks.append(text))
+    monkeypatch.setitem(sys.modules, "notifiers.telegram", fake_tg)
+
+    core_events.publish(
+        core_events.Event(
+            kind="suggestion.created",
+            attrs={"text": "выпей воды", "suggestion_id": 5, "trace_id": "trace-pos"},
+        )
+    )
+    core_events.publish(
+        core_events.Event(kind="telegram.message", attrs={"text": "да"})
+    )
+
+    assert feedback == [(5, "да", True)]
+    assert acks and "записал" in acks[0].lower()
 
 
 def test_response_timeout(monkeypatch):
