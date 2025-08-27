@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from core.events import Event, publish
 from core.logging_json import configure_logging
@@ -60,6 +60,8 @@ class PresenceDetector:
         frame_interval_ms: int = 500,
         absent_after_sec: int = 5,
         show_window: bool = True,
+        window_size: Tuple[int, int] = (800, 600),
+        frame_rotation: int = 0,
     ) -> None:
         """Создать объект детектора присутствия.
 
@@ -69,6 +71,8 @@ class PresenceDetector:
         :param camera_index: индекс веб‑камеры; ``None`` отключает работу с камерой
         :param frame_interval_ms: интервал между кадрами при автономной работе
         :param absent_after_sec: сколько секунд отсутствия лица считать уходом пользователя
+        :param window_size: размер окна отладки ``(ширина, высота)``
+        :param frame_rotation: поворот кадра по часовой стрелке (0/90/180/270 градусов)
         """
 
         # Параметры сглаживания
@@ -88,6 +92,12 @@ class PresenceDetector:
         # ли детекция.  В тестовой среде и при работе без дисплея
         # параметр можно отключить.
         self.show_window = show_window
+        self.window_size = window_size  # хотим видеть кадр крупнее для удобной отладки
+
+        if frame_rotation not in (0, 90, 180, 270):
+            raise ValueError("frame_rotation must be 0, 90, 180 or 270 degrees")
+        # фиксированный поворот помогает, если камера установлена боком
+        self.frame_rotation = frame_rotation
         # Событие для остановки фонового потока
         self._stop = threading.Event()
 
@@ -152,10 +162,11 @@ class PresenceDetector:
             return
 
         log.info(
-            "Запуск детектора присутствия (camera_index=%s, interval=%d ms, window=%s)",
+            "Запуск детектора присутствия (camera_index=%s, interval=%d ms, window=%s, rotation=%d)",
             self.camera_index,
             self.frame_interval_ms,
             self.show_window,
+            self.frame_rotation,
         )
 
         cap = cv2.VideoCapture(self.camera_index)
@@ -166,9 +177,10 @@ class PresenceDetector:
         classifier = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
-        # Если требуется, создаём отдельное окно для отладки
+        # Если требуется, создаём отдельное окно для отладки нужного размера
         if self.show_window:
             cv2.namedWindow("jarvis_presence", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("jarvis_presence", *self.window_size)
 
         last_ts = time.monotonic()
         while not self._stop.is_set():
@@ -177,6 +189,14 @@ class PresenceDetector:
                 log.debug("Кадр не получен")
                 time.sleep(self.frame_interval_ms / 1000)
                 continue
+            # Поворачиваем кадр при необходимости: это упрощает работу с повернутой камерой
+            if self.frame_rotation:
+                rotate_flag = {
+                    90: cv2.ROTATE_90_CLOCKWISE,
+                    180: cv2.ROTATE_180,
+                    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+                }[self.frame_rotation]
+                frame = cv2.rotate(frame, rotate_flag)
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = classifier.detectMultiScale(gray, 1.3, 5)

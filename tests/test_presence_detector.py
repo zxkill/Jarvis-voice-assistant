@@ -1,3 +1,5 @@
+import pytest
+
 from sensors.vision.presence import PresenceDetector
 
 
@@ -40,3 +42,15 @@ def test_run_without_cv2(monkeypatch):
     monkeypatch.setattr("sensors.vision.presence.cv2", None)
     det = PresenceDetector(camera_index=0, show_window=False)
     det.run()  # отсутствие зависимостей не должно приводить к исключениям
+
+
+def test_frame_rotation_and_validation():
+    """Поворот кадра задаётся параметром ``frame_rotation`` и валидируется."""
+
+    # допустимое значение — просто проверяем, что run() завершится без ошибок
+    det = PresenceDetector(show_window=False, frame_rotation=90)
+    det.run()
+
+    # недопустимый угол должен приводить к ValueError
+    with pytest.raises(ValueError):
+        PresenceDetector(frame_rotation=45)
