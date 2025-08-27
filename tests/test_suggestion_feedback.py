@@ -13,7 +13,7 @@ def temp_db(tmp_path, monkeypatch):
 
 def test_feedback_crud_operations(temp_db):
     """Проверяем создание, чтение, обновление и удаление отзывов."""
-    suggestion_id = writer.add_suggestion("выпей воды")
+    suggestion_id = writer.add_suggestion("выпей воды", "water")
     feedback_id = writer.add_suggestion_feedback(suggestion_id, "хорошо", True)
 
     # Чтение — должен вернуться один отзыв
@@ -44,15 +44,20 @@ def test_feedback_stats(temp_db):
     """Проверяем агрегаты по принятым и отклонённым подсказкам."""
     # На чистой БД статистика должна быть нулевой
     assert reader.get_feedback_stats() == {"accepted": 0, "rejected": 0}
-
-    s1 = writer.add_suggestion("зарядка")
-    s2 = writer.add_suggestion("позвони другу")
+    s1 = writer.add_suggestion("зарядка", "stretch")
+    s2 = writer.add_suggestion("позвони другу", "call")
 
     writer.add_suggestion_feedback(s1, "сделаю", True)
     writer.add_suggestion_feedback(s2, "не сейчас", False)
 
     # Подсказка без отзывов должна возвращать пустой список
-    s3 = writer.add_suggestion("прочитай книгу")
+    s3 = writer.add_suggestion("прочитай книгу", "read")
     assert reader.get_suggestion_feedback(s3) == []
 
     assert reader.get_feedback_stats() == {"accepted": 1, "rejected": 1}
+    # Проверяем агрегаты по типам подсказок
+    stats_by_type = reader.get_feedback_stats_by_type()
+    assert stats_by_type == {
+        "stretch": {"accepted": 1, "rejected": 0},
+        "call": {"accepted": 0, "rejected": 1},
+    }

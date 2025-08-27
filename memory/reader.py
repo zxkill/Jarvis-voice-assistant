@@ -90,3 +90,35 @@ def get_feedback_stats() -> dict[str, int]:
             rejected_count,
         )
         return {"accepted": accepted_count, "rejected": rejected_count}
+
+
+def get_feedback_stats_by_type() -> dict[str, dict[str, int]]:
+    """Вернуть статистику отзывов, сгруппированную по типам подсказок.
+
+    Результат словарь вида ``{reason_code: {"accepted": int, "rejected": int}}``.
+    Подсказки без отзывов в результат не попадают.
+    """
+
+    logger.debug("Запрос статистики по типам подсказок")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.reason_code AS reason_code,
+                   SUM(CASE WHEN f.accepted = 1 THEN 1 ELSE 0 END) AS accepted_count,
+                   SUM(CASE WHEN f.accepted = 0 THEN 1 ELSE 0 END) AS rejected_count
+            FROM suggestions AS s
+            JOIN suggestion_feedback AS f ON s.id = f.suggestion_id
+            GROUP BY s.reason_code
+            """,
+        ).fetchall()
+
+        stats: dict[str, dict[str, int]] = {}
+        for row in rows:
+            reason_code = str(row["reason_code"])
+            stats[reason_code] = {
+                "accepted": int(row["accepted_count"] or 0),
+                "rejected": int(row["rejected_count"] or 0),
+            }
+
+        logger.debug("Статистика по типам: %s", stats)
+        return stats

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+# Стандартные библиотеки
 import sqlite3
 import time
+import logging
 from pathlib import Path
 
 # Путь к файлу БД, создаётся рядом с модулем
@@ -35,8 +37,12 @@ SCHEMA = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         text TEXT NOT NULL,
         ts INTEGER NOT NULL,
-        processed INTEGER NOT NULL DEFAULT 0
+        processed INTEGER NOT NULL DEFAULT 0,
+        reason_code TEXT
     )
+    """,
+    """
+    ALTER TABLE suggestions ADD COLUMN reason_code TEXT
     """,
     """
     -- Таблица для хранения откликов пользователей на подсказки
@@ -86,9 +92,15 @@ def get_connection() -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Прогоняем DDL-миграции."""
+    """Прогоняем DDL-миграции, игнорируя уже применённые шаги."""
     for ddl in SCHEMA:
-        conn.execute(ddl)
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError as exc:
+            # Если столбец уже существует или таблица создана, SQLite выбросит
+            # ``OperationalError``. Для идемпотентности миграций такие ошибки
+            # подавляются, но логируются для отладки.
+            logging.getLogger(__name__).debug("migration skipped: %s", exc)
 
 
 def _rotate_events(conn: sqlite3.Connection) -> None:
