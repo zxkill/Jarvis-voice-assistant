@@ -1,5 +1,3 @@
-import pytest
-
 from sensors.vision.presence import PresenceDetector
 
 
@@ -18,7 +16,7 @@ def test_presence_events_and_tracker(monkeypatch):
     monkeypatch.setattr("sensors.vision.presence.publish", lambda e: events.append(e))
 
     tracker = DummyTracker()
-    det = PresenceDetector(alpha=1.0, threshold=0.5, tracker=tracker, show_window=False)
+    det = PresenceDetector(alpha=1.0, threshold=0.5, tracker=tracker)
 
     det.update(True, 5.0, -3.0, 33)
     assert tracker.calls[-1] == (True, 5.0, -3.0, 33)
@@ -32,7 +30,7 @@ def test_presence_events_and_tracker(monkeypatch):
 def test_run_without_camera_index():
     """Метод run() без указания камеры завершается без ошибок."""
 
-    det = PresenceDetector(show_window=False)
+    det = PresenceDetector()
     det.run()  # просто проверяем, что метод не выбрасывает исключений
 
 
@@ -40,32 +38,5 @@ def test_run_without_cv2(monkeypatch):
     """Если OpenCV отсутствует, run() должен завершиться сразу."""
 
     monkeypatch.setattr("sensors.vision.presence.cv2", None)
-    det = PresenceDetector(camera_index=0, show_window=False)
+    det = PresenceDetector(camera_index=0)
     det.run()  # отсутствие зависимостей не должно приводить к исключениям
-
-
-def test_frame_rotation_and_validation():
-    """Поворот кадра задаётся параметром ``frame_rotation`` и валидируется."""
-
-    # по умолчанию камера должна быть повернута на 270°
-    det_default = PresenceDetector(show_window=False)
-    assert det_default.frame_rotation == 270
-
-    # допустимое значение — просто проверяем, что run() завершится без ошибок
-    det = PresenceDetector(show_window=False, frame_rotation=90)
-    det.run()
-
-    # недопустимый угол должен приводить к ValueError
-    with pytest.raises(ValueError):
-        PresenceDetector(frame_rotation=45)
-
-
-def test_detection_params_validation():
-    """Параметры каскада должны валидироваться."""
-
-    with pytest.raises(ValueError):
-        PresenceDetector(scale_factor=1.0)
-    with pytest.raises(ValueError):
-        PresenceDetector(min_neighbors=-1)
-    with pytest.raises(ValueError):
-        PresenceDetector(min_size=(0, 50))
