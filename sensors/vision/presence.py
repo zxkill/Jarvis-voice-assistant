@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -14,6 +16,16 @@ from typing import Optional
 from core.events import Event, publish
 from core.logging_json import configure_logging
 from .face_tracker import FaceTracker
+
+# Попытка импортировать OpenCV. В тестовой среде или на устройствах без
+# установленной библиотеки импорт может завершиться ошибкой — в таком случае
+# модуль всё равно должен загрузиться, но функциональность детекции по камере
+# будет недоступна.
+try:  # pragma: no cover - в тестах OpenCV может отсутствовать
+    import cv2  # type: ignore
+except Exception as exc:  # pylint: disable=broad-except
+    cv2 = None  # type: ignore
+    logging.getLogger(__name__).warning("OpenCV недоступен: %s", exc)
 
 log = configure_logging(__name__)
 
@@ -29,16 +41,49 @@ class PresenceState:
 
 
 class PresenceDetector:
-    """EMA-для оценки присутствия лица и запуск `FaceTracker`."""
+    """EMA-для оценки присутствия лица и запуск ``FaceTracker``.
 
-    def __init__(self, alpha: float = 0.6, threshold: float = 0.5, tracker: Optional[FaceTracker] = None) -> None:
-        # Коэффициент сглаживания и порог появления/исчезновения
+    Класс объединяет две задачи:
+
+    * статистическая оценка присутствия пользователя в кадре на основе
+      экспоненциального сглаживания (EMA);
+    * при необходимости — автономный цикл обработки кадров с камеры для
+      детекции лица при помощи OpenCV.
+    """
+
+    def __init__(
+        self,
+        alpha: float = 0.6,
+        threshold: float = 0.5,
+        tracker: Optional[FaceTracker] = None,
+        camera_index: Optional[int] = None,
+        frame_interval_ms: int = 500,
+        absent_after_sec: int = 5,
+    ) -> None:
+        """Создать объект детектора присутствия.
+
+        :param alpha: коэффициент сглаживания для EMA
+        :param threshold: порог уверенности, при превышении которого лицо считается найденным
+        :param tracker: внешний трекер поворота камеры
+        :param camera_index: индекс веб‑камеры; ``None`` отключает работу с камерой
+        :param frame_interval_ms: интервал между кадрами при автономной работе
+        :param absent_after_sec: сколько секунд отсутствия лица считать уходом пользователя
+        """
+
+        # Параметры сглаживания
         self.alpha = alpha
         self.threshold = threshold
         # Текущее состояние
         self.state = PresenceState()
         # Трекер лица, отвечающий за поворот камеры
         self.tracker = tracker or FaceTracker()
+
+        # Параметры работы с камерой
+        self.camera_index = camera_index
+        self.frame_interval_ms = frame_interval_ms
+        self.absent_after_sec = absent_after_sec
+        # Событие для остановки фонового потока
+        self._stop = threading.Event()
 
     # ------------------------------------------------------------------
     def update(self, detected: bool, dx_px: float = 0.0, dy_px: float = 0.0, dt_ms: int = 0) -> None:
@@ -83,6 +128,82 @@ class PresenceDetector:
             self.tracker.update(True, dx_px, dy_px, dt_ms)
         else:
             self.tracker.update(False, 0.0, 0.0, dt_ms)
+
+    # ------------------------------------------------------------------
+    def run(self) -> None:
+        """Запустить автономный цикл обработки кадров с камеры.
+
+        Если библиотека OpenCV недоступна либо не задан индекс камеры, метод
+        завершается сразу, оставляя систему работоспособной без детекции
+        присутствия.
+        """
+
+        if self.camera_index is None:
+            log.warning("Индекс камеры не задан — детектор присутствия не запущен")
+            return
+        if cv2 is None:
+            log.error("OpenCV не установлен — детектор присутствия недоступен")
+            return
+
+        log.info(
+            "Запуск детектора присутствия (camera_index=%s, interval=%d ms)",
+            self.camera_index,
+            self.frame_interval_ms,
+        )
+
+        cap = cv2.VideoCapture(self.camera_index)
+        if not cap.isOpened():  # pragma: no cover - зависит от окружения
+            log.error("Не удалось открыть камеру %s", self.camera_index)
+            return
+
+        classifier = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+        last_ts = time.monotonic()
+        while not self._stop.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                log.debug("Кадр не получен")
+                time.sleep(self.frame_interval_ms / 1000)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = classifier.detectMultiScale(gray, 1.3, 5)
+            detected = len(faces) > 0
+
+            dx_px = dy_px = 0.0
+            if detected:
+                x, y, w, h = faces[0]
+                dx_px = (x + w / 2) - frame.shape[1] / 2
+                dy_px = (y + h / 2) - frame.shape[0] / 2
+
+            now = time.monotonic()
+            dt_ms = int((now - last_ts) * 1000)
+            last_ts = now
+
+            self.update(detected, dx_px, dy_px, dt_ms)
+
+            # Если лицо исчезло и длительное время не возвращается, явно
+            # сигнализируем об отсутствии пользователя.
+            if (
+                not detected
+                and self.state.present
+                and now - self.state.last_seen > self.absent_after_sec
+            ):
+                log.debug("пользователь отсутствует более %d с", self.absent_after_sec)
+                self.update(False, 0.0, 0.0, dt_ms)
+
+            time.sleep(self.frame_interval_ms / 1000)
+
+        cap.release()
+        log.info("Детектор присутствия остановлен")
+
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        """Остановить автономный цикл ``run``."""
+
+        self._stop.set()
 
 
 __all__ = ["PresenceDetector", "PresenceState"]

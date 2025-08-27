@@ -25,3 +25,18 @@ def test_presence_events_and_tracker(monkeypatch):
     det.update(False, 0.0, 0.0, 33)
     assert tracker.calls[-1][0] is False
     assert events[-1].attrs["present"] is False
+
+
+def test_run_without_camera_index():
+    """Метод run() без указания камеры завершается без ошибок."""
+
+    det = PresenceDetector()
+    det.run()  # просто проверяем, что метод не выбрасывает исключений
+
+
+def test_run_without_cv2(monkeypatch):
+    """Если OpenCV отсутствует, run() должен завершиться сразу."""
+
+    monkeypatch.setattr("sensors.vision.presence.cv2", None)
+    det = PresenceDetector(camera_index=0)
+    det.run()  # отсутствие зависимостей не должно приводить к исключениям
