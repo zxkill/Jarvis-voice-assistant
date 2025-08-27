@@ -7,5 +7,12 @@
 
 from .distributions import normal, uniform
 from .rate_limiter import RateLimiter
+from .greeting import generate_greeting, process_event
 
-__all__ = ["normal", "uniform", "RateLimiter"]
+__all__ = [
+    "normal",
+    "uniform",
+    "RateLimiter",
+    "generate_greeting",
+    "process_event",
+]
