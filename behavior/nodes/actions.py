@@ -9,6 +9,10 @@ import py_trees
 from py_trees.common import Status
 from py_trees.blackboard import Blackboard
 
+from utils.rng import lognormal
+from utils.noise import perlin
+import random
+
 from core.logging_json import configure_logging
 
 # Логгер модуля действий
@@ -62,3 +66,48 @@ class Idle(py_trees.behaviour.Behaviour):
         self.blackboard.set("idled", count)
         log.info("ожидание бездействия", extra={"attrs": {"count": count}})
         return Status.SUCCESS
+
+
+def blink(start: float = 0.0, mu: float = 0.3, sigma: float = 0.1, seed: int | None = None):
+    """Генератор времени морганий.
+
+    Для интервалов между морганиями используется логнормальное
+    распределение. Возвращает абсолютные метки времени (в секундах)
+    от ``start``. Каждое запланированное моргание логируется вместе
+    с рассчитанным интервалом и параметрами распределения.
+    """
+
+    rng = random.Random(seed)
+    t = start
+    while True:
+        interval = lognormal(mu, sigma, rng=rng)
+        t += interval
+        log.info(
+            "запланировано моргание",
+            extra={"attrs": {"next_time": t, "interval": interval, "mu": mu, "sigma": sigma}},
+        )
+        yield t
+
+
+def micro_saccade(time_point: float, amplitude: float = 1.0, seed: int = 0) -> float:
+    """Вычислить угол смещения взгляда для микро-саккады.
+
+    Плавный дрейф рассчитывается через шум Перлина. Результат
+    ограничивается значением ``amplitude`` и логируется для
+    упрощения отладки.
+    """
+
+    drift = perlin(time_point, seed=seed)
+    angle = max(min(drift * amplitude, amplitude), -amplitude)
+    log.info(
+        "микро-саккада",
+        extra={
+            "attrs": {
+                "time": time_point,
+                "drift": drift,
+                "angle": angle,
+                "amplitude": amplitude,
+            }
+        },
+    )
+    return angle
