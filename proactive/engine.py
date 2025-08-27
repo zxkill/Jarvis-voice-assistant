@@ -19,6 +19,36 @@ from memory.writer import add_suggestion_feedback
 from core import events as core_events
 from skills.chit_chat_ru import random_phrase
 
+# Глобальная ссылка на последний созданный экземпляр движка.
+_engine_instance: "ProactiveEngine | None" = None
+
+
+def is_awaiting_response() -> bool:
+    """Проверить, ждём ли мы сейчас ответа на подсказку."""
+
+    awaiting = bool(_engine_instance and _engine_instance._awaiting)
+    if _engine_instance:
+        _engine_instance.log.debug("awaiting response: %s", awaiting)
+    return awaiting
+
+
+def pop_awaiting() -> dict | None:
+    """Получить информацию об ожидаемой подсказке и сбросить флаг ожидания."""
+
+    if not _engine_instance or not _engine_instance._awaiting:
+        if _engine_instance:
+            _engine_instance.log.debug("no suggestion awaiting")
+        return None
+    timer = _engine_instance._awaiting.get("timer")
+    if timer:
+        timer.cancel()
+    info = _engine_instance._awaiting
+    _engine_instance._awaiting = None
+    _engine_instance.log.debug(
+        "awaiting consumed", extra={"ctx": {"suggestion_id": info.get("id")}}
+    )
+    return info
+
 
 class ProactiveEngine:
     """Обрабатывает проактивные подсказки и отправляет их пользователю."""
@@ -47,6 +77,10 @@ class ProactiveEngine:
         # Состояние ожидания ответа: хранит ID подсказки и таймер.
         self._awaiting: dict | None = None
         self.log = configure_logging("proactive.engine")
+        # Сохраняем глобальную ссылку на экземпляр движка,
+        # чтобы другие модули могли проверить состояние ожидания.
+        global _engine_instance
+        _engine_instance = self
         set_metric("suggestions.sent", 0)
         set_metric("suggestions.failed", 0)
         # Подписываемся на новые подсказки, обновления присутствия и команды.
@@ -55,8 +89,8 @@ class ProactiveEngine:
         # Подписка на распознанную речь используется и для обновления таймера,
         # и для фиксации возможного ответа на подсказку.
         core_events.subscribe("speech.recognized", self._on_command)
-        core_events.subscribe("speech.recognized", self._on_user_response)
-        # Сообщения из Telegram также могут быть реакцией на подсказку.
+        # Ответы, пришедшие текстом, обрабатываем напрямую, а голосовые
+        # перехватываются в ``app.command_processing``.
         core_events.subscribe("telegram.message", self._on_user_response)
         # Фоновая проверка тишины запускается в отдельном потоке.
         threading.Thread(target=self._idle_loop, daemon=True).start()
