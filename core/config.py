@@ -69,6 +69,8 @@ class PresenceConfig:
     enabled: bool
     camera_index: int
     frame_interval_ms: int
+    show_window: bool
+    frame_rotation: int
 
 
 @dataclass
@@ -170,10 +172,17 @@ def load_config(path: str = "config.ini") -> AppConfig:
         token=_env_or_cfg(parser, "TELEGRAM", "token", "TELEGRAM_TOKEN")
     )
     # Параметры камеры берём целочисленными значениями
+    # Параметры присутствия: флаг, индекс камеры, интервал кадров и настройки
+    # отладочного окна с поворотом кадра.
+    rotation = parser.getint("PRESENCE", "frame_rotation", fallback=270)
+    if rotation not in (0, 90, 180, 270):
+        raise ConfigError("frame_rotation must be 0/90/180/270")
     presence = PresenceConfig(
         enabled=parser.getboolean("PRESENCE", "enabled"),
         camera_index=parser.getint("PRESENCE", "camera_index"),
         frame_interval_ms=parser.getint("PRESENCE", "frame_interval_ms"),
+        show_window=parser.getboolean("PRESENCE", "show_window", fallback=True),
+        frame_rotation=rotation,
     )
 
     quiet = QuietConfig(

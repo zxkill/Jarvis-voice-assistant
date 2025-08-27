@@ -59,8 +59,8 @@ class PresenceDetector:
         camera_index: Optional[int] = None,
         frame_interval_ms: int = 500,
         absent_after_sec: int = 5,
-        show_window: bool = False,
-        frame_rotation: int = 90,
+        show_window: bool = True,
+        frame_rotation: int = 270,
     ) -> None:
         """Создать объект детектора присутствия.
 
@@ -72,6 +72,8 @@ class PresenceDetector:
         :param frame_interval_ms: интервал между кадрами при автономной работе
         :param absent_after_sec: сколько секунд отсутствия лица считать уходом
             пользователя
+        :param show_window: выводить ли окно OpenCV для наглядной отладки
+        :param frame_rotation: поворот кадра (0/90/180/270°) для корректной ориентации
         """
 
         # Параметры сглаживания

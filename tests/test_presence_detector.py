@@ -52,7 +52,7 @@ def test_frame_rotation_validation():
 
 
 def test_default_frame_rotation():
-    """По умолчанию кадр поворачивается на 90 градусов."""
+    """По умолчанию кадр поворачивается на 270 градусов."""
 
     det = PresenceDetector()
-    assert det.frame_rotation == 90
+    assert det.frame_rotation == 270
