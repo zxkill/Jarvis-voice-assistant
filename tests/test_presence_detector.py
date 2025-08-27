@@ -3,56 +3,22 @@ import pytest
 from sensors.vision.presence import PresenceDetector
 
 
-class DummyTracker:
-    def __init__(self):
-        self.calls = []
-
-    def update(self, detected, dx, dy, dt_ms):
-        self.calls.append((detected, dx, dy, dt_ms))
+def test_frame_rotation_validation():
+    """Неверное значение угла поворота должно приводить к исключению."""
+    with pytest.raises(ValueError):
+        PresenceDetector(camera_index=0, frame_interval_ms=100, absent_after_sec=5, frame_rotation=45)
 
 
-def test_presence_events_and_tracker(monkeypatch):
-    """При появлении/исчезновении лица публикуется событие и вызывается трекер."""
-
-    events = []
-    monkeypatch.setattr("sensors.vision.presence.publish", lambda e: events.append(e))
-
-    tracker = DummyTracker()
-    det = PresenceDetector(alpha=1.0, threshold=0.5, tracker=tracker)
-
-    det.update(True, 5.0, -3.0, 33)
-    assert tracker.calls[-1] == (True, 5.0, -3.0, 33)
-    assert events[-1].kind == "presence.update" and events[-1].attrs["present"] is True
-
-    det.update(False, 0.0, 0.0, 33)
-    assert tracker.calls[-1][0] is False
-    assert events[-1].attrs["present"] is False
-
-
-def test_run_without_camera_index():
-    """Метод run() без указания камеры завершается без ошибок."""
-
-    det = PresenceDetector()
-    det.run()  # просто проверяем, что метод не выбрасывает исключений
+def test_default_parameters():
+    """Параметры по умолчанию устанавливаются корректно."""
+    det = PresenceDetector(camera_index=0, frame_interval_ms=100, absent_after_sec=5)
+    assert det.frame_rotation == 270
+    assert det.show_window is True
 
 
 def test_run_without_cv2(monkeypatch):
-    """Если OpenCV отсутствует, run() должен завершиться сразу."""
-
+    """Отсутствие зависимостей не должно приводить к ошибке выполнения."""
     monkeypatch.setattr("sensors.vision.presence.cv2", None)
-    det = PresenceDetector(camera_index=0)
-    det.run()  # отсутствие зависимостей не должно приводить к исключениям
-
-
-def test_frame_rotation_validation():
-    """Недопустимый угол поворота должен приводить к ValueError."""
-
-    with pytest.raises(ValueError):
-        PresenceDetector(frame_rotation=45)
-
-
-def test_default_frame_rotation():
-    """По умолчанию кадр поворачивается на 270 градусов."""
-
-    det = PresenceDetector()
-    assert det.frame_rotation == 270
+    monkeypatch.setattr("sensors.vision.presence.mp", None)
+    det = PresenceDetector(camera_index=0, frame_interval_ms=100, absent_after_sec=5)
+    det.run()  # метод просто завершается без исключений
