@@ -1,24 +1,37 @@
-import types
+import pytest
 
-from sensors.vision import face_tracker
+from sensors.vision.face_tracker import FaceTracker
 
 
-def test_smoothing_and_events(monkeypatch):
-    """Проверяем экспоненциальное сглаживание и публикацию событий."""
+class DummyPublish:
+    def __init__(self):
+        self.events = []
 
-    sent = []
-    monkeypatch.setattr(face_tracker, "_send_track", lambda dx, dy, dt: sent.append((dx, dy, dt)))
-    events = []
-    monkeypatch.setattr(face_tracker, "publish", lambda e: events.append(e))
+    def __call__(self, event):
+        self.events.append(event)
 
-    tr = face_tracker.FaceTracker(alpha=0.5)
-    tr.update(True, 10.0, 0.0, 40)
-    assert sent[-1][0] == 5.0
-    assert events[-1].attrs["dx"] == 5.0
 
-    tr.update(True, 20.0, 0.0, 40)
-    assert round(sent[-1][0], 1) == 12.5
-    assert round(events[-1].attrs["dx"], 1) == 12.5
+def test_face_tracker_smoothing_and_events(monkeypatch):
+    """Трекер сглаживает координаты и публикует события о статусе лица."""
 
+    dummy_publish = DummyPublish()
+    monkeypatch.setattr("sensors.vision.face_tracker.publish", dummy_publish)
+
+    calls = []
+    monkeypatch.setattr(
+        "sensors.vision.face_tracker._update_track",
+        lambda detected, dx, dy, dt: calls.append((detected, dx, dy, dt)),
+    )
+
+    tr = FaceTracker(alpha=0.5)
+
+    # При первом обнаружении координаты сглаживаются к половине.
+    tr.update(True, 10.0, -6.0, 40)
+    assert calls[-1] == (True, 5.0, -3.0, 40)
+    assert dummy_publish.events[-1].attrs["detected"] is True
+
+    # При потере лица сервоприводы останавливаются и координаты обнуляются.
     tr.update(False, 0.0, 0.0, 40)
-    assert events[-1].attrs["detected"] is False
+    assert calls[-1][0] is False
+    assert tr.dx == 0.0 and tr.dy == 0.0
+    assert dummy_publish.events[-1].attrs["detected"] is False
