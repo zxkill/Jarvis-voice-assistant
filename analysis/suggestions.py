@@ -22,20 +22,61 @@ _present = False
 _last_absent = dt.datetime.now()
 # Момент последнего напоминания о разминке.
 _last_stretch: dt.datetime | None = None
+# Момент последнего напоминания о питье воды.
+_last_water: dt.datetime | None = None
+# Момент последнего напоминания о перерыве для глаз.
+_last_eye_break: dt.datetime | None = None
+# Дата последнего напоминания о постановке целей на день.
+_last_goals_date: dt.date | None = None
 
 # --- Вероятности показа подсказок -----------------------------------------
 # Словарь ``reason_code -> вероятность``. Обновляется перед генерацией.
 _probabilities: Dict[str, float] = {}
 
+# --- Шаблоны подсказок ----------------------------------------------------
+# Для каждого типа подсказки определяем несколько вариантов вопроса и список
+# возможных ответов.  Это поможет последующей ML-части системы понимать, чего
+# ожидает ассистент от пользователя.
+SUGGESTION_TEMPLATES: dict[str, dict[str, List[str]]] = {
+    "hydration": {
+        # Разнообразные формулировки напоминания о воде
+        "questions": [
+            "выпей воды?",
+            "не пора ли попить воды?",
+            "хочешь стакан воды?",
+        ],
+        # Примеры ответов пользователя (положительные и отрицательные)
+        "answers": ["да", "нет", "позже", "сейчас"]
+    },
+    "eye_break": {
+        "questions": [
+            "сделай перерыв для глаз?",
+            "отвлекись от экрана и посмотри вдаль?",
+            "нужен отдых глазам?",
+        ],
+        "answers": ["хорошо", "сейчас", "не сейчас", "позже"],
+    },
+    "daily_goals": {
+        "questions": [
+            "какие цели на сегодня?",
+            "поставим цели на день?",
+            "как продвигаются дневные цели?",
+        ],
+        "answers": ["готово", "позже", "уже сделал", "нет"]
+    },
+}
+
 
 def _on_presence(event: Event) -> None:
     """Обновить внутреннее состояние по событию ``presence.update``."""
-    global _present, _last_absent, _last_stretch
+    global _present, _last_absent, _last_stretch, _last_water, _last_eye_break
     _present = bool(event.attrs.get("present"))
     if not _present:
-        # Пользователь ушёл — запоминаем время и сбрасываем таймер растяжки.
+        # Пользователь ушёл — фиксируем время и сбрасываем таймеры подсказок.
         _last_absent = dt.datetime.now()
         _last_stretch = None
+        _last_water = None
+        _last_eye_break = None
 
 
 # Подписываемся на события присутствия при загрузке модуля.
@@ -96,7 +137,7 @@ def generate(now: dt.datetime | None = None) -> List[int]:
     :param now: текущее время, по умолчанию ``datetime.now()``.
     :return: список идентификаторов созданных подсказок.
     """
-    global _last_stretch
+    global _last_stretch, _last_water, _last_eye_break, _last_goals_date
     now = now or dt.datetime.now()
     created: list[int] = []
 
@@ -119,7 +160,47 @@ def generate(now: dt.datetime | None = None) -> List[int]:
         and (_last_stretch is None or now - _last_stretch >= dt.timedelta(hours=1))
         and _should_emit("hourly_stretch")
     ):
+        # Для режима разминки оставляем жёстко заданный текст,
+        # чтобы не нарушить существующие сценарии распознавания.
         created.append(_emit("разминка?", "hourly_stretch"))
         _last_stretch = now
+
+    # --- Напоминание о питье воды -------------------------------------
+    if (
+        _present
+        and ACTIVE_START_HOUR <= now.hour < ACTIVE_END_HOUR
+        and (_last_water is None or now - _last_water >= dt.timedelta(hours=2))
+        and _should_emit("hydration")
+    ):
+        question = random.choice(SUGGESTION_TEMPLATES["hydration"]["questions"])
+        created.append(_emit(question, "hydration"))
+        _last_water = now
+
+    # --- Перерыв для глаз ----------------------------------------------
+    if (
+        _present
+        and ACTIVE_START_HOUR <= now.hour < ACTIVE_END_HOUR
+        and now - _last_absent >= dt.timedelta(minutes=30)
+        and (
+            _last_eye_break is None
+            or now - _last_eye_break >= dt.timedelta(minutes=30)
+        )
+        and _should_emit("eye_break")
+    ):
+        question = random.choice(SUGGESTION_TEMPLATES["eye_break"]["questions"])
+        created.append(_emit(question, "eye_break"))
+        _last_eye_break = now
+
+    # --- Цели на день ---------------------------------------------------
+    if (
+        _present
+        and now.hour == 9
+        and now.minute < 5
+        and _last_goals_date != now.date()
+        and _should_emit("daily_goals")
+    ):
+        question = random.choice(SUGGESTION_TEMPLATES["daily_goals"]["questions"])
+        created.append(_emit(question, "daily_goals"))
+        _last_goals_date = now.date()
 
     return created
