@@ -59,6 +59,7 @@ class PresenceDetector:
         camera_index: Optional[int] = None,
         frame_interval_ms: int = 500,
         absent_after_sec: int = 5,
+        show_window: bool = True,
     ) -> None:
         """Создать объект детектора присутствия.
 
@@ -82,6 +83,11 @@ class PresenceDetector:
         self.camera_index = camera_index
         self.frame_interval_ms = frame_interval_ms
         self.absent_after_sec = absent_after_sec
+        # Нужно ли выводить отладочное окно с изображением камеры
+        # По умолчанию включено, так как это помогает понять, работает
+        # ли детекция.  В тестовой среде и при работе без дисплея
+        # параметр можно отключить.
+        self.show_window = show_window
         # Событие для остановки фонового потока
         self._stop = threading.Event()
 
@@ -146,9 +152,10 @@ class PresenceDetector:
             return
 
         log.info(
-            "Запуск детектора присутствия (camera_index=%s, interval=%d ms)",
+            "Запуск детектора присутствия (camera_index=%s, interval=%d ms, window=%s)",
             self.camera_index,
             self.frame_interval_ms,
+            self.show_window,
         )
 
         cap = cv2.VideoCapture(self.camera_index)
@@ -159,6 +166,9 @@ class PresenceDetector:
         classifier = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
+        # Если требуется, создаём отдельное окно для отладки
+        if self.show_window:
+            cv2.namedWindow("jarvis_presence", cv2.WINDOW_NORMAL)
 
         last_ts = time.monotonic()
         while not self._stop.is_set():
@@ -184,6 +194,17 @@ class PresenceDetector:
 
             self.update(detected, dx_px, dy_px, dt_ms)
 
+            if self.show_window:
+                # Рисуем прямоугольник вокруг лица и выводим на экран
+                if detected:
+                    x, y, w, h = faces[0]
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.imshow("jarvis_presence", frame)
+                # waitKey необходим для обновления окна; 1 мс достаточно
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    log.info("Остановлено пользователем через 'q'")
+                    break
+
             # Если лицо исчезло и длительное время не возвращается, явно
             # сигнализируем об отсутствии пользователя.
             if (
@@ -197,6 +218,8 @@ class PresenceDetector:
             time.sleep(self.frame_interval_ms / 1000)
 
         cap.release()
+        if self.show_window:
+            cv2.destroyWindow("jarvis_presence")
         log.info("Детектор присутствия остановлен")
 
     # ------------------------------------------------------------------
