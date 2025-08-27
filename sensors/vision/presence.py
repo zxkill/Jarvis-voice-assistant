@@ -90,6 +90,13 @@ class PresenceDetector:
         self.absent_after_sec = absent_after_sec
         # Нужно ли показывать отладочное окно с изображением
         self.show_window = show_window
+        # Логируем выбранный режим, чтобы при отладке сразу видеть, будет ли
+        # показано окно OpenCV
+        log.debug(
+            "show_window=%s — отладочное окно %s",
+            show_window,
+            "включено" if show_window else "отключено",
+        )
         # Поворот кадра; допускаются только кратные 90 градусы значения
         if frame_rotation not in (0, 90, 180, 270):
             raise ValueError("frame_rotation must be 0, 90, 180 or 270 degrees")

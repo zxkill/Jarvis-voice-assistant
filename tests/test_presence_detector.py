@@ -56,3 +56,12 @@ def test_default_frame_rotation():
 
     det = PresenceDetector()
     assert det.frame_rotation == 270
+
+
+def test_show_window_flag(monkeypatch):
+    """Передача флага ``show_window`` не должна приводить к ошибкам."""
+
+    # Подменяем OpenCV, чтобы тест не зависел от наличия GUI
+    monkeypatch.setattr("sensors.vision.presence.cv2", None)
+    det = PresenceDetector(show_window=False)
+    assert det.show_window is False
