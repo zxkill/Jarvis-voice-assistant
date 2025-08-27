@@ -1,6 +1,7 @@
 import sys
 import time
 import types
+import threading
 
 from core import events as core_events
 from core.events import Event
@@ -65,3 +66,57 @@ def test_smalltalk_interval(monkeypatch, tmp_path):
     assert len(events) == 1
     assert events[0].attrs["present"] is False
     assert sent and all(ch == "telegram" for ch, _ in sent)
+
+
+def test_dialog_events_on_response(monkeypatch):
+    """Убеждаемся, что ответы пользователя публикуют события ``dialog.*`` с trace_id."""
+    events: list[tuple[str, Event]] = []
+    core_events._subscribers.clear()
+
+    # Отключаем фоновый поток ``_idle_loop``, чтобы тест не зависал.
+    real_thread = threading.Thread
+
+    def fake_thread(*args, **kwargs):
+        target = kwargs.get("target")
+        if target is not None:
+            return types.SimpleNamespace(start=lambda: None)
+        return real_thread(*args, **kwargs)
+
+    monkeypatch.setattr(threading, "Thread", fake_thread)
+
+    engine = ProactiveEngine(
+        Policy(PolicyConfig()),
+        idle_threshold_sec=10**6,
+        smalltalk_interval_sec=10**6,
+        check_period_sec=10**6,
+    )
+    # Возвращаем оригинальный класс ``Thread`` после создания движка.
+    monkeypatch.setattr(threading, "Thread", real_thread)
+    monkeypatch.setattr(engine, "_send", lambda *a, **k: True)
+
+    core_events.subscribe("dialog.success", lambda e: events.append(("success", e)))
+    core_events.subscribe("dialog.failure", lambda e: events.append(("failure", e)))
+
+    trace_id = "trace-dialog"
+    core_events.publish(
+        Event(
+            kind="suggestion.created",
+            attrs={"text": "выпей воды", "suggestion_id": 1, "trace_id": trace_id},
+        )
+    )
+    core_events.publish(Event(kind="telegram.message", attrs={"text": "да"}))
+    time.sleep(0.1)
+    assert events and events[0][0] == "success"
+    assert events[0][1].attrs["trace_id"] == trace_id
+
+    events.clear()
+    core_events.publish(
+        Event(
+            kind="suggestion.created",
+            attrs={"text": "отдохни", "suggestion_id": 2, "trace_id": trace_id},
+        )
+    )
+    core_events.publish(Event(kind="telegram.message", attrs={"text": "нет"}))
+    time.sleep(0.1)
+    assert events and events[0][0] == "failure"
+    assert events[0][1].attrs["trace_id"] == trace_id

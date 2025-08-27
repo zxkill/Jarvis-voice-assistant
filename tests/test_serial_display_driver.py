@@ -285,8 +285,8 @@ def test_non_json_lines_are_ignored(monkeypatch, capfd):
 
     # Драйвер должен проигнорировать строку и не записать событие в очередь
     assert driver._inq.empty(), "Очередь событий должна быть пустой"
-    # В логах не должно появиться сообщения о некорректном JSON
-    assert "Bad JSON" not in err, "Не должно быть ошибок JSON"
+    # В логах не должно появиться сообщения о некорректном NDJSON
+    assert "Invalid NDJSON" not in err, "Не должно быть ошибок NDJSON"
 
 
 def test_driver_disables_serial_logging(monkeypatch):
@@ -355,3 +355,67 @@ def test_parse_json_line_returns_none_on_failure():
     from display.drivers.serial import _parse_json_line
 
     assert _parse_json_line('broken') is None
+
+
+def test_send_item_adds_timestamp(monkeypatch):
+    """Каждая отправка должна содержать поле времени ``ts``."""
+
+    dummy = DummySerial()
+    fake_serial = types.SimpleNamespace(Serial=lambda *a, **k: dummy, SerialException=Exception)
+    fake_tools = types.SimpleNamespace(list_ports=types.SimpleNamespace(comports=lambda: []))
+    fake_serial.tools = fake_tools
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_tools.list_ports)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    # Подменяем открытие порта и поток чтения, чтобы использовать фиктивный порт
+    monkeypatch.setattr(
+        SerialDisplayDriver,
+        "_open_serial",
+        lambda self, timeout=None: setattr(self, "ser", dummy),
+    )
+    monkeypatch.setattr(SerialDisplayDriver, "_reader", lambda self: None)
+
+    driver = SerialDisplayDriver(port="dummy")
+    item = DisplayItem(kind="txt", payload="hi")
+    driver.draw(item)
+    driver.close()
+
+    sent = [json.loads(w) for w in dummy.written]
+    assert any(isinstance(msg.get("ts"), float) and msg.get("kind") == "txt" for msg in sent)
+
+
+def test_on_event_rejects_invalid_ndjson(monkeypatch, capfd):
+    """Некорректные строки NDJSON логируются и отбрасываются."""
+
+    fake_serial = types.SimpleNamespace(SerialException=Exception)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    monkeypatch.setattr(SerialDisplayDriver, "_open_serial", lambda self, timeout=None: None)
+
+    driver = SerialDisplayDriver(port="dummy")
+    ok = driver.on_event("not a json")
+    driver.close()
+    assert not ok
+    assert driver._inq.empty()
+
+
+def test_on_event_requires_fields(monkeypatch, capfd):
+    """Строки без обязательных полей отбрасываются."""
+
+    fake_serial = types.SimpleNamespace(SerialException=Exception)
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+
+    from display.drivers.serial import SerialDisplayDriver
+
+    monkeypatch.setattr(SerialDisplayDriver, "_open_serial", lambda self, timeout=None: None)
+
+    driver = SerialDisplayDriver(port="dummy")
+    ok = driver.on_event('{"kind": 123}')
+    driver.close()
+    assert not ok
+    assert driver._inq.empty()

@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import time
 import datetime as dt
+import uuid  # Генерация trace_id для отслеживания цепочек событий
 
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
@@ -242,6 +243,9 @@ class ProactiveEngine:
             now_dt = dt.datetime.fromtimestamp(now)
             period = self._period_of_day(now_dt.hour)
             weekday = now_dt.strftime("%A")
+            # Для каждого small-talk генерируем отдельный ``trace_id``,
+            # чтобы отследить всю цепочку событий от предложения до ответа.
+            trace_id = uuid.uuid4().hex
             self.log.info(
                 "smalltalk triggered",
                 extra={
@@ -250,6 +254,7 @@ class ProactiveEngine:
                         "present": self.present,
                         "period": period,
                         "weekday": weekday,
+                        "trace_id": trace_id,
                     }
                 },
             )
@@ -262,6 +267,7 @@ class ProactiveEngine:
                         "present": self.present,
                         "period": period,
                         "weekday": weekday,
+                        "trace_id": trace_id,
                     },
                 )
             )
@@ -374,12 +380,35 @@ class ProactiveEngine:
                 },
             )
         )
+        # Параллельно публикуем агрегированное событие исхода диалога,
+        # чтобы другие подсистемы могли реагировать на успех или отказ.
+        dialog_kind = "dialog.success" if accepted else "dialog.failure"
+        core_events.publish(
+            core_events.Event(
+                kind=dialog_kind,
+                attrs={
+                    "text": text,
+                    "suggestion_id": suggestion_id,
+                    "trace_id": trace_id,
+                },
+            )
+        )
         self.log.info(
             "response received",
             extra={
                 "ctx": {
                     "suggestion_id": suggestion_id,
                     "accepted": accepted,
+                    "trace_id": trace_id,
+                }
+            },
+        )
+        self.log.debug(
+            "dialog result event published",
+            extra={
+                "ctx": {
+                    "suggestion_id": suggestion_id,
+                    "result": dialog_kind,
                     "trace_id": trace_id,
                 }
             },

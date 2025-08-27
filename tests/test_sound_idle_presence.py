@@ -20,6 +20,8 @@ def test_play_idle_respects_presence(monkeypatch):
     monkeypatch.setattr(sounds, "sd", dummy_sd)
     # Отключаем запуск фонового потока, чтобы не создавать гонок в тесте.
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
+    monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
     # Создаём драйвер и подменяем воспроизведение эффекта на запись вызова.
     driver = sounds.EmotionSoundDriver()
     monkeypatch.setattr(sounds, "_idle_breath_last", -sounds.MIN_IDLE_BREATH_COOLDOWN)

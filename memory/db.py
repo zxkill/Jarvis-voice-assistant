@@ -6,6 +6,7 @@ from __future__ import annotations
 import sqlite3
 import time
 import logging
+import json
 from pathlib import Path
 
 # Путь к файлу БД, создаётся рядом с модулем
@@ -124,6 +125,8 @@ def _cleanup_timers(conn: sqlite3.Connection) -> None:
 SMALLTALK_KEY = "smalltalk:last_ts"
 # Ключ для хранения уровня настроения ассистента
 MOOD_LEVEL_KEY = "emotion:mood"
+# Ключ для хранения valence/arousal настроения
+MOOD_STATE_KEY = "emotion:mood_state"
 
 
 def get_last_smalltalk_ts() -> int:
@@ -167,3 +170,59 @@ def set_mood_level(level: int) -> None:
             "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
             (MOOD_LEVEL_KEY, str(level), ts),
         )
+
+
+# --- Extended mood state helpers -------------------------------------------
+
+def get_mood_state(trace_id: str | None = None) -> tuple[float, float]:
+    """Вернуть сохранённое состояние настроения (valence, arousal)."""
+    start = time.time()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM context_items WHERE key=?", (MOOD_STATE_KEY,)
+        ).fetchone()
+        if row:
+            data = json.loads(row["value"])
+            valence = float(data.get("valence", 0.0))
+            arousal = float(data.get("arousal", 0.0))
+        else:
+            valence, arousal = 0.0, 0.0
+    duration = int((time.time() - start) * 1000)
+    logging.getLogger(__name__).info(
+        json.dumps(
+            {
+                "event": "db.get_mood_state",
+                "trace_id": trace_id,
+                "duration_ms": duration,
+                "valence": valence,
+                "arousal": arousal,
+            },
+            ensure_ascii=False,
+        )
+    )
+    return valence, arousal
+
+
+def set_mood_state(valence: float, arousal: float, trace_id: str | None = None) -> None:
+    """Сохранить текущее состояние настроения (valence, arousal)."""
+    start = time.time()
+    ts = int(time.time())
+    payload = json.dumps({"valence": valence, "arousal": arousal}, ensure_ascii=False)
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
+            (MOOD_STATE_KEY, payload, ts),
+        )
+    duration = int((time.time() - start) * 1000)
+    logging.getLogger(__name__).info(
+        json.dumps(
+            {
+                "event": "db.set_mood_state",
+                "trace_id": trace_id,
+                "duration_ms": duration,
+                "valence": valence,
+                "arousal": arousal,
+            },
+            ensure_ascii=False,
+        )
+    )

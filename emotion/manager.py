@@ -1,8 +1,13 @@
 import time
 from threading import Timer
 
-from emotion.state import EmotionState, Emotion
 from typing import Optional
+
+# Локальные модули системы эмоций
+from emotion.state import EmotionState, Emotion
+from emotion.mood import Mood
+from emotion import policy
+
 from core.logging_json import configure_logging
 from core import events as core_events
 
@@ -27,6 +32,9 @@ class EmotionManager:
         self._state = EmotionState()
         self._prev_emotion = self._state.current
 
+        # Объект настроения (valence/arousal), восстанавливаемый из БД
+        self._mood = Mood.load()
+
         # Признак текущего присутствия пользователя перед камерой
         self._present = True
         # Активен ли сейчас обработчик пользовательского запроса
@@ -37,6 +45,8 @@ class EmotionManager:
         self._speech_active = False
         # Эмоция, ожидающая публикации после окончания речи
         self._pending_emotion: Optional[Emotion] = None
+        # Отложенный результат политики (для передачи после завершения речи)
+        self._pending_policy: Optional[policy.PolicyResult] = None
         # Таймер смены эмоций в простое
         self._idle_timer: Optional[Timer] = None
 
@@ -53,6 +63,8 @@ class EmotionManager:
         # Уровень настроения зависит от успешности диалога
         core_events.subscribe("dialog.success", self._on_dialog_success)
         core_events.subscribe("dialog.failure", self._on_dialog_failure)
+        # Внешние факторы, влияющие на настроение (например, погода)
+        core_events.subscribe("weather.update", self._on_weather_update)
 
     def start(self) -> None:
         """Опубликовать начальное состояние.
@@ -81,20 +93,28 @@ class EmotionManager:
 
     def _on_dialog_success(self, event: core_events.Event) -> None:
         """Реакция на успешный ответ пользователю."""
+        # Поднимаем числовой уровень настроения для обратной совместимости
         self._state.raise_mood(reason="dialog success")
-        self._switch_emotion(Emotion.HAPPY, "dialog success")
+        # Обновляем двухмерное настроение и выбираем новую эмоцию
+        self._update_mood(1.0, 1.0, reason="dialog success")
 
     def _on_dialog_failure(self, event: core_events.Event) -> None:
         """Реакция на ошибку или непонимание команды."""
         self._state.drop_mood(reason="dialog failure")
-        self._switch_emotion(Emotion.FRUSTRATED, "dialog failure")
+        # Снижаем валентность сильнее, чем возбуждение, чтобы перейти в негативную зону
+        self._update_mood(-2.0, 0.5, reason="dialog failure")
 
     def _on_presence_update(self, event: core_events.Event) -> None:
         """Запоминаем, есть ли сейчас человек в кадре."""
         self._present = bool(event.attrs.get("present"))
         if self._present and not self._query_active:
+            # Наличие пользователя немного повышает настроение
+            self._update_mood(0.5, 0.2, reason="presence")
             self._reset_idle_timer()
         else:
+            # Отсутствие пользователя делает Jarvis чуть грустнее
+            if not self._present:
+                self._update_mood(-1.0, -0.5, reason="no presence")
             self._cancel_idle_timer()
 
     def _on_speech_recognized(self, event: core_events.Event) -> None:
@@ -151,20 +171,28 @@ class EmotionManager:
         self._switch_emotion(self._prev_emotion, "user query ended")
         self._reset_idle_timer()
 
-    def _publish_emotion(self, emotion: Emotion) -> None:
+    def _publish_emotion(self, emotion: Emotion, policy_res: Optional[policy.PolicyResult] = None) -> None:
         """Публикует событие смены эмоции.
 
-        Весь обмен эмоциями между компонентами происходит через
-        ``core_events``. Здесь мы формируем и отправляем соответствующий
-        объект ``Event``.
+        При активном воспроизведении речи эмоция откладывается до завершения,
+        чтобы не менять параметры синтеза на лету.  Дополнительно к имени
+        эмоции передаются выбранные политикой пресеты TTS и палитра звуков,
+        если они доступны.
         """
         if self._speech_active:
             self._pending_emotion = emotion
+            self._pending_policy = policy_res
             return
+
+        attrs = {"emotion": emotion}
+        if policy_res is not None:
+            attrs.update({
+                "tts_preset": policy_res.tts_preset,
+                "sfx_palette": policy_res.sfx_palette,
+            })
+
         log.debug("Publishing emotion_changed(%s)", emotion.value)
-        core_events.publish(
-            core_events.Event(kind="emotion_changed", attrs={"emotion": emotion})
-        )
+        core_events.publish(core_events.Event(kind="emotion_changed", attrs=attrs))
 
     def _on_speech_started(self, event: core_events.Event) -> None:
         """Отметить, что началось воспроизведение речи.
@@ -180,17 +208,60 @@ class EmotionManager:
         self._speech_active = False
         if self._pending_emotion is not None:
             emotion = self._pending_emotion
+            policy_res = self._pending_policy
             self._pending_emotion = None
-            self._publish_emotion(emotion)
+            self._pending_policy = None
+            self._publish_emotion(emotion, policy_res)
+
+    def _on_weather_update(self, event: core_events.Event) -> None:
+        """Изменить настроение в зависимости от погоды.
+
+        Простейшая эвристика: солнечная и тёплая погода улучшает настроение,
+        дождь или снег — ухудшают.  Конкретные значения можно подобрать в
+        конфигурации ``config/affect.yaml``.
+        """
+        condition = str(event.attrs.get("condition", "")).lower()
+        temp = float(event.attrs.get("temperature", 0))
+        if "rain" in condition or "snow" in condition:
+            self._update_mood(-1.0, -0.5, reason=f"weather {condition}")
+        elif "sun" in condition or temp >= 20:
+            self._update_mood(1.0, 0.5, reason=f"weather {condition}")
 
     # --------------------------------------- вспомогательные методы ---
 
-    def _switch_emotion(self, emotion: Emotion, reason: str) -> None:
+    def _policy_icon_to_emotion(self, icon: str) -> Emotion:
+        """Преобразовать строковое название иконки в перечисление ``Emotion``."""
+        try:
+            return Emotion[icon]
+        except KeyError:
+            return Emotion.NEUTRAL
+
+    def _update_mood(self, valence_delta: float, arousal_delta: float, reason: str) -> None:
+        """Обновить настроение и опубликовать новую эмоцию.
+
+        Вызывает политику выбора эмоций и сохраняет состояние в БД.
+        ``reason`` используется для подробного логирования вклада события.
+        """
+        self._mood.update(valence_delta, arousal_delta)
+        self._mood.save()
+        log.info(
+            "mood update (%s) valence=%+.2f arousal=%+.2f → (%.2f, %.2f)",
+            reason,
+            valence_delta,
+            arousal_delta,
+            self._mood.valence,
+            self._mood.arousal,
+        )
+        policy_res = policy.select(self._mood.valence, self._mood.arousal)
+        emotion = self._policy_icon_to_emotion(policy_res.icon)
+        self._switch_emotion(emotion, reason, policy_res)
+
+    def _switch_emotion(self, emotion: Emotion, reason: str, policy_res: Optional[policy.PolicyResult] = None) -> None:
         """Переключить эмоцию с логированием причины."""
         prev = self._state.current
         self._state.set(emotion)
         log.info("emotion %s → %s (%s)", prev.value, emotion.value, reason)
-        self._publish_emotion(emotion)
+        self._publish_emotion(emotion, policy_res)
 
     def _on_idle_timeout(self) -> None:
         """Обработчик таймера простоя: выбрать следующую эмоцию."""

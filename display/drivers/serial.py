@@ -136,11 +136,16 @@ class SerialDisplayDriver(DisplayDriver):
         self._last.pop(kind, None)
 
     def process_events(self) -> None:
-        """Process incoming events from M5Stack."""
+        """Очистить очередь событий.
+
+        После перехода на NDJSON все события обрабатываются сразу в потоке
+        чтения.  Очередь используется лишь как отладочный буфер и очищается
+        здесь, чтобы не накапливать элементы бесконечно.
+        """
+
         try:
             while True:
-                kind, payload = self._inq.get_nowait()
-                self.on_event(kind, payload)
+                self._inq.get_nowait()
         except Empty:
             pass
 
@@ -154,31 +159,53 @@ class SerialDisplayDriver(DisplayDriver):
             self._send_item(it)
         self._cache_sent = True
 
-    def on_event(self, kind: str, payload: str) -> None:
-        """Handle events from M5Stack. Override as needed."""
+    def on_event(self, line: str) -> bool:
+        """Разобрать и обработать одну строку NDJSON, пришедшую по Serial.
+
+        Возвращает ``True`` при успешной обработке и ``False`` при ошибке
+        валидации.  Корректные события добавляются в очередь ``_inq`` для
+        внешних наблюдателей.
+        """
+
+        msg = _parse_json_line(line)
+        if msg is None:
+            # Линия не похожа на JSON – логируем и отбрасываем
+            log.error("Invalid NDJSON from M5: %s", line)
+            return False
+
+        kind = msg.get("kind")
+        payload = msg.get("payload")
+        if not isinstance(kind, str) or not isinstance(payload, str):
+            # Если поля отсутствуют или имеют неожиданный тип – также отбрасываем
+            log.error("Invalid NDJSON structure: %s", line)
+            return False
+
+        # Сохраняем разобранное событие для возможной обработки в других местах
+        self._inq.put((kind, payload))
         log.debug("Event received kind=%s payload=%s", kind, payload)
-        if kind == "hello":
-            if payload in ("ready", "ping"):
-                now = time.monotonic()
-                # Treat the first ping as a handshake if we missed the initial
-                # "ready" message (e.g. Jarvis started after the board booted).
-                if not self.ready.is_set() or payload == "ready":
-                    # Ignore duplicate handshakes that arrive in quick
-                    # succession, but allow a later "ready" to refresh cache.
-                    if now - self._last_handshake < 5 and self.ready.is_set():
-                        log.debug("Duplicate handshake ignored")
-                    else:
-                        self._last_handshake = now
-                        log.info("Handshake received; pushing cache")
-                        self._cache_sent = False
-                        self._push_cache()
-                        self.ready.set()
-                        # После успешного рукопожатия просим устройство
-                        # отключить вывод логов в USB Serial, чтобы канал
-                        # использовался только для команд.
-                        self._send_json("log", "off")
-                self._send_json("hello", "pong")
-            return
+
+        # Обработка рукопожатия и служебных сообщений
+        if kind == "hello" and payload in ("ready", "ping"):
+            now = time.monotonic()
+            # Treat the first ping as a handshake if we missed the initial
+            # "ready" message (e.g. Jarvis started after the board booted).
+            if not self.ready.is_set() or payload == "ready":
+                # Ignore duplicate handshakes that arrive in quick
+                # succession, but allow a later "ready" to refresh cache.
+                if now - self._last_handshake < 5 and self.ready.is_set():
+                    log.debug("Duplicate handshake ignored")
+                else:
+                    self._last_handshake = now
+                    log.info("Handshake received; pushing cache")
+                    self._cache_sent = False
+                    self._push_cache()
+                    self.ready.set()
+                    # После успешного рукопожатия просим устройство
+                    # отключить вывод логов в USB Serial, чтобы канал
+                    # использовался только для команд.
+                    self._send_json("log", "off")
+            self._send_json("hello", "pong")
+        return True
 
     def _open_serial(self, timeout: float | None = None) -> None:
         """Open serial connection and start reader thread."""
@@ -218,18 +245,22 @@ class SerialDisplayDriver(DisplayDriver):
         """Wait until board sends initial handshake."""
         return self.ready.wait(timeout)
 
-    def _send_json(self, kind: str, payload: str) -> None:
-        """Write an arbitrary JSON message to the serial port."""
+    def _send_dict(self, msg: dict) -> None:
+        """Отправить словарь как строку NDJSON с добавлением timestamp."""
+
+        msg = {"ts": time.time(), **msg}
         with self._tx_lock:
             # Если порт уже закрыт, просто фиксируем факт и не пытаемся писать
             if not self.ser or not self.ser.is_open:
-                log.debug("Serial port not open, dropping frame kind=%s", kind)
+                log.debug(
+                    "Serial port not open, dropping frame kind=%s", msg.get("kind")
+                )
                 return
 
-            msg = json.dumps({"kind": kind, "payload": payload})
-            log.debug("SER→M5 %s", msg)
+            line = json.dumps(msg)
+            log.debug("SER→M5 %s", line)
             try:
-                self.ser.write(msg.encode() + b"\n")
+                self.ser.write(line.encode() + b"\n")
                 # Если запись прошла успешно, сбрасываем счётчик ошибок
                 if self._write_failures:
                     log.debug("Write recovered after %d failures", self._write_failures)
@@ -259,12 +290,16 @@ class SerialDisplayDriver(DisplayDriver):
                         # не пытались писать в него и не получали ошибку
                         self.ser = None
 
+    def _send_json(self, kind: str, payload: str) -> None:
+        """Отправить произвольное сообщение с указанными ``kind`` и ``payload``."""
+        self._send_dict({"kind": kind, "payload": payload})
+
     def _send_item(self, item: DisplayItem) -> None:
-        """Serialize item as JSON and write to serial port."""
-        self._send_json(item.kind, item.payload)
+        """Сериализовать ``DisplayItem`` в NDJSON и отправить по Serial."""
+        self._send_dict({"kind": item.kind, "payload": item.payload})
 
     def _reader(self) -> None:
-        """Фоновый поток: читает строки, парсит JSON и ставит события в очередь."""
+        """Фоновый поток чтения строк NDJSON от устройства."""
         buf = b""
         bad_json_count = 0  # счётчик подряд идущих ошибок парсинга
         while self._running.is_set():
@@ -300,12 +335,12 @@ class SerialDisplayDriver(DisplayDriver):
                         log.info("M5 log: %s", line)
                         continue
 
-                    msg = _parse_json_line(line)
-                    if msg is None:
+                    # Пытаемся обработать строку как NDJSON. При ошибке увеличиваем
+                    # счётчик и при достижении порога сообщаем о возможной
+                    # рассинхронизации.
+                    if not self.on_event(line):
                         bad_json_count += 1
-                        log.error("Bad JSON from M5: %s", line)
                         log.debug("Raw bytes: %s", raw)
-                        # Предупреждаем лишь один раз при достижении порога
                         if bad_json_count == 5:
                             log.warning(
                                 "Five consecutive JSON errors — waiting for resync"
@@ -313,10 +348,6 @@ class SerialDisplayDriver(DisplayDriver):
                         continue
 
                     bad_json_count = 0
-                    kind = msg.get("kind", "")
-                    payload = msg.get("payload", "")
-                    self._inq.put((kind, payload))
-                    self.on_event(kind, payload)
             except serial.SerialException as exc:
                 if not self._running.is_set():
                     break
