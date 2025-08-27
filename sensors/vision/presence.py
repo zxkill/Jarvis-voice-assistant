@@ -205,8 +205,20 @@ class PresenceDetector:
             dx_px = dy_px = 0.0
             if detected:
                 x, y, w, h = faces[0]
+                # Смещение центра лица относительно центра кадра в пикселях:
+                # положительное ``dx_px`` означает, что лицо правее центра,
+                # положительное ``dy_px`` — выше центра.
                 dx_px = (x + w / 2) - frame.shape[1] / 2
                 dy_px = (y + h / 2) - frame.shape[0] / 2
+                log.debug(
+                    "face detected at x=%d y=%d w=%d h=%d dx=%.1f dy=%.1f",
+                    x,
+                    y,
+                    w,
+                    h,
+                    dx_px,
+                    dy_px,
+                )
 
             now = time.monotonic()
             dt_ms = int((now - last_ts) * 1000)
