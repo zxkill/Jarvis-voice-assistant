@@ -85,7 +85,8 @@ async def main() -> None:
     from jarvis_skills import load_all, start_skill_reloader
     from core.config import load_config
     from core.events import Event, publish
-    from sensors.vision import PresenceDetector
+    # Модули зрения: детектор присутствия и сканер камеры
+    from sensors.vision import PresenceDetector, IdleScanner
     from proactive.policy import Policy, PolicyConfig
     from proactive.engine import ProactiveEngine
     from memory.event_logger import setup_event_logging
@@ -172,6 +173,14 @@ async def main() -> None:
         # поэтому при отсутствии библиотеки или камеры модуль просто
         # выводит предупреждение и завершает поток.
         threading.Thread(target=detector.run, daemon=True).start()
+
+        # При отсутствии человека в кадре запускаем ``IdleScanner``, который
+        # плавно осматривает помещение и управляет сервоприводами камеры.
+        # Ширина/высота кадра подобраны под стандартный формат 320x240 px,
+        # при необходимости их можно скорректировать в конфигурации.
+        idle_scanner = IdleScanner(frame_width=320.0, frame_height=240.0)
+        stop_mgr.register(idle_scanner.stop)
+        log.debug("IdleScanner активирован для автосканирования камеры")
 
     # --- Проактивная политика и движок ---------------------------------
     # ``Policy`` определяет канал доставки подсказок, ``ProactiveEngine``
