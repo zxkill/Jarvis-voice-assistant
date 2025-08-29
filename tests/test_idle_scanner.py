@@ -65,3 +65,26 @@ def test_scanner_goes_sleep(monkeypatch):
     scanner.stop()
     events._subscribers.clear()
     events._global_subscribers.clear()
+
+
+def test_scanner_wakeup_by_voice(monkeypatch):
+    """Голосовая команда прерывает сканирование."""
+    driver = _setup_driver(monkeypatch)
+    events._subscribers.clear()
+    events._global_subscribers.clear()
+
+    scanner = IdleScanner(idle_sec=0.05, scan_sec=0.2, sleep_sec=0.2, step_ms=20)
+    for _ in range(20):
+        if any(it.payload for it in driver.items):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("scan did not start")
+
+    events.publish(Event(kind="speech.recognized", attrs={"text": "привет"}))
+    time.sleep(0.05)
+    assert driver.items[-1].payload is None
+
+    scanner.stop()
+    events._subscribers.clear()
+    events._global_subscribers.clear()
