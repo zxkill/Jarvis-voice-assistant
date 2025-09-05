@@ -201,36 +201,44 @@ class PresenceDetector:
             while True:
                 ret, frame_bgr = self._cap.read()
                 if not ret:
+                    log.debug("Камера не вернула кадр, повтор через %.2f сек", dt)
                     time.sleep(dt)
                     continue
                 if self._rotate_code is not None:
                     frame_bgr = cv2.rotate(frame_bgr, self._rotate_code)
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-            detections = mp_face.process(frame_rgb).detections
-            if detections:
-                face = max(detections, key=lambda d: d.score[0])
-                rel_bb = face.location_data.relative_bounding_box
-                cx = rel_bb.xmin + rel_bb.width / 2
-                cy = rel_bb.ymin + rel_bb.height / 2
-                h, w = frame_bgr.shape[:2]
-                self.process_detection(True, cx, cy, w, h)
-            else:
-                self.process_detection(False)
-
-            if self.show_window:
+                # Обнаруживаем лица на кадре
+                detections = mp_face.process(frame_rgb).detections
                 if detections:
+                    face = max(detections, key=lambda d: d.score[0])
+                    rel_bb = face.location_data.relative_bounding_box
+                    cx = rel_bb.xmin + rel_bb.width / 2
+                    cy = rel_bb.ymin + rel_bb.height / 2
                     h, w = frame_bgr.shape[:2]
-                    x0 = int(rel_bb.xmin * w)
-                    y0 = int(rel_bb.ymin * h)
-                    x1 = int((rel_bb.xmin + rel_bb.width) * w)
-                    y1 = int((rel_bb.ymin + rel_bb.height) * h)
-                    cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                cv2.imshow("presence", frame_bgr)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                    log.debug(
+                        "Лицо обнаружено: cx=%.3f cy=%.3f w=%d h=%d", cx, cy, w, h
+                    )
+                    self.process_detection(True, cx, cy, w, h)
+                else:
+                    log.debug("Лицо не обнаружено на текущем кадре")
+                    self.process_detection(False)
 
-            time.sleep(dt)
+                # При необходимости показываем окно с изображением
+                if self.show_window:
+                    if detections:
+                        h, w = frame_bgr.shape[:2]
+                        x0 = int(rel_bb.xmin * w)
+                        y0 = int(rel_bb.ymin * h)
+                        x1 = int((rel_bb.xmin + rel_bb.width) * w)
+                        y1 = int((rel_bb.ymin + rel_bb.height) * h)
+                        cv2.rectangle(frame_bgr, (x0, y0), (x1, y1), (0, 255, 0), 2)
+                    cv2.imshow("presence", frame_bgr)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        log.info("Остановка детектора по нажатию 'q'")
+                        break
+
+                time.sleep(dt)
         finally:
             # При завершении работы снимаем индикатор активности
             set_active("camera", False)
