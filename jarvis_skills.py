@@ -193,7 +193,13 @@ def handle_utterance(text: str) -> bool:
 
                 return True
         except Exception as e:
-            log.exception("Ошибка в скилле %s: %s", func.__module__, e, extra={"trace_id": trace_id})
+            # Используем имя фактически вызванного скилла для корректной диагностики
+            log.exception(
+                "Ошибка в скилле %s: %s",
+                best_func.__module__ if best_func else "<unknown>",
+                e,
+                extra={"trace_id": trace_id},
+            )
 
     return False
 

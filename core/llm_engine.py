@@ -43,7 +43,12 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
         raise ValueError(f"Неизвестный профиль: {profile}")
     model = PROFILES[profile]
     url = f"{BASE_URL}/api/generate"
-    payload = {"model": model, "prompt": prompt, "trace_id": trace_id}
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "trace_id": trace_id,
+        "stream": False,  # просим сервер вернуть единый JSON без чанков
+    }
 
     logger.debug(
         "Отправка запроса в Ollama", extra={"url": url, "model": model, "trace_id": trace_id}
@@ -57,6 +62,8 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
 
     try:
         data = response.json()
+        if not isinstance(data, dict):
+            raise TypeError(f"unexpected JSON type: {type(data)!r}")
         text = str(data.get("response", ""))
     except Exception as exc:
         logger.error("Некорректный ответ от Ollama: %s", exc)

@@ -1,13 +1,8 @@
-import json
 from collections import deque
 
 import requests
-
-from collections import deque
 import pathlib
 import sys
-
-import requests
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -74,6 +69,7 @@ def test_think_saves_dialog(monkeypatch):
     reply = llm_engine.think("Как дела?", trace_id="42")
     assert reply == "привет"
     assert fake_post.last_payload["trace_id"] == "42"
+    assert fake_post.last_payload["stream"] is False
     assert short_term.get_last()[-1] == {
         "trace_id": "42",
         "user": "Как дела?",
