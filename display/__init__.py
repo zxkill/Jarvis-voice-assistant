@@ -29,6 +29,8 @@ class DisplayItem:
         "track",
         "frame",
         "mode",
+        "camera",
+        "microphone",
     ]
     payload: Optional[Union[str, bytes, dict]]  # None → удалить элемент из кеша
 

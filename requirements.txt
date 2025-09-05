@@ -30,3 +30,5 @@ mediapipe
 numpy>=1.26
 
 pyserial==3.5
+# Шифрование конфиденциальных данных
+cryptography
