@@ -9,12 +9,27 @@ sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from memory import db as memory_db
 from memory.long_memory import retrieve_similar, store_event, store_fact
+from memory import embeddings
 
+@pytest.mark.parametrize("profile", ["simple", "transformer"])
+def test_store_and_retrieve_similarity(tmp_path, monkeypatch, profile):
+    """Эпизоды и факты должны находиться по запросу в разных профилях."""
 
-def test_store_and_retrieve_similarity(tmp_path, monkeypatch):
-    """Эпизоды и факты должны находиться по запросу."""
     # Используем временную БД, чтобы не портить реальные данные
     monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
+
+    # Подменяем профиль эмбеддингов: ``simple`` или ``transformer``.
+    monkeypatch.setattr(embeddings, "EMBEDDING_PROFILE", profile)
+
+    # Для трансформера подставляем фиктивную модель, чтобы тест не
+    # зависел от внешних файлов. Модель использует тот же алгоритм,
+    # что и fallback-хеширование, обеспечивая повторяемость результатов.
+    if profile == "transformer":
+        class DummyModel:
+            def encode(self, texts):
+                return [embeddings._hash_embedding(t) for t in texts]
+
+        monkeypatch.setattr(embeddings, "_load_model", lambda: DummyModel())
 
     # Сохраняем несколько записей в обоих типах памяти
     store_event("пошёл в магазин за хлебом")
