@@ -74,6 +74,8 @@ def _run_nightly_reflection() -> None:
         )
     )
     log.info("daily digest notification sent")
+    # Уведомляем другие подсистемы, что ночная рефлексия завершена
+    publish(Event(kind="nightly_reflection.done"))
 
 
 async def nightly_reflect() -> None:
