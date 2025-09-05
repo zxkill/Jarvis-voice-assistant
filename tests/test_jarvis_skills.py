@@ -78,3 +78,30 @@ def test_handle_utterance_from_thread(monkeypatch):
         reset_request_source(token)
 
     assert sent == ["ответ"]
+
+
+def test_handle_utterance_passes_trace_id(monkeypatch):
+    """Убеждаемся, что роутер передаёт ``trace_id`` скиллам, которые
+    его ожидают."""
+
+    import types, sys
+
+    fake_nlp = types.SimpleNamespace(normalize=lambda s: s)
+    monkeypatch.setitem(sys.modules, "core.nlp", fake_nlp)
+
+    import jarvis_skills
+
+    # Заглушка отправки голоса, чтобы не зависеть от реальных TTS-модулей
+    fake_voice = types.SimpleNamespace(send=lambda *a, **k: None)
+    monkeypatch.setitem(sys.modules, "notifiers.voice", fake_voice)
+
+    traces: list[str] = []
+
+    def fake_skill(text: str, *, trace_id: str) -> str:
+        traces.append(trace_id)
+        return "ok"
+
+    monkeypatch.setattr(jarvis_skills, "_loaded", [(["тест"], fake_skill)])
+
+    assert jarvis_skills.handle_utterance("тест") is True
+    assert traces and len(traces[0]) == 32  # uuid.uuid4().hex имеет длину 32 символа
