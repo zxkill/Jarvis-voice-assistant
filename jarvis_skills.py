@@ -18,6 +18,7 @@ import importlib.util
 import threading
 import asyncio
 from pathlib import Path
+import uuid  # для генерации trace_id уникальных запросов
 
 from rapidfuzz import fuzz   # уже есть в requirements.txt
 from core.logging_json import configure_logging
@@ -139,8 +140,17 @@ def handle_utterance(text: str) -> bool:
                 best_score, best_func = score, func
 
     if best_score >= THRESHOLD and best_func:
+        # Генерируем trace_id для связывания логов одного запроса
+        trace_id = uuid.uuid4().hex
         try:
-            reply = best_func(text)
+            try:
+                # Пытаемся передать trace_id скиллу, если он его принимает
+                reply = best_func(text, trace_id=trace_id)
+            except TypeError:
+                # Большинство старых скиллов принимает только текст,
+                # поэтому при ``TypeError`` повторяем вызов без идентификатора
+                reply = best_func(text)
+
             if isinstance(reply, str) and reply.strip():
                 # Используем универсальный уведомитель, который
                 # автоматически отправит ответ голосом или текстом
@@ -150,7 +160,10 @@ def handle_utterance(text: str) -> bool:
                 try:
                     voice_send(reply)
                     log.info(
-                        "skill %s replied: %r", best_func.__module__, reply
+                        "skill %s replied: %r",
+                        best_func.__module__,
+                        reply,
+                        extra={"trace_id": trace_id},
                     )
                 except RuntimeError:
                     if _MAIN_LOOP is not None:
@@ -159,24 +172,34 @@ def handle_utterance(text: str) -> bool:
                             "skill %s replied via main loop: %r",
                             best_func.__module__,
                             reply,
+                            extra={"trace_id": trace_id},
                         )
                     else:  # pragma: no cover - основной цикл не задан
-                        log.exception("failed to send skill reply: no event loop")
+                        log.exception(
+                            "failed to send skill reply: no event loop",
+                            extra={"trace_id": trace_id},
+                        )
                 except Exception:  # pragma: no cover - логируем любые сбои
-                    log.exception("failed to send skill reply")
+                    log.exception("failed to send skill reply", extra={"trace_id": trace_id})
 
                 # сохраняем диалог в краткосрочном контексте для последующего
                 # анализа, чтобы ассистент мог помнить недавние реплики.
                 try:
                     from context.short_term import add as ctx_add
 
-                    ctx_add({"user": text, "reply": reply})
+                    ctx_add({"trace_id": trace_id, "user": text, "reply": reply})
                 except Exception:  # pragma: no cover - контекст не критичен
                     pass
 
                 return True
         except Exception as e:
-            log.exception("Ошибка в скилле %s: %s", func.__module__, e)
+            # Используем имя фактически вызванного скилла для корректной диагностики
+            log.exception(
+                "Ошибка в скилле %s: %s",
+                best_func.__module__ if best_func else "<unknown>",
+                e,
+                extra={"trace_id": trace_id},
+            )
 
     return False
 
