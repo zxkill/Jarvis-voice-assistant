@@ -20,6 +20,7 @@ import os
 import requests
 
 from context import long_term, short_term
+from memory import long_memory
 
 logger = logging.getLogger(__name__)
 
@@ -214,12 +215,19 @@ def think(topic: str, *, trace_id: str) -> str:
     """
 
     context_text = _compose_context()
-    events = "\n".join(long_term.get_events_by_label("think"))
+    # Извлекаем исторические события с меткой "think"
+    events = long_term.get_events_by_label("think")
+    # Находим семантически похожие воспоминания по текущей теме
+    similar = [text for text, _ in long_memory.retrieve_similar(topic)]
+    logger.debug(
+        "Релевантные события для темы %r: %s", topic, similar
+    )
+    long_context = "\n".join(events + similar)
     return _run(
         "think",
         topic=topic,
         context=context_text,
-        long_context=events,
+        long_context=long_context,
         profile="light",
         user_input=topic,
         trace_id=trace_id,
@@ -229,12 +237,18 @@ def think(topic: str, *, trace_id: str) -> str:
 def act(command: str, *, trace_id: str) -> str:
     """Предложить действие на основании команды пользователя."""
     context_text = _compose_context()
-    events = "\n".join(long_term.get_events_by_label("act"))
+    # Извлекаем события с меткой "act" и похожие команды из долговременной памяти
+    events = long_term.get_events_by_label("act")
+    similar = [text for text, _ in long_memory.retrieve_similar(command)]
+    logger.debug(
+        "Релевантные события для команды %r: %s", command, similar
+    )
+    long_context = "\n".join(events + similar)
     return _run(
         "act",
         command=command,
         context=context_text,
-        long_context=events,
+        long_context=long_context,
         profile="light",
         user_input=command,
         trace_id=trace_id,
