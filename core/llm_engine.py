@@ -42,21 +42,25 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
     if profile not in PROFILES:
         raise ValueError(f"Неизвестный профиль: {profile}")
     model = PROFILES[profile]
-    url = f"{BASE_URL}/api/generate"
+    # Используем OpenAI-совместимый эндпоинт /v1/chat/completions.
+    # В качестве единственного сообщения передаём подготовленный ``prompt``.
+    url = f"{BASE_URL}/v1/chat/completions"
     payload = {
         "model": model,
-        "prompt": prompt,
-        "trace_id": trace_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "trace_id": trace_id,  # произвольное поле, помогает в трассировке
         "stream": False,  # просим сервер вернуть единый JSON без чанков
     }
 
     logger.debug(
-        "Отправка запроса в Ollama", extra={"url": url, "model": model, "trace_id": trace_id}
+        "Отправка запроса в Ollama",
+        extra={"url": url, "model": model, "trace_id": trace_id},
     )
     try:
         response = requests.post(url, json=payload, timeout=60)
         response.raise_for_status()
     except requests.RequestException as exc:
+        # Любые сетевые ошибки логируем и поднимаем понятное исключение
         logger.error("Ошибка при обращении к Ollama: %s", exc)
         raise RuntimeError("Ollama недоступна") from exc
 
@@ -64,12 +68,22 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
         data = response.json()
         if not isinstance(data, dict):
             raise TypeError(f"unexpected JSON type: {type(data)!r}")
-        text = str(data.get("response", ""))
+        # Структура ответа: {"choices": [{"message": {"content": "текст"}}]}
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise KeyError("choices")
+        message = choices[0].get("message", {})
+        if not isinstance(message, dict):
+            raise TypeError("message should be dict")
+        text = str(message.get("content", ""))
     except Exception as exc:
         logger.error("Некорректный ответ от Ollama: %s", exc)
         raise RuntimeError("Ollama вернула невалидный JSON") from exc
 
-    logger.debug("Получен ответ от Ollama", extra={"length": len(text), "trace_id": trace_id})
+    logger.debug(
+        "Получен ответ от Ollama",
+        extra={"length": len(text), "trace_id": trace_id},
+    )
     return text
 
 

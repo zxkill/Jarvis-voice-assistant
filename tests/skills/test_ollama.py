@@ -72,7 +72,7 @@ def test_think_saves_dialog(monkeypatch):
 
     def fake_post(url, json, timeout):
         fake_post.last_payload = json
-        return DummyResponse({"response": "привет"})
+        return DummyResponse({"choices": [{"message": {"content": "привет"}}]})
 
     monkeypatch.setattr(requests, "post", fake_post)
     monkeypatch.setattr(long_term, "add_daily_event", lambda text, labels: saved.append((text, labels)))
@@ -81,6 +81,7 @@ def test_think_saves_dialog(monkeypatch):
     assert reply == "привет"
     assert fake_post.last_payload["trace_id"] == "42"
     assert fake_post.last_payload["stream"] is False
+    assert "Как дела?" in fake_post.last_payload["messages"][0]["content"]
     assert short_term.get_last()[-1] == {
         "trace_id": "42",
         "user": "Как дела?",

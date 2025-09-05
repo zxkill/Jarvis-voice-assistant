@@ -44,8 +44,13 @@ class OllamaClient:
         if profile not in self.profiles:
             raise ValueError(f"Неизвестный профиль: {profile}")
         model = self.profiles[profile]
-        url = f"{self.base_url}/api/generate"
-        payload = {"model": model, "prompt": prompt}
+        # Новый эндпоинт: /v1/chat/completions, совместимый с OpenAI API
+        url = f"{self.base_url}/v1/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
 
         logger.debug(
             "Отправка запроса в Ollama", extra={"url": url, "model": model}
@@ -57,10 +62,16 @@ class OllamaClient:
             logger.error("Ошибка при обращении к Ollama: %s", exc)
             raise RuntimeError("Ollama недоступна") from exc
 
-        # Ответ от Ollama приходит как JSON с полем ``response``
+        # Ответ от Ollama: {"choices": [{"message": {"content": "..."}}]}
         try:
             data = response.json()
-            text = str(data.get("response", ""))
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise KeyError("choices")
+            message = choices[0].get("message", {})
+            if not isinstance(message, dict):
+                raise TypeError("message should be dict")
+            text = str(message.get("content", ""))
         except Exception as exc:  # ошибка разбора JSON
             logger.error("Некорректный ответ от Ollama: %s", exc)
             raise RuntimeError("Ollama вернула невалидный JSON") from exc

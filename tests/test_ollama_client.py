@@ -19,14 +19,15 @@ def test_generate_light_profile(monkeypatch):
     def fake_post(url, json, timeout):
         captured["url"] = url
         captured["json"] = json
-        return DummyResponse({"response": "hi"})
+        return DummyResponse({"choices": [{"message": {"content": "hi"}}]})
 
     monkeypatch.setattr("utils.ollama_client.requests.post", fake_post)
     client = OllamaClient(profiles={"light": "test-model"})
     text = client.generate("hello", profile="light")
     assert text == "hi"
     assert captured["json"]["model"] == "test-model"
-    assert "/api/generate" in captured["url"]
+    assert captured["json"]["messages"][0]["content"] == "hello"
+    assert "/v1/chat/completions" in captured["url"]
 
 
 def test_generate_unknown_profile():
