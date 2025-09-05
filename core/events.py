@@ -51,3 +51,23 @@ def publish(event: Event) -> None:
         callback(event)
     for callback in list(_global_subscribers):
         callback(event)
+
+
+# --- Утилиты для проактивных подсказок ------------------------------------
+def fire_proactive_trigger(kind: str, name: str, context: Dict[str, Any] | None = None) -> None:
+    """Опубликовать событие проактивного триггера.
+
+    Parameters
+    ----------
+    kind:
+        Тип триггера: ``time``, ``context`` или ``event``.
+    name:
+        Имя сценария из плейбука.
+    context:
+        Дополнительные атрибуты, передаваемые обработчику.
+    """
+
+    attrs = {"trigger": kind, "name": name}
+    if context:
+        attrs["context"] = context
+    publish(Event("proactivity.trigger", attrs))

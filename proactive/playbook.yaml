@@ -1,0 +1,16 @@
+scenarios:
+  morning_briefing:
+    trigger: time
+    time: "08:00"
+    prompt: |
+      Сформируй краткий утренний брифинг с напоминанием о важных задачах и погоде.
+  context_hint:
+    trigger: context
+    event: presence.update
+    prompt: |
+      Предложи полезный совет, учитывая текущий контекст и активность пользователя.
+  health_check:
+    trigger: event
+    event: health.reminder
+    prompt: |
+      Вежливо напомни сделать разминку, размять глаза и выпить воды.
