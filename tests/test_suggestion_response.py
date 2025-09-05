@@ -1,5 +1,4 @@
 import time
-import threading
 import types
 import asyncio
 import sys
@@ -31,7 +30,8 @@ class DummyPolicy(Policy):
     def __init__(self):
         super().__init__(PolicyConfig())
 
-    def choose_channel(self, present: bool, now=None):  # type: ignore[override]
+    def choose_channel(self, present: bool, *, now=None, text: str | None = None):  # type: ignore[override]
+        """Всегда выбираем голосовой канал, игнорируя текст."""
         return "voice"
 
 
@@ -50,28 +50,12 @@ def reset_metrics():
 
 
 def _engine(monkeypatch, timeout=1.0):
-    # Блокируем запуск фонового потока ``_idle_loop``, чтобы тесты завершались
-    # без лишних логов и зависших потоков. Для этого временно подменяем
-    # ``threading.Thread`` на обёртку, которая игнорирует вызов ``start``.
-    real_thread = threading.Thread
-
-    def fake_thread(*args, **kwargs):
-        target = kwargs.get("target")
-        if target is not None:
-            return types.SimpleNamespace(start=lambda: None)
-        return real_thread(*args, **kwargs)
-
-    monkeypatch.setattr(threading, "Thread", fake_thread)
-
+    """Создать ``ProactiveEngine`` с подменой отправки уведомлений."""
     engine = ProactiveEngine(
         DummyPolicy(),
-        idle_threshold_sec=10**6,
-        smalltalk_interval_sec=10**6,
-        check_period_sec=10**6,
         response_timeout_sec=timeout,
     )
-    # Возвращаем оригинальный ``Thread`` для корректной работы ``Timer``.
-    monkeypatch.setattr(threading, "Thread", real_thread)
+    # Перехватываем отправку уведомлений, чтобы тесты не делали сетевых вызовов.
     monkeypatch.setattr(engine, "_send", lambda *a, **k: True)
     return engine
 

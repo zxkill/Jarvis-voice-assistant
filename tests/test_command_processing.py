@@ -78,34 +78,19 @@ def test_suggestion_answer_bypasses_handlers(monkeypatch):
 
     from proactive.engine import ProactiveEngine
     from proactive.policy import Policy, PolicyConfig
-    import threading
-    import types
 
     class DummyPolicy(Policy):
         def __init__(self) -> None:
             super().__init__(PolicyConfig())
 
-        def choose_channel(self, present: bool, now=None):  # type: ignore[override]
+        def choose_channel(self, present: bool, *, now=None, text: str | None = None):  # type: ignore[override]
+            """Всегда возвращаем голосовой канал, игнорируя содержание."""
             return "voice"
 
-    # Блокируем запуск фонового потока ``_idle_loop``.
-    real_thread = threading.Thread
-
-    def fake_thread(*a, **k):
-        target = k.get("target")
-        if target is not None:
-            return types.SimpleNamespace(start=lambda: None)
-        return real_thread(*a, **k)
-
-    monkeypatch.setattr(threading, "Thread", fake_thread)
     engine = ProactiveEngine(
         DummyPolicy(),
-        idle_threshold_sec=10**6,
-        smalltalk_interval_sec=10**6,
-        check_period_sec=10**6,
         response_timeout_sec=1,
     )
-    monkeypatch.setattr(threading, "Thread", real_thread)
 
     # Имитируем ожидание ответа на подсказку.
     engine._await_response(1, "выпей воды")
