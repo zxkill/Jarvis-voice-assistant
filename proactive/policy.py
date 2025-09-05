@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
+from core.quiet import is_quiet_now
 
 
 @dataclass
@@ -27,6 +28,10 @@ class PolicyConfig:
     force_telegram: bool = False
     silence_window: tuple[dt.time, dt.time] | None = None
     suggestion_min_interval_min: float = 0.0
+    # Максимальное количество подсказок в сутки
+    daily_limit: int | None = None
+    # Ключевые слова, по которым подсказка отменяется
+    cancel_keywords: set[str] = dataclass_field(default_factory=set)
 
 
 class Policy:
@@ -41,6 +46,9 @@ class Policy:
         self.config = config
         # Момент времени последней удачной отправки.
         self._last_sent: dt.datetime | None = None
+        # Счётчик отправок за текущие сутки
+        self._sent_today: int = 0
+        self._day: dt.date = dt.date.today()
         # Логгер с отдельным неймспейсом для удобства фильтрации.
         self.log = configure_logging("proactive.policy")
         set_metric("policy.voice_suppressed_night", 0)
@@ -61,33 +69,49 @@ class Policy:
         return moment >= start or moment <= end
 
     # ------------------------------------------------------------------
-    def choose_channel(self, present: bool, now: dt.datetime | None = None) -> str | None:
+    def choose_channel(
+        self,
+        present: bool,
+        *,
+        now: dt.datetime | None = None,
+        text: str | None = None,
+    ) -> str | None:
         """Выбрать канал доставки подсказки.
 
-        Порядок работы:
-        1. Проверяется интервал с последней отправки. Если он меньше
-           ``suggestion_min_interval_min`` — подсказка игнорируется.
-        2. По умолчанию выбирается голосовой канал. Он заменяется на
-           Telegram, если выполнено одно из правил: принудительный режим,
-           пользователь отсутствует или наступило «тихое» окно.
-        3. Решение логируется вместе с причинами.
-
-        Parameters
-        ----------
-        present:
-            Присутствует ли пользователь физически рядом с устройством.
-        now:
-            Текущее время; используется в тестах, в продакшене
-            берётся ``datetime.now``.
-
-        Returns
-        -------
-        str | None
-            Имя канала (``"voice"`` или ``"telegram"``) либо ``None``,
-            если троттлинг заблокировал отправку.
+        Последовательно проверяются ограничения: тихие часы,
+        ключевые слова отмены, лимит частоты и минимальный интервал.
+        После этого определяется канал доставки, учитывая присутствие.
         """
 
         now = now or dt.datetime.now()
+
+        # --- Тихие часы -------------------------------------------------
+        if is_quiet_now():
+            self.log.info("suppressed: quiet hours")
+            inc_metric("policy.voice_suppressed_night")
+            return None
+
+        # --- Отмена по ключевым словам ---------------------------------
+        if text and self.config.cancel_keywords:
+            lower = text.lower()
+            for kw in self.config.cancel_keywords:
+                if kw.lower() in lower:
+                    self.log.info(
+                        "cancelled by keyword", extra={"ctx": {"keyword": kw}}
+                    )
+                    return None
+
+        # --- Дневной лимит отправок -----------------------------------
+        if self.config.daily_limit is not None:
+            if now.date() != self._day:
+                self._day = now.date()
+                self._sent_today = 0
+            if self._sent_today >= self.config.daily_limit:
+                self.log.info(
+                    "daily limit reached",
+                    extra={"ctx": {"limit": self.config.daily_limit}},
+                )
+                return None
 
         # --- Троттлинг по времени последней отправки -------------------
         if (
@@ -122,6 +146,7 @@ class Policy:
 
         # Запоминаем момент отправки и фиксируем решение в логе.
         self._last_sent = now
+        self._sent_today += 1
         self.log.info(
             "channel decided",
             extra={"ctx": {"channel": channel, "reasons": reasons}},

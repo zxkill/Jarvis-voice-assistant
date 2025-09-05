@@ -139,7 +139,7 @@ class ProactiveEngine:
         )
         # Запрашиваем у политики канал доставки, учитывающий присутствие
         # и ограничения (тихое время, троттлинг и т.п.).
-        channel = self.policy.choose_channel(present)
+        channel = self.policy.choose_channel(present, text=text)
         # Логируем принятое политикой решение.
         self.log.info(
             "policy result",
