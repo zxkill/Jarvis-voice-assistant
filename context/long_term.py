@@ -42,8 +42,25 @@ def get_events_by_label(label: str) -> List[str]:
         try:
             data = json.loads(row["value"])
         except Exception:
-            logger.debug("long_term.get_events_by_label: пропуск повреждённой записи")
+            # Если значение не парсится как JSON, запись повреждена —
+            # пропускаем её, чтобы не ломать остальной вывод.
+            logger.debug(
+                "long_term.get_events_by_label: пропуск повреждённой записи",
+                extra={"label": label},
+            )
             continue
+
+        # В старых версиях данные могли быть не словарём, например числом.
+        # Чтобы не получить AttributeError при .get(), проверяем тип.
+        if not isinstance(data, dict):
+            logger.debug(
+                "long_term.get_events_by_label: неожиданное значение %r",
+                data,
+                extra={"label": label},
+            )
+            continue
+
+        # Добавляем текст события, если среди меток присутствует нужная.
         if label in data.get("labels", []):
             events.append(str(data.get("text", "")))
     logger.debug("long_term.get_events_by_label(%s): %s", label, events)
