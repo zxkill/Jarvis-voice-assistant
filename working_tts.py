@@ -18,7 +18,7 @@ from piper import PiperVoice  # type: ignore — external lib
 from transliterate import translit  # type: ignore
 from threading import Event
 
-from core.nlp import numbers_to_words, remove_spaces_in_numbers
+from core.nlp import normalize_tts_text
 from core import events as core_events
 
 # ────────────────────────── 0. LOGGING ────────────────────────────
@@ -251,9 +251,13 @@ def working_tts(
         )
     )
     _STOP_EVENT.clear()
-    # Приводим исходный текст к удобному для синтеза виду:
-    # 1) числа → слова, 2) убираем пробелы в числах, 3) транслитерация
-    norm = translit(remove_spaces_in_numbers(numbers_to_words(text)), "ru")
+    # Сначала приводим текст к виду, пригодному для TTS: удаляем мусорные
+    # символы, числа переводим в слова и т.д.
+    # Затем выполняем транслитерацию в кириллицу, чтобы Piper корректно
+    # озвучивал даже латиницу.
+    log.debug("Исходный текст для озвучки: %r", text)
+    norm = translit(normalize_tts_text(text), "ru")
+    log.debug("Нормализованный текст для TTS: %r", norm)
     log.info("Озвучиваем строку длиной %d символов (preset=%s)", len(norm), preset)
     cfg = TTS_PRESETS.get(emotion or preset, TTS_PRESETS["neutral"])
     vol = cfg["volume"]
