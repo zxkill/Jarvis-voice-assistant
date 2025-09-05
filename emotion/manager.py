@@ -10,6 +10,10 @@ from emotion import policy
 
 from core.logging_json import configure_logging
 from core import events as core_events
+from core import llm_engine
+from memory import db
+from notifiers import voice
+from display import get_driver, DisplayItem
 
 log = configure_logging("emotion.manager")
 
@@ -49,6 +53,8 @@ class EmotionManager:
         self._pending_policy: Optional[policy.PolicyResult] = None
         # Таймер смены эмоций в простое
         self._idle_timer: Optional[Timer] = None
+        # Текущий пресет для синтеза речи, выбранный политикой эмоций
+        self._tts_preset: str = "neutral"
 
         # Подписываемся на события глобального event bus.  Каждый обработчик
         # отвечает за конкретную ситуацию: начало/конец пользовательского
@@ -65,6 +71,8 @@ class EmotionManager:
         core_events.subscribe("dialog.failure", self._on_dialog_failure)
         # Внешние факторы, влияющие на настроение (например, погода)
         core_events.subscribe("weather.update", self._on_weather_update)
+        # Сигнал от планировщика о завершении ночной рефлексии
+        core_events.subscribe("nightly_reflection.done", self._on_nightly_reflection)
 
     def start(self) -> None:
         """Опубликовать начальное состояние.
@@ -97,12 +105,19 @@ class EmotionManager:
         self._state.raise_mood(reason="dialog success")
         # Обновляем двухмерное настроение и выбираем новую эмоцию
         self._update_mood(1.0, 1.0, reason="dialog success")
+        # Генерация и озвучивание «муд‑профиля» через LLM
+        self._announce_mood("после успешного диалога", "dialog.success")
 
     def _on_dialog_failure(self, event: core_events.Event) -> None:
         """Реакция на ошибку или непонимание команды."""
         self._state.drop_mood(reason="dialog failure")
         # Снижаем валентность сильнее, чем возбуждение, чтобы перейти в негативную зону
         self._update_mood(-2.0, 0.5, reason="dialog failure")
+        self._announce_mood("после неудачного диалога", "dialog.failure")
+
+    def _on_nightly_reflection(self, event: core_events.Event) -> None:
+        """Обработка завершения ночной рефлексии."""
+        self._announce_mood("после ночной рефлексии", "nightly_reflection")
 
     def _on_presence_update(self, event: core_events.Event) -> None:
         """Запоминаем, есть ли сейчас человек в кадре."""
@@ -190,6 +205,12 @@ class EmotionManager:
                 "tts_preset": policy_res.tts_preset,
                 "sfx_palette": policy_res.sfx_palette,
             })
+            # Запоминаем пресет, чтобы использовать его при озвучке сообщений
+            self._tts_preset = policy_res.tts_preset
+
+        # Если политикой не задан новый пресет, сохраняем предыдущий
+        if policy_res is None and not attrs.get("tts_preset"):
+            attrs["tts_preset"] = self._tts_preset
 
         log.debug("Publishing emotion_changed(%s)", emotion.value)
         core_events.publish(core_events.Event(kind="emotion_changed", attrs=attrs))
@@ -262,6 +283,38 @@ class EmotionManager:
         self._state.set(emotion)
         log.info("emotion %s → %s (%s)", prev.value, emotion.value, reason)
         self._publish_emotion(emotion, policy_res)
+
+    def _announce_mood(self, feeling: str, source: str) -> None:
+        """Получить текстовое описание настроения и озвучить его.
+
+        Вызываем LLM для генерации «муд‑профиля», сохраняем результат в
+        базу и одновременно выводим его на экран и через TTS. Это помогает
+        пользователю понять текущее состояние ассистента.
+        """
+
+        try:
+            profile = llm_engine.mood(feeling)
+        except Exception:
+            log.exception("llm_engine.mood failed", extra={"ctx": {"source": source}})
+            profile = ""
+
+        # Сохраняем текст и координаты настроения в отдельной таблице
+        db.add_mood_history(self._mood.valence, self._mood.arousal, source, profile)
+
+        # Отправляем сообщение в TTS с учётом текущего пресета
+        try:
+            voice.send(profile, emotion=self._tts_preset)
+        except Exception:
+            log.exception("voice.send failed", extra={"ctx": {"text": profile}})
+
+        # Выводим текст на экран, не мешая основному отображению эмоций
+        try:
+            driver = get_driver()
+            driver.draw(DisplayItem(kind="text", payload=profile))
+        except Exception:
+            log.exception("display draw failed")
+
+        log.info("mood profile", extra={"ctx": {"source": source, "profile": profile}})
 
     def _on_idle_timeout(self) -> None:
         """Обработчик таймера простоя: выбрать следующую эмоцию."""

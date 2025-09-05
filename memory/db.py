@@ -105,6 +105,17 @@ SCHEMA = [
         mood INTEGER
     )
     """,
+    """
+    -- История изменений настроения и текстовых профилей
+    CREATE TABLE IF NOT EXISTS mood_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        valence REAL NOT NULL,
+        arousal REAL NOT NULL,
+        source TEXT,
+        profile TEXT
+    )
+    """,
 ]
 
 # Удерживаем события не дольше двух недель
@@ -281,3 +292,48 @@ def set_mood_state(valence: float, arousal: float, trace_id: str | None = None) 
             ensure_ascii=False,
         )
     )
+
+
+# --- Mood history helpers --------------------------------------------------
+
+def add_mood_history(valence: float, arousal: float, source: str, profile: str) -> None:
+    """Добавить запись о настроении в таблицу ``mood_history``.
+
+    ``source`` описывает, что именно повлияло на изменение настроения
+    (например, ``dialog.success``), а ``profile`` содержит текстовый
+    ответ LLM.  Благодаря этому можно анализировать, как события
+    отражаются на состоянии персонажа.
+    """
+
+    ts = int(time.time())
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO mood_history (ts, valence, arousal, source, profile) VALUES (?, ?, ?, ?, ?)",
+            (ts, valence, arousal, source, profile),
+        )
+    logging.getLogger(__name__).info(
+        json.dumps(
+            {
+                "event": "db.add_mood_history",
+                "source": source,
+                "valence": valence,
+                "arousal": arousal,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+def get_mood_history(limit: int = 100) -> list[dict]:
+    """Вернуть последние записи из ``mood_history``.
+
+    Возвращается список словарей со значениями ``ts``, ``valence``,
+    ``arousal``, ``source`` и ``profile``.
+    """
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT ts, valence, arousal, source, profile FROM mood_history ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
