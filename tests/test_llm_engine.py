@@ -195,3 +195,20 @@ def test_query_reports_model_not_found(monkeypatch):
     assert "модель" in str(exc.value).lower()
     # Убедимся, что повторного вызова на /api/generate не было
     assert calls == [f"{llm_engine.BASE_URL}/v1/chat/completions"]
+
+
+def test_reflect_parses_json(monkeypatch):
+    """Функция ``reflect`` должна корректно разбирать JSON."""
+    monkeypatch.setattr(llm_engine, "_compose_context", lambda: "")
+    monkeypatch.setattr(llm_engine.long_term, "get_events_by_label", lambda label: [])
+    monkeypatch.setattr(llm_engine, "_run", lambda *a, **kw: '{"digest": "d", "priorities": "p", "mood": 5}')
+    assert llm_engine.reflect() == {"digest": "d", "priorities": "p", "mood": 5}
+
+
+def test_reflect_invalid_json(monkeypatch):
+    """При невалидном ответе должна возникать ``ValueError``."""
+    monkeypatch.setattr(llm_engine, "_compose_context", lambda: "")
+    monkeypatch.setattr(llm_engine.long_term, "get_events_by_label", lambda label: [])
+    monkeypatch.setattr(llm_engine, "_run", lambda *a, **kw: "not json")
+    with pytest.raises(ValueError):
+        llm_engine.reflect()
