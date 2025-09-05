@@ -296,8 +296,14 @@ class ProactiveEngine:
             )
 
     # ------------------------------------------------------------------
-    def _await_response(self, suggestion_id: int, text: str, trace_id: str | None) -> None:
+    def _await_response(
+        self, suggestion_id: int, text: str, trace_id: str | None = None
+    ) -> None:
         """Перейти в режим ожидания ответа пользователя.
+
+        :param suggestion_id: идентификатор подсказки в БД
+        :param text: текст, который был отправлен пользователю
+        :param trace_id: уникальный идентификатор диалога, может отсутствовать
 
         Запускается таймер и публикуется событие изменения контекста,
         чтобы другие компоненты могли знать, что система ждёт реакцию.
@@ -314,7 +320,9 @@ class ProactiveEngine:
             "id": suggestion_id,
             "text": text,
             "timer": timer,
-            "trace_id": trace_id,
+            # Если идентификатор не передан, сохраняем пустую строку, чтобы
+            # дальнейший код мог безопасно использовать поле без проверок
+            "trace_id": trace_id or "",
         }
         timer.start()
         # Публикуем событие о переходе в режим ожидания ответа.
