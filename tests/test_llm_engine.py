@@ -3,14 +3,14 @@ from core import llm_engine
 from context import short_term, long_term
 
 
-class DummyClient:
-    def __init__(self):
-        self.last_prompt = None
-        self.last_profile = None
+class DummyQuery:
+    """Заглушка HTTP-запроса к Ollama."""
 
-    def generate(self, prompt: str, profile: str = "light") -> str:
-        self.last_prompt = prompt
-        self.last_profile = profile
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, prompt: str, profile: str, trace_id: str = "") -> str:
+        self.calls.append((prompt, profile, trace_id))
         return "ответ"
 
 
@@ -21,39 +21,42 @@ def clear_short_term():
 
 def test_think_uses_context_and_light_profile(monkeypatch):
     clear_short_term()
-    dummy = DummyClient()
-    monkeypatch.setattr(llm_engine, "_client", dummy)
+    dummy = DummyQuery()
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
     monkeypatch.setattr(long_term, "get_events_by_label", lambda label: ["факт"])
-    result = llm_engine.think("тема")
+    result = llm_engine.think("тема", trace_id="xyz")
     assert result == "ответ"
-    assert dummy.last_profile == "light"
-    assert "тема" in dummy.last_prompt
-    assert "факт" in dummy.last_prompt
-    assert short_term.get_last()[-1]["text"] == "ответ"
+    prompt, profile, trace = dummy.calls[-1]
+    assert profile == "light"
+    assert trace == "xyz"
+    assert "тема" in prompt
+    assert "факт" in prompt
+    assert short_term.get_last()[-1]["reply"] == "ответ"
 
 
 def test_summarise_saves_to_long_term(monkeypatch):
     clear_short_term()
-    dummy = DummyClient()
+    dummy = DummyQuery()
     saved = []
-    monkeypatch.setattr(llm_engine, "_client", dummy)
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
     monkeypatch.setattr(long_term, "add_daily_event", lambda text, labels: saved.append((text, list(labels))))
     result = llm_engine.summarise("текст", labels=["news"])
     assert result == "ответ"
-    assert dummy.last_profile == "heavy"
+    assert dummy.calls[-1][1] == "heavy"
     assert saved == [("ответ", ["news"])]
 
 
 def test_mood_uses_history(monkeypatch):
     clear_short_term()
-    dummy = DummyClient()
+    dummy = DummyQuery()
     history = ["хорошо"]
     saved = []
-    monkeypatch.setattr(llm_engine, "_client", dummy)
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
     monkeypatch.setattr(long_term, "get_events_by_label", lambda label: history if label == "mood" else [])
     monkeypatch.setattr(long_term, "add_daily_event", lambda text, labels: saved.append(text))
     result = llm_engine.mood("радость")
     assert result == "ответ"
-    assert "радость" in dummy.last_prompt
-    assert "хорошо" in dummy.last_prompt
+    prompt, _, _ = dummy.calls[-1]
+    assert "радость" in prompt
+    assert "хорошо" in prompt
     assert saved == ["ответ"]

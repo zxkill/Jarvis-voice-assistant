@@ -2,12 +2,12 @@
 
 Модуль предоставляет функции ``think``, ``act``, ``reflect``, ``summarise`` и
 ``mood``.  Каждая функция подставляет данные в соответствующий шаблон из
-каталога ``prompts`` и отправляет запрос к локальной модели через
-:class:`utils.ollama_client.OllamaClient`.
+каталога ``prompts`` и отправляет запрос к локальной модели по HTTP.
 
 Полученные ответы сохраняются в краткосрочном и долговременном контексте,
 что позволяет накапливать знания между вызовами.  Все действия подробно
-логируются для удобной отладки.
+логируются для удобной отладки.  Код снабжён комментариями на русском
+языке, упрощающими поддержку проекта.
 """
 
 from __future__ import annotations
@@ -16,16 +16,54 @@ import logging
 from pathlib import Path
 from typing import Iterable
 
+import requests
+
 from context import long_term, short_term
-from utils.ollama_client import OllamaClient
 
 logger = logging.getLogger(__name__)
 
 # Путь к каталогу с текстовыми шаблонами
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
-# Единый клиент Ollama для всего модуля
-_client = OllamaClient()
+# Профили генерации и соответствующие имена моделей
+PROFILES = {"light": "llama2", "heavy": "llama2:13b"}
+
+# Базовый URL локального сервера Ollama
+BASE_URL = "http://localhost:11434"
+
+
+def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
+    """Отправить HTTP-запрос к Ollama и вернуть ответ.
+
+    Параметр ``trace_id`` используется только для логирования и удобства
+    отладки.  Сервер Ollama его игнорирует, но информация попадает в логи.
+    """
+
+    if profile not in PROFILES:
+        raise ValueError(f"Неизвестный профиль: {profile}")
+    model = PROFILES[profile]
+    url = f"{BASE_URL}/api/generate"
+    payload = {"model": model, "prompt": prompt, "trace_id": trace_id}
+
+    logger.debug(
+        "Отправка запроса в Ollama", extra={"url": url, "model": model, "trace_id": trace_id}
+    )
+    try:
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.error("Ошибка при обращении к Ollama: %s", exc)
+        raise RuntimeError("Ollama недоступна") from exc
+
+    try:
+        data = response.json()
+        text = str(data.get("response", ""))
+    except Exception as exc:
+        logger.error("Некорректный ответ от Ollama: %s", exc)
+        raise RuntimeError("Ollama вернула невалидный JSON") from exc
+
+    logger.debug("Получен ответ от Ollama", extra={"length": len(text), "trace_id": trace_id})
+    return text
 
 
 def _load_prompt(name: str) -> str:
@@ -39,25 +77,48 @@ def _compose_context() -> str:
     return "\n".join(map(str, short_term.get_last()))
 
 
-def _run(prompt_name: str, profile: str = "light", **kwargs: str) -> str:
+def _run(
+    prompt_name: str,
+    profile: str = "light",
+    *,
+    user_input: str = "",
+    trace_id: str = "",
+    **kwargs: str,
+) -> str:
     """Универсальный запуск запроса к LLM.
 
     :param prompt_name: имя файла шаблона без расширения;
     :param profile: ключ профиля генерации (``light``/``heavy``);
+    :param user_input: исходный текст пользователя для сохранения в память;
+    :param trace_id: уникальный идентификатор взаимодействия;
     :param kwargs: параметры для подстановки в шаблон.
     """
 
     template = _load_prompt(prompt_name)
     prompt = template.format(**kwargs)
     logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
-    reply = _client.generate(prompt, profile=profile)
-    short_term.add({"stage": prompt_name, "text": reply})
+    reply = _query_ollama(prompt, profile=profile, trace_id=trace_id)
+
+    if user_input:
+        # Сохраняем диалог в краткосрочную и долговременную память
+        short_term.add({"trace_id": trace_id, "user": user_input, "reply": reply})
+        long_term.add_daily_event(
+            f"user: {user_input}\nassistant: {reply}", [prompt_name]
+        )
+    else:
+        # Для вспомогательных запросов сохраняем только ответ
+        short_term.add({"stage": prompt_name, "text": reply})
+
     logger.info("Ответ %s: %s", prompt_name, reply)
     return reply
 
 
-def think(topic: str) -> str:
-    """Сформировать размышление по заданной теме."""
+def think(topic: str, *, trace_id: str) -> str:
+    """Сформировать размышление по заданной теме.
+
+    ``trace_id`` передаётся для связи всех логов и записей в памяти.
+    """
+
     context_text = _compose_context()
     events = "\n".join(long_term.get_events_by_label("think"))
     return _run(
@@ -66,10 +127,12 @@ def think(topic: str) -> str:
         context=context_text,
         long_context=events,
         profile="light",
+        user_input=topic,
+        trace_id=trace_id,
     )
 
 
-def act(command: str) -> str:
+def act(command: str, *, trace_id: str) -> str:
     """Предложить действие на основании команды пользователя."""
     context_text = _compose_context()
     events = "\n".join(long_term.get_events_by_label("act"))
@@ -79,6 +142,8 @@ def act(command: str) -> str:
         context=context_text,
         long_context=events,
         profile="light",
+        user_input=command,
+        trace_id=trace_id,
     )
 
 
