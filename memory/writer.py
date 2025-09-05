@@ -9,6 +9,7 @@ from enum import Enum
 import logging
 
 from .db import get_connection
+from .long_memory import store_event as _store_episodic_event
 
 
 # Настраиваем логгер для данного модуля
@@ -31,7 +32,17 @@ def write_event(event_type: str, payload: dict[str, Any] | None = None) -> int:
             "INSERT INTO events (ts, event_type, payload) VALUES (?, ?, ?)",
             (ts, event_type, data),
         )
-        return int(cur.lastrowid)
+        event_id = int(cur.lastrowid)
+
+    # Пытаемся сохранить событие и в долговременной памяти
+    try:
+        text = f"{event_type}: {payload}" if payload else event_type
+        _store_episodic_event(text)
+    except Exception:
+        # Логируем, но не мешаем основному процессу записи события
+        logger.exception("Не удалось сохранить событие в эпизодической памяти")
+
+    return event_id
 
 
 def start_session(user_id: str) -> int:

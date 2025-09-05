@@ -14,6 +14,7 @@ import logging
 from typing import Iterable, List
 
 from memory.db import get_connection
+from memory.long_memory import store_event
 
 # Логгер для наблюдения за операциями долговременной памяти
 logger = logging.getLogger(__name__)
@@ -30,6 +31,13 @@ def add_daily_event(text: str, labels: Iterable[str]) -> str:
             (key, payload, ts),
         )
     logger.debug("long_term.add_daily_event: %s -> %s", labels, text)
+
+    # Дополнительно сохраняем событие в эпизодической памяти
+    try:
+        store_event(text, {"labels": list(labels)})
+    except Exception:
+        logger.exception("Не удалось сохранить событие в эпизодической памяти")
+
     return key
 
 
