@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import json
 import time
+import logging
 from typing import Iterable, List
 
 from memory.db import get_connection
+
+# Логгер для наблюдения за операциями долговременной памяти
+logger = logging.getLogger(__name__)
 
 
 def add_daily_event(text: str, labels: Iterable[str]) -> str:
@@ -25,6 +29,7 @@ def add_daily_event(text: str, labels: Iterable[str]) -> str:
             "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
             (key, payload, ts),
         )
+    logger.debug("long_term.add_daily_event: %s -> %s", labels, text)
     return key
 
 
@@ -37,7 +42,9 @@ def get_events_by_label(label: str) -> List[str]:
         try:
             data = json.loads(row["value"])
         except Exception:
+            logger.debug("long_term.get_events_by_label: пропуск повреждённой записи")
             continue
         if label in data.get("labels", []):
             events.append(str(data.get("text", "")))
+    logger.debug("long_term.get_events_by_label(%s): %s", label, events)
     return events
