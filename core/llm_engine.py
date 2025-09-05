@@ -48,9 +48,12 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "trace_id": trace_id,  # произвольное поле, помогает в трассировке
         "stream": False,  # просим сервер вернуть единый JSON без чанков
     }
+
+    # trace_id не обязателен для сервера, но полезен для сопоставления логов,
+    # поэтому передаём его в заголовке X-Trace-Id
+    headers = {"X-Trace-Id": trace_id} if trace_id else None
 
     logger.debug(
         "Отправка запроса в Ollama",
@@ -58,7 +61,7 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
     )
 
     try:
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
     except requests.RequestException as exc:
         # Сетевые ошибки: сервер недоступен или таймаут
         logger.error("Ошибка при обращении к Ollama: %s", exc)
@@ -76,11 +79,10 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
         payload = {
             "model": model,
             "prompt": prompt,
-            "trace_id": trace_id,
             "stream": False,
         }
         try:
-            response = requests.post(url, json=payload, timeout=60)
+            response = requests.post(url, json=payload, headers=headers, timeout=60)
             response.raise_for_status()
             use_legacy = True
         except requests.RequestException as exc:

@@ -86,7 +86,8 @@ def test_query_falls_back_to_generate(monkeypatch):
         def json(self):
             return {"response": "привет"}
 
-    def fake_post(url, json, timeout):
+    def fake_post(url, json, headers=None, timeout=60):
+        # фиксируем URL вызова и игнорируем переданные заголовки
         calls.append(url)
         return Resp404() if url.endswith("/v1/chat/completions") else RespOK()
 

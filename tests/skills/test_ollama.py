@@ -78,8 +78,10 @@ def test_think_saves_dialog(monkeypatch):
     reset_short_term()
     saved = []
 
-    def fake_post(url, json, timeout):
+    def fake_post(url, json, headers=None, timeout=60):
+        # сохраняем переданные данные для последующей проверки
         fake_post.last_payload = json
+        fake_post.last_headers = headers or {}
         return DummyResponse({"choices": [{"message": {"content": "привет"}}]})
 
     monkeypatch.setattr(requests, "post", fake_post)
@@ -87,7 +89,7 @@ def test_think_saves_dialog(monkeypatch):
 
     reply = llm_engine.think("Как дела?", trace_id="42")
     assert reply == "привет"
-    assert fake_post.last_payload["trace_id"] == "42"
+    assert fake_post.last_headers["X-Trace-Id"] == "42"
     assert fake_post.last_payload["stream"] is False
     assert "Как дела?" in fake_post.last_payload["messages"][0]["content"]
     assert short_term.get_last()[-1] == {
