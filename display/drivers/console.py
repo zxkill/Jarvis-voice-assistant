@@ -41,6 +41,8 @@ class ConsoleDisplayDriver(DisplayDriver):
         weather_item = next((i for i in self._items if i.kind=="weather"), None)
         text_item    = next((i for i in self._items if i.kind=="text"), None)
         emotion_item = next((i for i in self._items if i.kind=="emotion"), None)
+        cam_item     = next((i for i in self._items if i.kind=="camera"), None)
+        mic_item     = next((i for i in self._items if i.kind=="microphone"), None)
 
         # Формируем пустую «матрицу» строк
         lines = []
@@ -50,8 +52,15 @@ class ConsoleDisplayDriver(DisplayDriver):
         # 2) Шапка: время слева, погода справа
         left = time_item.payload if time_item else ""
         right = weather_item.payload if weather_item else ""
-        # если строка слишком длинная — обрезаем
-        header = (left + right.rjust(INNER_W - len(left)))[:INNER_W]
+        # иконки активности камеры/микрофона размещаем справа
+        icons = ""
+        if cam_item:
+            icons += cam_item.payload
+        if mic_item:
+            icons += mic_item.payload
+        # учитываем ширину иконок при выравнивании погоды
+        header = left + right.rjust(INNER_W - len(left) - len(icons)) + icons
+        header = header[:INNER_W]
         lines.append("│" + header + "│")
 
         # 3) Тело на втором ряду

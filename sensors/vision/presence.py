@@ -26,6 +26,7 @@ except Exception:  # pylint: disable=broad-except
 from core.events import Event, publish
 from core.logging_json import configure_logging
 from sensors.vision.face_tracker import FaceTracker
+from sensors import set_active
 
 # Логгер модуля. При включенном DEBUG выводится дополнительная диагностика.
 log = configure_logging(__name__)
@@ -186,17 +187,25 @@ class PresenceDetector:
         if not self._ensure_camera():
             return
 
+        # Активируем индикатор камеры, требуя предварительного согласия
+        try:
+            set_active("camera", True)
+        except PermissionError:
+            log.error("Запуск камеры отклонён из-за отсутствия согласия")
+            return
+
         mp_face = mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.55)
         dt = self.frame_interval_ms / 1000.0
 
-        while True:
-            ret, frame_bgr = self._cap.read()
-            if not ret:
-                time.sleep(dt)
-                continue
-            if self._rotate_code is not None:
-                frame_bgr = cv2.rotate(frame_bgr, self._rotate_code)
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        try:
+            while True:
+                ret, frame_bgr = self._cap.read()
+                if not ret:
+                    time.sleep(dt)
+                    continue
+                if self._rotate_code is not None:
+                    frame_bgr = cv2.rotate(frame_bgr, self._rotate_code)
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
             detections = mp_face.process(frame_rgb).detections
             if detections:
@@ -222,6 +231,8 @@ class PresenceDetector:
                     break
 
             time.sleep(dt)
-
-        self._cap.release()
-        cv2.destroyAllWindows()
+        finally:
+            # При завершении работы снимаем индикатор активности
+            set_active("camera", False)
+            self._cap.release()
+            cv2.destroyAllWindows()

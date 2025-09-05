@@ -7,6 +7,7 @@ import logging
 import uuid
 from contextvars import ContextVar
 from datetime import datetime
+import re
 
 
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
@@ -26,6 +27,17 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Преобразует запись ``record`` в строку JSON."""
 
+        def _mask(obj):  # рекурсивная анонимизация
+            if isinstance(obj, str):
+                obj = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", "<email>", obj)
+                obj = re.sub(r"\b\d{3,}\b", "<num>", obj)
+                return obj
+            if isinstance(obj, dict):
+                return {k: _mask(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_mask(v) for v in obj]
+            return obj
+
         log_entry = {
             # Метка времени события в формате ISO 8601
             "ts": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
@@ -37,10 +49,10 @@ class JsonFormatter(logging.Formatter):
             "event": getattr(record, "event", ""),
             # Идентификатор трассировки для связывания логов
             "trace_id": getattr(record, "trace_id", ""),
-            # Дополнительные атрибуты события
-            "attrs": getattr(record, "attrs", {}),
-            # Основное сообщение лога
-            "message": record.getMessage(),
+            # Дополнительные атрибуты события с анонимизацией
+            "attrs": _mask(getattr(record, "attrs", {})),
+            # Основное сообщение лога без персональных данных
+            "message": _mask(record.getMessage()),
         }
         # ensure_ascii=False — чтобы корректно выводить кириллицу
         return json.dumps(log_entry, ensure_ascii=False)

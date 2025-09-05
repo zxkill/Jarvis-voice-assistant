@@ -8,6 +8,10 @@ import time
 import logging
 import json
 from pathlib import Path
+import os
+
+# Для шифрования конфиденциальных полей используем симметричный алгоритм
+from cryptography.fernet import Fernet
 
 # Путь к файлу БД, создаётся рядом с модулем
 DB_PATH = Path(__file__).with_name("memory.sqlite3")
@@ -120,6 +124,47 @@ SCHEMA = [
 
 # Удерживаем события не дольше двух недель
 RETENTION_SECONDS = 14 * 24 * 3600  # две недели
+
+# ---------------------------------------------------------------------------
+# Работа с ключом шифрования
+# ---------------------------------------------------------------------------
+
+# Имя переменной окружения, в которой ожидается ключ
+_KEY_ENV_VAR = "JARVIS_DB_KEY"
+
+
+def _get_cipher() -> Fernet:
+    """Создать объект ``Fernet`` для шифрования/дешифрования.
+
+    Ключ берётся из переменной окружения ``JARVIS_DB_KEY``.
+    Если ключ не задан, генерируем исключение, чтобы разработчик явно
+    указал его в окружении. Такая мера исключает хранение ключа в коде.
+    """
+
+    key = os.environ.get(_KEY_ENV_VAR)
+    if not key:
+        raise RuntimeError(
+            "Не задан ключ шифрования в переменной окружения JARVIS_DB_KEY"
+        )
+    return Fernet(key.encode() if not isinstance(key, bytes) else key)
+
+
+def encrypt(data: str) -> str:
+    """Зашифровать строку ``data`` и вернуть base64‑представление."""
+
+    cipher = _get_cipher()
+    token = cipher.encrypt(data.encode("utf-8"))
+    logging.getLogger(__name__).debug("Строка зашифрована")
+    return token.decode("utf-8")
+
+
+def decrypt(token: str) -> str:
+    """Расшифровать строку, полученную из :func:`encrypt`."""
+
+    cipher = _get_cipher()
+    data = cipher.decrypt(token.encode("utf-8"))
+    logging.getLogger(__name__).debug("Строка расшифрована")
+    return data.decode("utf-8")
 
 
 def get_connection() -> sqlite3.Connection:

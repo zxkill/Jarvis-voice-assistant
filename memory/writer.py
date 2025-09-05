@@ -8,7 +8,7 @@ from typing import Any
 from enum import Enum
 import logging
 
-from .db import get_connection
+from .db import get_connection, encrypt
 from .long_memory import store_event as _store_episodic_event
 
 
@@ -26,11 +26,14 @@ def _json_default(obj: Any) -> Any:
 def write_event(event_type: str, payload: dict[str, Any] | None = None) -> int:
     """Сохраняет сырое событие и возвращает его ID."""
     ts = int(time.time())  # текущая метка времени
+    # Сериализуем и шифруем полезную нагрузку события
     data = json.dumps(payload, default=_json_default) if payload is not None else None
+    enc_data = encrypt(data) if data is not None else None
+    logger.debug("Шифруем payload события: %s", bool(enc_data))
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO events (ts, event_type, payload) VALUES (?, ?, ?)",
-            (ts, event_type, data),
+            (ts, event_type, enc_data),
         )
         event_id = int(cur.lastrowid)
 
