@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+# Стандартные библиотеки
 import json
+import logging
 from datetime import datetime
 from typing import List
 
+# Внутренние модули проекта
 from context.long_term import add_daily_event, get_events_by_label
 from memory.db import get_connection
+from memory.preferences import save_preference
+
+# Логгер с пространством имён модуля для удобного поиска сообщений
+logger = logging.getLogger(__name__)
 
 PATTERNS = [
     "что ты запомнил",
@@ -62,13 +69,30 @@ def _get_last_context_items(limit: int = 3) -> List[str]:
 
 
 def handle(text: str) -> str:
+    """Основная точка входа для обработки пользовательской команды."""
+
     low = text.lower().strip()
+
+    # ─── Режим сохранения заметок или предпочтений ────────────────
     if low.startswith("запомни"):
-        note = text[len("запомни") :].lstrip(" :")
+        # отрезаем ключевое слово и лишние разделители перед содержанием
+        note = text[len("запомни") :].lstrip(" ,:")
         if not note:
             return "Что запомнить?"
-        add_daily_event(note, [LABEL])
+
+        note_low = note.lower()
+        if note_low.startswith("что"):
+            # Пользователь формулирует устойчивое предпочтение
+            pref_text = note[3:].lstrip(" ,:")
+            logger.debug("Сохранение предпочтения: %s", pref_text)
+            save_preference(pref_text)
+        else:
+            # Обычная заметка дня
+            logger.debug("Сохранение заметки: %s", note)
+            add_daily_event(note, [LABEL])
         return "Запомнил"
+
+    # ─── Режим отчёта о сохранённых записях ──────────────────────
     if any(p in low for p in ["что ты запомнил", "что запомнил", "события дня"]):
         presence = _get_last_presence()
         items = _get_last_context_items()
@@ -83,4 +107,5 @@ def handle(text: str) -> str:
         if not parts:
             return "Пока ничего не запомнил"
         return ". ".join(parts)
+
     return ""
