@@ -1,6 +1,7 @@
 from core import llm_engine
 from context import short_term, long_term
 import requests
+import pytest
 
 
 class DummyQuery:
@@ -101,3 +102,36 @@ def test_query_falls_back_to_generate(monkeypatch):
         f"{llm_engine.BASE_URL}/v1/chat/completions",
         f"{llm_engine.BASE_URL}/api/generate",
     ]
+
+
+def test_query_reports_model_not_found(monkeypatch):
+    """При 404 'model not found' выдаётся понятная ошибка без повторных запросов."""
+
+    clear_short_term()
+    calls = []
+
+    class Resp404:
+        status_code = 404
+
+        def raise_for_status(self):
+            raise requests.HTTPError("404")
+
+        def json(self):
+            return {"error": "model not found: llama2"}
+
+        @property
+        def text(self):
+            return "model not found: llama2"
+
+    def fake_post(url, json, headers=None, timeout=60):
+        calls.append(url)
+        return Resp404()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    with pytest.raises(RuntimeError) as exc:
+        llm_engine.think("тема", trace_id="id42")
+
+    assert "модель" in str(exc.value).lower()
+    # Убедимся, что повторного вызова на /api/generate не было
+    assert calls == [f"{llm_engine.BASE_URL}/v1/chat/completions"]

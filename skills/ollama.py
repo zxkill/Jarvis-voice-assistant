@@ -52,4 +52,7 @@ def handle(text: str, *, trace_id: str) -> str:
             "Сбой в работе Ollama: %s", exc, extra={"trace_id": trace_id, "text": text}
         )
         # Возвращаем дружелюбное сообщение пользователю
+        msg = str(exc)
+        if "не найдена" in msg.lower():
+            return f"Извините, {msg}"
         return "Извините, сервис генерации текста временно недоступен"

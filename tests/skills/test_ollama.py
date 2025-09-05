@@ -74,6 +74,17 @@ def test_handle_returns_error_message(monkeypatch):
     assert "недоступ" in reply.lower()
 
 
+def test_handle_reports_missing_model(monkeypatch):
+    """Скилл сообщает о нехватке модели, если LLM подняла ошибку."""
+
+    def fake_think(text, trace_id):
+        raise RuntimeError("Модель llama2 не найдена")
+
+    monkeypatch.setattr(llm_engine, "think", fake_think)
+    reply = ollama.handle("Расскажи сказку", trace_id="77")
+    assert "не найдена" in reply.lower()
+
+
 def test_think_saves_dialog(monkeypatch):
     reset_short_term()
     saved = []

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Iterable
+import os
 
 import requests
 
@@ -26,7 +27,11 @@ logger = logging.getLogger(__name__)
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 # Профили генерации и соответствующие имена моделей
-PROFILES = {"light": "llama2", "heavy": "llama2:13b"}
+# Названия можно переопределить через переменные окружения
+PROFILES = {
+    "light": os.getenv("OLLAMA_LIGHT_MODEL", "llama2"),
+    "heavy": os.getenv("OLLAMA_HEAVY_MODEL", "llama2:13b"),
+}
 
 # Базовый URL локального сервера Ollama
 BASE_URL = "http://localhost:11434"
@@ -69,6 +74,21 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
 
     use_legacy = False  # признак использования старого API /api/generate
     if response.status_code == 404:
+        # Разбираем тело ответа: если модель не найдена, нет смысла делать
+        # повторный запрос на старый эндпоинт.
+        try:
+            error_msg = response.json().get("error", "")
+        except Exception:
+            error_msg = response.text
+        if "model" in error_msg.lower() and "not found" in error_msg.lower():
+            logger.error(
+                "Модель %s не найдена: %s",
+                model,
+                error_msg,
+                extra={"trace_id": trace_id},
+            )
+            raise RuntimeError(f"Модель {model} не найдена")
+
         # Старые версии Ollama не знают про /v1/chat/completions.
         # Логируем предупреждение и пробуем fallback на /api/generate.
         logger.warning(
@@ -83,6 +103,24 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
         }
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=60)
+        except requests.RequestException as exc:
+            logger.error("Ошибка при обращении к Ollama: %s", exc)
+            raise RuntimeError("Ollama недоступна") from exc
+
+        if response.status_code == 404:
+            try:
+                error_msg = response.json().get("error", "")
+            except Exception:
+                error_msg = response.text
+            logger.error(
+                "Модель %s не найдена: %s",
+                model,
+                error_msg,
+                extra={"trace_id": trace_id},
+            )
+            raise RuntimeError(f"Модель {model} не найдена")
+
+        try:
             response.raise_for_status()
             use_legacy = True
         except requests.RequestException as exc:
