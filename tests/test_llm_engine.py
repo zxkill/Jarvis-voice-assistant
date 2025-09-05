@@ -25,6 +25,12 @@ def test_think_uses_context_and_light_profile(monkeypatch):
     dummy = DummyQuery()
     monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
     monkeypatch.setattr(long_term, "get_events_by_label", lambda label: ["факт"])
+    # Заглушаем поиск по долговременной памяти, чтобы не обращаться к БД
+    monkeypatch.setattr(
+        llm_engine.long_memory,
+        "retrieve_similar",
+        lambda query, top_k=5: [],
+    )
     result = llm_engine.think("тема", trace_id="xyz")
     assert result == "ответ"
     prompt, profile, trace = dummy.calls[-1]
@@ -33,6 +39,48 @@ def test_think_uses_context_and_light_profile(monkeypatch):
     assert "тема" in prompt
     assert "факт" in prompt
     assert short_term.get_last()[-1]["reply"] == "ответ"
+
+
+def test_think_includes_similar_events(monkeypatch):
+    """Проверяем, что функция ``think`` подставляет релевантные воспоминания."""
+    clear_short_term()
+    dummy = DummyQuery()
+    queries: list[str] = []
+
+    def fake_retrieve(query: str, top_k: int = 5):
+        queries.append(query)
+        return [("старое воспоминание", 0.9)]
+
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
+    monkeypatch.setattr(long_term, "get_events_by_label", lambda label: [])
+    monkeypatch.setattr(llm_engine.long_memory, "retrieve_similar", fake_retrieve)
+
+    result = llm_engine.think("новая тема", trace_id="abc")
+    assert result == "ответ"
+    prompt, _, _ = dummy.calls[-1]
+    assert "старое воспоминание" in prompt
+    assert queries == ["новая тема"]
+
+
+def test_act_includes_similar_events(monkeypatch):
+    """Проверяем, что ``act`` расширяет контекст через поиск по памяти."""
+    clear_short_term()
+    dummy = DummyQuery()
+    queries: list[str] = []
+
+    def fake_retrieve(query: str, top_k: int = 5):
+        queries.append(query)
+        return [("прошлая команда", 0.8)]
+
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
+    monkeypatch.setattr(long_term, "get_events_by_label", lambda label: [])
+    monkeypatch.setattr(llm_engine.long_memory, "retrieve_similar", fake_retrieve)
+
+    result = llm_engine.act("сделай что-то", trace_id="def")
+    assert result == "ответ"
+    prompt, _, _ = dummy.calls[-1]
+    assert "прошлая команда" in prompt
+    assert queries == ["сделай что-то"]
 
 
 def test_summarise_saves_to_long_term(monkeypatch):
@@ -95,6 +143,9 @@ def test_query_falls_back_to_generate(monkeypatch):
     monkeypatch.setattr(requests, "post", fake_post)
     monkeypatch.setattr(long_term, "get_events_by_label", lambda label: [])
     monkeypatch.setattr(long_term, "add_daily_event", lambda text, labels: None)
+    monkeypatch.setattr(
+        llm_engine.long_memory, "retrieve_similar", lambda query, top_k=5: []
+    )
 
     result = llm_engine.think("тема", trace_id="123")
     assert result == "привет"
@@ -128,6 +179,9 @@ def test_query_reports_model_not_found(monkeypatch):
         return Resp404()
 
     monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(
+        llm_engine.long_memory, "retrieve_similar", lambda query, top_k=5: []
+    )
 
     with pytest.raises(RuntimeError) as exc:
         llm_engine.think("тема", trace_id="id42")
