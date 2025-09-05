@@ -75,6 +75,26 @@ SCHEMA = [
         ts INTEGER NOT NULL
     )
     """,
+    """
+    -- Таблица для эпизодической памяти: хранит события с эмбеддингами
+    CREATE TABLE IF NOT EXISTS episodic_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        embedding TEXT NOT NULL,
+        meta TEXT
+    )
+    """,
+    """
+    -- Таблица для семантической памяти: факты и знания
+    CREATE TABLE IF NOT EXISTS semantic_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        embedding TEXT NOT NULL,
+        meta TEXT
+    )
+    """,
 ]
 
 # Удерживаем события не дольше двух недель
