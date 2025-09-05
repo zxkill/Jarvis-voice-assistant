@@ -29,8 +29,8 @@ PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 # Профили генерации и соответствующие имена моделей
 # Названия можно переопределить через переменные окружения
 PROFILES = {
-    "light": os.getenv("OLLAMA_LIGHT_MODEL", "llama2"),
-    "heavy": os.getenv("OLLAMA_HEAVY_MODEL", "llama2:13b"),
+    "light": os.getenv("OLLAMA_LIGHT_MODEL", "gemma3:latest"),
+    "heavy": os.getenv("OLLAMA_HEAVY_MODEL", "gemma3:latest"),
 }
 
 # Базовый URL локального сервера Ollama
