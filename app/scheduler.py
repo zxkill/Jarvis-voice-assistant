@@ -43,14 +43,15 @@ def start_background_tasks(suggestion_interval: int) -> None:
 def _run_nightly_reflection() -> None:
     """Выполнить ночную рефлексию один раз."""
     result = llm_engine.reflect()
-    if isinstance(result, dict):
-        digest = str(result.get("digest", ""))
-        priorities = result.get("priorities")
-        mood = result.get("mood")
-    else:
-        digest = str(result)
-        priorities = None
-        mood = None
+    # Результат уже прошёл строгую валидацию в ``llm_engine.reflect``,
+    # поэтому здесь можно безопасно извлекать поля.
+    digest: str = str(result["digest"])
+    priorities: str | None = result.get("priorities") or None
+    mood: int | None = result.get("mood")
+    log.debug(
+        "night reflection parsed",
+        extra={"ctx": {"digest": digest, "priorities": priorities, "mood": mood}},
+    )
     memory_db.add_daily_digest(digest, priorities, mood)
     log.info(
         "daily digest saved",

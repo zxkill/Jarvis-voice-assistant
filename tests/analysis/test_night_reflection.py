@@ -18,7 +18,7 @@ def test_nightly_reflection(monkeypatch, tmp_path):
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(memory_db, "DB_PATH", db_file)
 
-    # Заглушаем вызов LLM и возвращаем предсказуемый результат
+    # Заглушаем вызов LLM и возвращаем предсказуемый JSON-объект
     result = {"digest": "итоги дня", "priorities": "работа, отдых", "mood": 7}
     monkeypatch.setattr(llm_engine, "reflect", lambda: result)
 

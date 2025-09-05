@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from pathlib import Path
 from typing import Iterable
 import os
@@ -261,17 +262,44 @@ def act(command: str, *, trace_id: str) -> str:
     )
 
 
-def reflect(note: str | None = None) -> str:
-    """Проанализировать недавний опыт и сделать выводы."""
+def reflect(note: str | None = None) -> dict:
+    """Проанализировать недавний опыт и вернуть структурированный результат.
+
+    Функция ожидает от LLM строго валидный JSON с полями ``digest``,
+    ``priorities`` и ``mood``.  При любой ошибке парсинга возбуждается
+    ``ValueError``.  Дополнительные сведения выводятся в лог для удобства
+    отладки.
+    """
+
     context_text = _compose_context()
     events = "\n".join(long_term.get_events_by_label("reflect"))
-    return _run(
+    raw = _run(
         "reflect",
         context=context_text,
         note=note or "",
         long_context=events,
         profile="heavy",
     )
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.error("рефлексия вернула невалидный JSON", extra={"raw": raw})
+        raise ValueError("ответ рефлексии должен быть JSON") from exc
+    if not isinstance(data, dict):
+        logger.error("рефлексия ожидает JSON-объект, получено %s", type(data))
+        raise ValueError("формат рефлексии должен быть объект JSON")
+    try:
+        digest = str(data["digest"])
+        priorities = str(data.get("priorities", ""))
+        mood = int(data["mood"])
+    except Exception as exc:
+        logger.error("некорректные поля в JSON рефлексии", extra={"json": data})
+        raise ValueError("JSON рефлексии должен содержать digest, priorities, mood") from exc
+
+    result = {"digest": digest, "priorities": priorities, "mood": mood}
+    logger.debug("разобран результат рефлексии", extra={"ctx": result})
+    return result
 
 
 def summarise(text: str, labels: Iterable[str] | None = None) -> str:
