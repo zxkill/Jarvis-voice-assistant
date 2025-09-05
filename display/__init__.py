@@ -6,7 +6,7 @@
  ├── __init__.py    # загрузчик драйверов и базовый класс
  └── drivers/       # папка с драйверами
      ├── __init__.py
-     └── windows.py # пример драйвера для Windows (tkinter)
+     └── console.py # драйвер вывода текста в консоль
 """
 from abc import ABC, abstractmethod
 import importlib
@@ -63,13 +63,13 @@ class DisplayDriver(ABC):
 _driver: DisplayDriver | None = None
 
 
-def init_driver(name: str = "windows", driver: DisplayDriver | None = None) -> DisplayDriver:
+def init_driver(name: str = "console", driver: DisplayDriver | None = None) -> DisplayDriver:
     """
     Инициализировать драйвер дисплея:
-      - name: имя модуля внутри display.drivers (без .py)
-      - driver: объект драйвера (приоритет выше name)
+      - name: имя модуля внутри ``display.drivers`` (без ``.py``)
+      - driver: объект драйвера (приоритет выше ``name``)
 
-    Пример: init_driver("windows")
+    Пример: ``init_driver("console")``
     """
     global _driver
     if _driver is not None:

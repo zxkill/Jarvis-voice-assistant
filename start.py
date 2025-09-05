@@ -18,7 +18,7 @@ import threading
 from collections import deque
 from typing import Any
 
-from display import DisplayItem, init_driver
+from display import DisplayItem, init_driver, DisplayDriver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
 from emotion import sounds
@@ -51,23 +51,38 @@ signal.signal(signal.SIGTERM, _shutdown)
 
 # ────────────────────────── MAIN LOOP ────────────────────────────
 
+
+def init_display_from_config(cfg: configparser.ConfigParser) -> DisplayDriver:
+    """Инициализировать драйвер дисплея на основе ``config.ini``.
+
+    Параметр ``[DISPLAY] driver`` позволяет выбирать между выводом в
+    консоль и работой с M5Stack.  Если драйвер поддерживает метод
+    ``wait_ready`` (например, Serial‑мост M5), он будет вызван для
+    проверки готовности устройства.
+    """
+
+    # Получаем имя драйвера, по умолчанию используем консоль для удобной отладки
+    driver_name = cfg.get("DISPLAY", "driver", fallback="console")
+    log.info("Инициализация дисплея через драйвер '%s'", driver_name)
+    driver = init_driver(driver_name)
+
+    # Некоторые драйверы (Serial) требуют подтверждения готовности
+    if hasattr(driver, "wait_ready") and not driver.wait_ready():  # pragma: no cover - проверка специфична для железа
+        raise RuntimeError("display not ready")
+
+    return driver
+
 async def main() -> None:
     """Инициализация и основной цикл ассистента."""
 
-    # 0. Проверяем подключение дисплея как можно раньше, чтобы
-    # ошибки отображались ещё до загрузки тяжёлых подсистем.
+    # 0. Загружаем конфиг и инициализируем дисплей как можно раньше,
+    # чтобы возможные ошибки были показаны до старта тяжёлых подсистем.
+    cfg = configparser.ConfigParser()
+    cfg.read("config.ini", encoding="utf-8")
     try:
-        driver = init_driver("serial")
-        if not driver.wait_ready():
-            from working_tts import working_tts
-
-            await asyncio.to_thread(
-                working_tts,
-                "Дисплей не подключен",
-                preset="neutral",
-            )
-            return
+        driver = init_display_from_config(cfg)
     except Exception:
+        # Если дисплей не доступен, озвучиваем проблему и завершаем работу.
         from working_tts import working_tts
 
         await asyncio.to_thread(
@@ -118,8 +133,6 @@ async def main() -> None:
         k: [normalize(v) for v in variants]
         for k, variants in command_processing.VA_CMD_LIST.items()
     }
-    cfg = configparser.ConfigParser()
-    cfg.read("config.ini", encoding="utf-8")
     mic_idx = cfg.getint("MIC", "microphone_index")
     suggestion_interval = cfg.getint(
         "SUGGESTIONS", "interval_sec", fallback=60
