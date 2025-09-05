@@ -95,6 +95,16 @@ SCHEMA = [
         meta TEXT
     )
     """,
+    """
+    -- Хранение ежедневного дайджеста с приоритетами и настроением
+    CREATE TABLE IF NOT EXISTS daily_digest (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        digest TEXT NOT NULL,
+        priorities TEXT,
+        mood INTEGER
+    )
+    """,
 ]
 
 # Удерживаем события не дольше двух недель
@@ -147,6 +157,8 @@ SMALLTALK_KEY = "smalltalk:last_ts"
 MOOD_LEVEL_KEY = "emotion:mood"
 # Ключ для хранения valence/arousal настроения
 MOOD_STATE_KEY = "emotion:mood_state"
+# Ключ для хранения актуальных приоритетов на завтра
+PRIORITIES_KEY = "reflection:priorities"
 
 
 def get_last_smalltalk_ts() -> int:
@@ -190,6 +202,29 @@ def set_mood_level(level: int) -> None:
             "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
             (MOOD_LEVEL_KEY, str(level), ts),
         )
+
+
+# --- Reflection helpers ----------------------------------------------------
+
+def set_priorities(priorities: str) -> None:
+    """Сохранить список приоритетов на следующий день."""
+    ts = int(time.time())
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
+            (PRIORITIES_KEY, priorities, ts),
+        )
+
+
+def add_daily_digest(digest: str, priorities: str | None, mood: int | None) -> int:
+    """Записать результат вечерней рефлексии в отдельную таблицу."""
+    ts = int(time.time())
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO daily_digest (ts, digest, priorities, mood) VALUES (?, ?, ?, ?)",
+            (ts, digest, priorities, mood),
+        )
+        return int(cur.lastrowid)
 
 
 # --- Extended mood state helpers -------------------------------------------
