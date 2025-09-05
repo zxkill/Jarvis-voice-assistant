@@ -33,11 +33,23 @@ def handle(text: str, *, trace_id: str) -> str:
     """
 
     lower = text.lower()
-    if any(lower.startswith(cmd) for cmd in ["сделай", "поставь", "запусти", "выполни"]):
-        log.debug("handle → act", extra={"trace_id": trace_id, "text": text})
-        reply = llm_engine.act(text, trace_id=trace_id)
-    else:
-        log.debug("handle → think", extra={"trace_id": trace_id, "text": text})
-        reply = llm_engine.think(text, trace_id=trace_id)
-
-    return reply.strip()
+    try:
+        if any(
+            lower.startswith(cmd)
+            for cmd in ["сделай", "поставь", "запусти", "выполни"]
+        ):
+            # Команда пользователя подразумевает действие
+            log.debug("handle → act", extra={"trace_id": trace_id, "text": text})
+            reply = llm_engine.act(text, trace_id=trace_id)
+        else:
+            # Во всех остальных случаях просим модель "подумать"
+            log.debug("handle → think", extra={"trace_id": trace_id, "text": text})
+            reply = llm_engine.think(text, trace_id=trace_id)
+        return reply.strip()
+    except Exception as exc:
+        # Если обращение к LLM завершается неудачно, логируем подробности
+        log.error(
+            "Сбой в работе Ollama: %s", exc, extra={"trace_id": trace_id, "text": text}
+        )
+        # Возвращаем дружелюбное сообщение пользователю
+        return "Извините, сервис генерации текста временно недоступен"

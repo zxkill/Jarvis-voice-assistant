@@ -55,6 +55,17 @@ def test_handle_routes_to_act(monkeypatch):
     assert calls == [("Сделай шаг", "xyz")]
 
 
+def test_handle_returns_error_message(monkeypatch):
+    """Скилл должен возвращать понятное сообщение при сбое LLM."""
+
+    def fake_think(text, trace_id):
+        raise RuntimeError("Ollama недоступна")
+
+    monkeypatch.setattr(llm_engine, "think", fake_think)
+    reply = ollama.handle("Расскажи анекдот", trace_id="99")
+    assert "недоступ" in reply.lower()
+
+
 def test_think_saves_dialog(monkeypatch):
     reset_short_term()
     saved = []
