@@ -1,13 +1,18 @@
 import pytest
+import requests
 from utils.ollama_client import OllamaClient
 
 
 class DummyResponse:
-    def __init__(self, data):
+    """Минимальная заглушка ``requests.Response`` для юнит‑тестов."""
+
+    def __init__(self, data, status_code=200):
         self._data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status {self.status_code}")
 
     def json(self):
         return self._data

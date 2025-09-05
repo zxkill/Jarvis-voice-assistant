@@ -14,11 +14,19 @@ from context import short_term, long_term
 
 
 class DummyResponse:
-    def __init__(self, data):
+    """Простая заглушка объекта ``requests.Response``.
+
+    Содержит только необходимый минимум: статус-код, метод ``json`` и
+    ``raise_for_status`` для имитации поведения библиотеки ``requests``.
+    """
+
+    def __init__(self, data, status_code=200):
         self._data = data
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"status {self.status_code}")
 
     def json(self):
         return self._data

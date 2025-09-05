@@ -42,8 +42,8 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
     if profile not in PROFILES:
         raise ValueError(f"Неизвестный профиль: {profile}")
     model = PROFILES[profile]
-    # Используем OpenAI-совместимый эндпоинт /v1/chat/completions.
-    # В качестве единственного сообщения передаём подготовленный ``prompt``.
+
+    # Подготавливаем запрос для современного эндпоинта /v1/chat/completions
     url = f"{BASE_URL}/v1/chat/completions"
     payload = {
         "model": model,
@@ -56,33 +56,66 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
         "Отправка запроса в Ollama",
         extra={"url": url, "model": model, "trace_id": trace_id},
     )
+
     try:
         response = requests.post(url, json=payload, timeout=60)
-        response.raise_for_status()
     except requests.RequestException as exc:
-        # Любые сетевые ошибки логируем и поднимаем понятное исключение
+        # Сетевые ошибки: сервер недоступен или таймаут
         logger.error("Ошибка при обращении к Ollama: %s", exc)
         raise RuntimeError("Ollama недоступна") from exc
+
+    use_legacy = False  # признак использования старого API /api/generate
+    if response.status_code == 404:
+        # Старые версии Ollama не знают про /v1/chat/completions.
+        # Логируем предупреждение и пробуем fallback на /api/generate.
+        logger.warning(
+            "Эндпоинт /v1/chat/completions не найден, пробуем /api/generate",
+            extra={"trace_id": trace_id},
+        )
+        url = f"{BASE_URL}/api/generate"
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "trace_id": trace_id,
+            "stream": False,
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=60)
+            response.raise_for_status()
+            use_legacy = True
+        except requests.RequestException as exc:
+            logger.error("Ошибка при обращении к Ollama: %s", exc)
+            raise RuntimeError("Ollama недоступна") from exc
+    else:
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("Ошибка при обращении к Ollama: %s", exc)
+            raise RuntimeError("Ollama недоступна") from exc
 
     try:
         data = response.json()
         if not isinstance(data, dict):
             raise TypeError(f"unexpected JSON type: {type(data)!r}")
-        # Структура ответа: {"choices": [{"message": {"content": "текст"}}]}
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise KeyError("choices")
-        message = choices[0].get("message", {})
-        if not isinstance(message, dict):
-            raise TypeError("message should be dict")
-        text = str(message.get("content", ""))
+        if use_legacy:
+            # Ответ старого API: {"response": "текст"}
+            text = str(data.get("response", ""))
+        else:
+            # Новый формат: {"choices": [{"message": {"content": "текст"}}]}
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise KeyError("choices")
+            message = choices[0].get("message", {})
+            if not isinstance(message, dict):
+                raise TypeError("message should be dict")
+            text = str(message.get("content", ""))
     except Exception as exc:
         logger.error("Некорректный ответ от Ollama: %s", exc)
         raise RuntimeError("Ollama вернула невалидный JSON") from exc
 
     logger.debug(
         "Получен ответ от Ollama",
-        extra={"length": len(text), "trace_id": trace_id},
+        extra={"length": len(text), "trace_id": trace_id, "legacy": use_legacy},
     )
     return text
 

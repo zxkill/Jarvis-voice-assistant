@@ -1,5 +1,6 @@
 from core import llm_engine
 from context import short_term, long_term
+import requests
 
 
 class DummyQuery:
@@ -59,3 +60,43 @@ def test_mood_uses_history(monkeypatch):
     assert "радость" in prompt
     assert "хорошо" in prompt
     assert saved == ["ответ"]
+
+
+def test_query_falls_back_to_generate(monkeypatch):
+    """При 404 от нового эндпоинта должен использоваться старый /api/generate."""
+
+    clear_short_term()
+    calls = []
+
+    class Resp404:
+        status_code = 404
+
+        def raise_for_status(self):
+            raise requests.HTTPError("404")
+
+        def json(self):
+            return {}
+
+    class RespOK:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"response": "привет"}
+
+    def fake_post(url, json, timeout):
+        calls.append(url)
+        return Resp404() if url.endswith("/v1/chat/completions") else RespOK()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    monkeypatch.setattr(long_term, "get_events_by_label", lambda label: [])
+    monkeypatch.setattr(long_term, "add_daily_event", lambda text, labels: None)
+
+    result = llm_engine.think("тема", trace_id="123")
+    assert result == "привет"
+    assert calls == [
+        f"{llm_engine.BASE_URL}/v1/chat/completions",
+        f"{llm_engine.BASE_URL}/api/generate",
+    ]
