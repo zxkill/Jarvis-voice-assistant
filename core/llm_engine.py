@@ -20,7 +20,7 @@ import os
 import requests
 
 from context import long_term, short_term
-from memory import long_memory
+from memory import long_memory, preferences
 
 logger = logging.getLogger(__name__)
 
@@ -219,10 +219,13 @@ def think(topic: str, *, trace_id: str) -> str:
     events = long_term.get_events_by_label("think")
     # Находим семантически похожие воспоминания по текущей теме
     similar = [text for text, _ in long_memory.retrieve_similar(topic)]
+    # Загружаем известные предпочтения пользователя, чтобы учитывать их в ответе
+    prefs = preferences.load_preferences()
     logger.debug(
         "Релевантные события для темы %r: %s", topic, similar
     )
-    long_context = "\n".join(events + similar)
+    logger.debug("Учтённые предпочтения: %s", prefs)
+    long_context = "\n".join(events + similar + prefs)
     return _run(
         "think",
         topic=topic,
@@ -240,10 +243,13 @@ def act(command: str, *, trace_id: str) -> str:
     # Извлекаем события с меткой "act" и похожие команды из долговременной памяти
     events = long_term.get_events_by_label("act")
     similar = [text for text, _ in long_memory.retrieve_similar(command)]
+    # Предпочтения пользователя также важны при выборе действия
+    prefs = preferences.load_preferences()
     logger.debug(
         "Релевантные события для команды %r: %s", command, similar
     )
-    long_context = "\n".join(events + similar)
+    logger.debug("Учтённые предпочтения: %s", prefs)
+    long_context = "\n".join(events + similar + prefs)
     return _run(
         "act",
         command=command,

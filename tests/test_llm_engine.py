@@ -4,6 +4,12 @@ import requests
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_preferences(monkeypatch):
+    """Отключаем загрузку предпочтений в тестах."""
+    monkeypatch.setattr(llm_engine.preferences, "load_preferences", lambda: [])
+
+
 class DummyQuery:
     """Заглушка HTTP-запроса к Ollama."""
 
