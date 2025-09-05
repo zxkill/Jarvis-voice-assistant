@@ -4,21 +4,18 @@ from __future__ import annotations
 
 Подписывается на новые сообщения из брокера событий, запрашивает у
 ``Policy`` подходящий канал и отправляет уведомление через выбранный
-нотификатор.
+нотификатор. Ранее модуль умел инициировать лёгкий ``small-talk``, но
+этот функционал удалён во избежание пустых реплик.
 """
 
 import threading
-import time
-import datetime as dt
-import uuid  # Генерация trace_id для отслеживания цепочек событий
 
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from proactive.policy import Policy
-from memory.db import get_connection, get_last_smalltalk_ts, set_last_smalltalk_ts
+from memory.db import get_connection
 from memory.writer import add_suggestion_feedback
 from core import events as core_events
-from skills.chit_chat_ru import random_phrase
 
 # Глобальная ссылка на последний созданный экземпляр движка.
 _engine_instance: "ProactiveEngine | None" = None
@@ -58,25 +55,17 @@ class ProactiveEngine:
         self,
         policy: Policy,
         *,
-        idle_threshold_sec: int = 300,
-        smalltalk_interval_sec: int = 3600,
-        check_period_sec: int = 30,
         response_timeout_sec: int = 10,
     ) -> None:
         # ``policy`` определяет канал доставки подсказок.
         self.policy = policy
         # Считаем, что пользователь присутствует, пока не получили событие.
         self.present = True
-        # Последняя голосовая команда, чтобы отслеживать длительное молчание.
-        self._last_command_ts = time.time()
-        # Параметры троттлинга small-talk.
-        self.idle_threshold_sec = idle_threshold_sec
-        self.smalltalk_interval_sec = smalltalk_interval_sec
-        self.check_period_sec = check_period_sec
         # Таймаут ожидания ответа пользователя на подсказку.
         self.response_timeout_sec = response_timeout_sec
         # Состояние ожидания ответа: хранит ID подсказки и таймер.
         self._awaiting: dict | None = None
+        # Настраиваем структурированный логгер для удобной диагностики.
         self.log = configure_logging("proactive.engine")
         # Сохраняем глобальную ссылку на экземпляр движка,
         # чтобы другие модули могли проверить состояние ожидания.
@@ -88,28 +77,18 @@ class ProactiveEngine:
         set_metric("suggestions.responded", 0)
         set_metric("suggestions.accepted", 0)
         set_metric("suggestions.declined", 0)
-        # Подписываемся на новые подсказки, обновления присутствия и команды.
+        # Подписываемся на новые подсказки и обновления присутствия.
         core_events.subscribe("suggestion.created", self._on_suggestion)
         core_events.subscribe("presence.update", self._on_presence)
-        # Подписка на распознанную речь используется и для обновления таймера,
-        # и для фиксации возможного ответа на подсказку.
-        core_events.subscribe("speech.recognized", self._on_command)
         # Ответы, пришедшие текстом, обрабатываем напрямую, а голосовые
         # перехватываются в ``app.command_processing``.
         core_events.subscribe("telegram.message", self._on_user_response)
-        # Фоновая проверка тишины запускается в отдельном потоке.
-        threading.Thread(target=self._idle_loop, daemon=True).start()
 
     # ------------------------------------------------------------------
     def _on_presence(self, event: core_events.Event) -> None:
         """Обновить текущее состояние присутствия."""
         # Событие содержит атрибут ``present`` со значением ``True/False``.
         self.present = bool(event.attrs.get("present"))
-
-    # ------------------------------------------------------------------
-    def _on_command(self, event: core_events.Event) -> None:
-        """Запоминаем время последней распознанной команды."""
-        self._last_command_ts = time.time()
 
     # ------------------------------------------------------------------
     def _on_suggestion(self, event: core_events.Event) -> None:
@@ -225,65 +204,6 @@ class ProactiveEngine:
             )
             inc_metric("suggestions.failed")
             return False
-
-    # ------------------------------------------------------------------
-    def _idle_loop(self) -> None:
-        """Фоновый поток, генерирующий small-talk при длительном молчании."""
-        while True:
-            time.sleep(self.check_period_sec)
-            # Small-talk должен работать даже когда пользователя нет рядом:
-            # политика доставки самостоятельно выберет Telegram.
-            now = time.time()
-            if now - self._last_command_ts < self.idle_threshold_sec:
-                continue
-            last_smalltalk = get_last_smalltalk_ts()
-            if now - last_smalltalk < self.smalltalk_interval_sec:
-                continue
-            text = random_phrase()
-            now_dt = dt.datetime.fromtimestamp(now)
-            period = self._period_of_day(now_dt.hour)
-            weekday = now_dt.strftime("%A")
-            # Для каждого small-talk генерируем отдельный ``trace_id``,
-            # чтобы отследить всю цепочку событий от предложения до ответа.
-            trace_id = uuid.uuid4().hex
-            self.log.info(
-                "smalltalk triggered",
-                extra={
-                    "ctx": {
-                        "reason": "long_silence",
-                        "present": self.present,
-                        "period": period,
-                        "weekday": weekday,
-                        "trace_id": trace_id,
-                    }
-                },
-            )
-            core_events.publish(
-                core_events.Event(
-                    kind="suggestion.created",
-                    attrs={
-                        "text": text,
-                        "reason_code": "long_silence",
-                        "present": self.present,
-                        "period": period,
-                        "weekday": weekday,
-                        "trace_id": trace_id,
-                    },
-                )
-            )
-            set_last_smalltalk_ts(int(now))
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _period_of_day(hour: int) -> str:
-        """Вернуть период суток по номеру часа."""
-        if 5 <= hour < 12:
-            return "morning"
-        if 12 <= hour < 17:
-            return "day"
-        if 17 <= hour < 23:
-            return "evening"
-        return "night"
 
     # ------------------------------------------------------------------
     def _mark_processed(self, suggestion_id: int) -> None:
