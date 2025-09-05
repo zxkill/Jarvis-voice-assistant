@@ -8,6 +8,9 @@ from typing import Any, Dict
 
 import yaml
 
+# Подключаем чтение статистики по отзывам на подсказки
+from memory.reader import get_feedback_stats
+
 from core.logging_json import configure_logging
 from core import llm_engine
 from core.events import Event, publish, subscribe
@@ -31,6 +34,39 @@ def load_playbook(path: Path | None = None) -> Dict[str, Any]:
         log.warning("playbook missing", extra={"ctx": {"path": str(path)}})
         return {}
     return data.get("scenarios", {})
+
+
+def feedback_acceptance_ratio() -> Dict[str, float]:
+    """Рассчитать долю принятых и отклонённых подсказок.
+
+    Таблица ``suggestion_feedback`` накапливает ответы пользователя на
+    проактивные предложения. Функция подсчитывает количество принятых и
+    отклонённых подсказок и возвращает их долю. Значения находятся в
+    диапазоне ``0..1``. При отсутствии данных возвращаются нули.
+    """
+
+    # Получаем агрегированную статистику по отзывам из слоя памяти
+    stats = get_feedback_stats()
+    accepted = stats.get("accepted", 0)
+    rejected = stats.get("rejected", 0)
+    total = accepted + rejected
+    if total == 0:
+        log.info("no feedback yet")
+        return {"accepted": 0.0, "rejected": 0.0}
+
+    accepted_share = accepted / total
+    rejected_share = rejected / total
+    # Логируем рассчитанные показатели для удобной диагностики
+    log.info(
+        "feedback ratio", 
+        extra={
+            "ctx": {
+                "accepted_share": round(accepted_share, 3),
+                "rejected_share": round(rejected_share, 3),
+            }
+        },
+    )
+    return {"accepted": accepted_share, "rejected": rejected_share}
 
 
 def _handle_trigger(event: Event) -> None:
