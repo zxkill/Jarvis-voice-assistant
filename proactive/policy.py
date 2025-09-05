@@ -54,6 +54,78 @@ class Policy:
         set_metric("policy.voice_suppressed_night", 0)
 
     # ------------------------------------------------------------------
+    def adapt_from_feedback(self, ratio: dict[str, float] | None = None) -> None:
+        """Динамически скорректировать троттлинг и лимиты.
+
+        Параметры ``suggestion_min_interval_min`` и ``daily_limit``
+        подстраиваются под реакцию пользователя на подсказки. Когда
+        доля принятых подсказок падает ниже 50 %, ассистент становится
+        менее навязчивым: увеличивается минимальный интервал и
+        снижается дневной лимит. При высокой доле принятий ограничения
+        ослабляются.
+
+        :param ratio: словарь долей вида ``{"accepted": x, "rejected": y}``.
+            Если не указан, статистика будет получена из
+            :func:`analysis.proactivity.feedback_acceptance_ratio`.
+        """
+
+        # При необходимости запрашиваем статистику напрямую из слоя анализа
+        if ratio is None:
+            from analysis.proactivity import feedback_acceptance_ratio
+
+            ratio = feedback_acceptance_ratio()
+
+        accepted = float(ratio.get("accepted", 0.0))
+        rejected = float(ratio.get("rejected", 0.0))
+        total = accepted + rejected
+
+        if total == 0:
+            # Нет данных — ничего не меняем, но оставляем отметку в логе
+            self.log.info("adaptation skipped: no feedback")
+            return
+
+        accepted_share = accepted / total
+
+        if accepted_share < 0.5:
+            # Пользователь чаще отвергает подсказки — уменьшаем активность
+            self.config.suggestion_min_interval_min = min(
+                self.config.suggestion_min_interval_min + 1, 60
+            )
+            if self.config.daily_limit is None:
+                self.config.daily_limit = 1
+            else:
+                self.config.daily_limit = max(1, self.config.daily_limit - 1)
+            self.log.info(
+                "adapted: decrease proactivity",
+                extra={
+                    "ctx": {
+                        "accepted_share": round(accepted_share, 3),
+                        "min_interval": self.config.suggestion_min_interval_min,
+                        "daily_limit": self.config.daily_limit,
+                    }
+                },
+            )
+        else:
+            # Подсказки в основном принимаются — можно ускориться
+            self.config.suggestion_min_interval_min = max(
+                0.0, self.config.suggestion_min_interval_min - 1
+            )
+            if self.config.daily_limit is None:
+                self.config.daily_limit = 1
+            else:
+                self.config.daily_limit += 1
+            self.log.info(
+                "adapted: increase proactivity",
+                extra={
+                    "ctx": {
+                        "accepted_share": round(accepted_share, 3),
+                        "min_interval": self.config.suggestion_min_interval_min,
+                        "daily_limit": self.config.daily_limit,
+                    }
+                },
+            )
+
+    # ------------------------------------------------------------------
     def _in_silence_window(self, moment: dt.time) -> bool:
         """Проверить, попадает ли момент *moment* в тихое окно.
 
