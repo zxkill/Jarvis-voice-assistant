@@ -27,8 +27,8 @@ def clear_short_term():
     short_term._buffer.clear()
 
 
-def test_compose_context_includes_current_datetime(monkeypatch):
-    """Проверяем, что контекст начинается с актуальных даты и времени."""
+def test_compose_context_appends_current_datetime(monkeypatch):
+    """Контекст должен завершаться актуальной датой и временем."""
 
     # Подменяем refresh, чтобы вернуть предсказуемую дату
     monkeypatch.setattr(
@@ -44,14 +44,41 @@ def test_compose_context_includes_current_datetime(monkeypatch):
             return dt.datetime(2024, 4, 25, 15, 30, 0)
 
     monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
-    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: [])
+    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: ["предыдущее сообщение"])
 
     ctx = llm_engine._compose_context()
     expected = (
+        "предыдущее сообщение\n"
         "Текущая дата 25.04.2024, время 15:30:00. "
         "Используй именно её при ответах, даже если ранее упоминались другие даты."
     )
     assert ctx == expected
+
+
+def test_compose_context_overrides_user_dates(monkeypatch):
+    """Последняя строка должна перебивать даты из истории."""
+
+    monkeypatch.setattr(
+        llm_engine.current_date,
+        "refresh",
+        lambda: dt.date(2024, 4, 25),
+    )
+
+    class _FakeDatetime(dt.datetime):
+        @classmethod
+        def now(cls):  # type: ignore[override]
+            return dt.datetime(2024, 4, 25, 15, 30, 0)
+
+    monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
+    history = [{"user": "мой др 7 мая 1988", "reply": "понял"}]
+    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: history)
+
+    ctx = llm_engine._compose_context()
+    lines = ctx.splitlines()
+    assert str(history[0]) in ctx
+    assert lines[-1].startswith(
+        "Текущая дата 25.04.2024, время 15:30:00. Используй именно её"
+    )
 
 
 def test_compose_context_refreshes_date(monkeypatch):
