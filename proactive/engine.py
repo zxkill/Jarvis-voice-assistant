@@ -19,6 +19,7 @@ from memory.db import get_connection
 from memory.writer import add_suggestion_feedback
 from core import events as core_events
 from core import llm_engine
+from skills.holiday_ru import is_day_off
 
 # Глобальная ссылка на последний созданный экземпляр движка.
 _engine_instance: "ProactiveEngine | None" = None
@@ -145,6 +146,21 @@ class ProactiveEngine:
                 }
             },
         )
+
+        # Праздничные поздравления отправляем только в выходные/праздники
+        if reason_code == "holiday_greeting":
+            try:
+                flag, name = is_day_off()
+            except Exception as exc:  # pragma: no cover - сеть может быть недоступна
+                self.log.exception("holiday check failed", extra={"ctx": {"err": str(exc)}})
+                self._mark_processed(suggestion_id)
+                return
+            if not flag:
+                self.log.info("skipped: working day", extra={"ctx": {"id": suggestion_id}})
+                self._mark_processed(suggestion_id)
+                return
+            if "{holiday}" in text:
+                text = text.format(holiday=name or "праздником")
         # Запрашиваем у политики канал доставки, учитывающий присутствие
         # и ограничения (тихое время, троттлинг и т.п.).
         channel = self.policy.choose_channel(present, text=text)

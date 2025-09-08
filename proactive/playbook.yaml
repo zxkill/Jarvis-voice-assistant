@@ -14,3 +14,8 @@ scenarios:
     event: health.reminder
     prompt: |
       Вежливо напомни сделать разминку, размять глаза и выпить воды.
+  holiday_greeting:
+    trigger: time
+    time: "09:00"
+    prompt: |
+      Поздравь пользователя с праздником {holiday} и пожелай приятного отдыха.
