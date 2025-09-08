@@ -43,11 +43,19 @@ SCHEMA = [
         text TEXT NOT NULL,
         ts INTEGER NOT NULL,
         processed INTEGER NOT NULL DEFAULT 0,
-        reason_code TEXT
+        reason_code TEXT,
+        fingerprint TEXT
     )
     """,
     """
     ALTER TABLE suggestions ADD COLUMN reason_code TEXT
+    """,
+    """
+    ALTER TABLE suggestions ADD COLUMN fingerprint TEXT
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_suggestions_fingerprint
+        ON suggestions(fingerprint)
     """,
     """
     -- Таблица для хранения откликов пользователей на подсказки
