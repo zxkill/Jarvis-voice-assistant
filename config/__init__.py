@@ -58,6 +58,7 @@ class AffectConfig:
     valence_factor: float = 1.0  # масштабирование изменения по оси valence
     arousal_factor: float = 1.0  # масштабирование изменения по оси arousal
     ema_alpha: float = 0.5       # коэффициент экспоненциального сглаживания
+    announce_mood: bool = True   # включать ли озвучивание текущего настроения
 
 
 def load_affect(path: Path | None = None) -> AffectConfig:
@@ -70,6 +71,7 @@ def load_affect(path: Path | None = None) -> AffectConfig:
         valence_factor=float(data.get("valence_factor", defaults.valence_factor)),
         arousal_factor=float(data.get("arousal_factor", defaults.arousal_factor)),
         ema_alpha=float(data.get("ema_alpha", defaults.ema_alpha)),
+        announce_mood=bool(data.get("announce_mood", defaults.announce_mood)),
     )
 
 
@@ -132,3 +134,8 @@ def load_proactive(path: Path | None = None) -> ProactiveConfig:
         force_telegram=bool(data.get("force_telegram", defaults.force_telegram)),
         silence_window=silence_window,
     )
+
+
+# Загружаем конфигурации при импорте модуля для удобного доступа.
+# При необходимости параметры можно переопределить в тестах или во время работы.
+affect = load_affect()

@@ -8,6 +8,7 @@ from emotion.state import EmotionState, Emotion
 from emotion.mood import Mood
 from emotion import policy
 
+import config  # глобальные настройки приложения
 from core.logging_json import configure_logging
 from core import events as core_events
 from core import llm_engine
@@ -133,19 +134,30 @@ class EmotionManager:
         self._state.raise_mood(reason="dialog success")
         # Обновляем двухмерное настроение и выбираем новую эмоцию
         self._update_mood(1.0, 1.0, reason="dialog success")
-        # Генерация и озвучивание «муд‑профиля» через LLM
-        self._announce_mood("после успешного диалога", "dialog.success")
+        # Генерация и озвучивание «муд‑профиля» через LLM при разрешённой конфигурацией озвучке
+        if config.affect.announce_mood:
+            self._announce_mood("после успешного диалога", "dialog.success")
+        else:
+            log.info("Mood announcement suppressed by config")
 
     def _on_dialog_failure(self, event: core_events.Event) -> None:
         """Реакция на ошибку или непонимание команды."""
         self._state.drop_mood(reason="dialog failure")
         # Снижаем валентность сильнее, чем возбуждение, чтобы перейти в негативную зону
         self._update_mood(-2.0, 0.5, reason="dialog failure")
-        self._announce_mood("после неудачного диалога", "dialog.failure")
+        # Озвучивание настроения выключаем, если параметр отключён в конфигурации
+        if config.affect.announce_mood:
+            self._announce_mood("после неудачного диалога", "dialog.failure")
+        else:
+            log.info("Mood announcement suppressed by config")
 
     def _on_nightly_reflection(self, event: core_events.Event) -> None:
         """Обработка завершения ночной рефлексии."""
-        self._announce_mood("после ночной рефлексии", "nightly_reflection")
+        # Озвучиваем итог ночной рефлексии только при активном флаге announce_mood
+        if config.affect.announce_mood:
+            self._announce_mood("после ночной рефлексии", "nightly_reflection")
+        else:
+            log.info("Mood announcement suppressed by config")
 
     def _on_presence_update(self, event: core_events.Event) -> None:
         """Запоминаем, есть ли сейчас человек в кадре."""
