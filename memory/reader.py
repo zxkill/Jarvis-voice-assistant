@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from .db import get_connection
 
@@ -41,6 +42,28 @@ def pop_suggestion() -> str | None:
             return None
         conn.execute("UPDATE suggestions SET processed = 1 WHERE id = ?", (row["id"],))
         return str(row["text"])
+
+
+def was_event_triggered(code: str, hours: int = 24) -> bool:
+    """Проверить, создавалась ли подсказка с указанным кодом за период.
+
+    :param code: уникальный идентификатор события/подсказки
+    :param hours: глубина поиска в часах (по умолчанию сутки)
+    :return: ``True``, если подсказка уже была отправлена в указанном окне
+    """
+
+    look_back = int(hours * 3600)
+    logger.debug(
+        "Проверяем повтор события: code=%s hours=%s", code, hours
+    )
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM suggestions WHERE reason_code = ? AND ts > ? LIMIT 1",
+            (code, int(time.time()) - look_back),
+        ).fetchone()
+        triggered = row is not None
+        logger.debug("Результат проверки: %s", triggered)
+        return triggered
 
 
 def get_suggestion_feedback(suggestion_id: int) -> list[dict]:
