@@ -11,6 +11,16 @@ from core import llm_engine, events
 from memory import db as memory_db
 
 
+class DummyDailyMemory:
+    """Заглушка дневной памяти для ускорения теста."""
+
+    def fetch_all(self):
+        return []
+
+    def clear(self):
+        pass
+
+
 def test_nightly_reflection(monkeypatch, tmp_path):
     """Проверяем генерацию дайджеста, запись в БД и отправку уведомления."""
 
@@ -21,6 +31,8 @@ def test_nightly_reflection(monkeypatch, tmp_path):
     # Заглушаем вызов LLM и возвращаем предсказуемый JSON-объект
     result = {"digest": "итоги дня", "priorities": "работа, отдых", "mood": 7}
     monkeypatch.setattr(llm_engine, "reflect", lambda: result)
+    # Дневная память пуста — пересылка не требуется
+    monkeypatch.setattr(scheduler, "daily_memory", DummyDailyMemory())
 
     # Перехватываем обновление настроения и приоритетов
     mood_holder = {}
