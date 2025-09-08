@@ -11,6 +11,7 @@ from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from core.request_source import get_request_source
 from working_tts import speak_async
+from utils.reply import extract_reply
 
 log = configure_logging("notifiers.voice")
 
@@ -81,9 +82,11 @@ def say(text: str, *, pitch: float | None = None, speed: float | None = None, em
     ``pitch`` и ``speed`` задаются как коэффициенты, ``emotion`` — имя
     пресета из :data:`working_tts.TTS_PRESETS`.
     """
+    # Перед постановкой в очередь пытаемся извлечь поле ``reply`` из JSON.
+    clean = extract_reply(text)
     source = get_request_source()
     _queue.put_nowait({
-        "text": text,
+        "text": clean,
         "pitch": pitch,
         "speed": speed,
         "emotion": emotion,
@@ -91,7 +94,7 @@ def say(text: str, *, pitch: float | None = None, speed: float | None = None, em
     })
     log.debug(
         "queued voice text=%r emotion=%s pitch=%s speed=%s source=%s",
-        text,
+        clean,
         emotion,
         pitch,
         speed,
