@@ -1,0 +1,59 @@
+import datetime as dt
+from cryptography.fernet import Fernet
+
+import analysis.proactivity as proactivity
+from core.events import Event
+from memory import events as user_events
+from memory import db as memory_db, writer
+
+
+def test_event_greeting_skipped(monkeypatch, tmp_path):
+    """Поздравления задолго до события игнорируются."""
+
+    monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
+    monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(proactivity.llm_engine, "act", lambda *a, **k: "С днём рождения!")
+    monkeypatch.setattr(user_events, "load_event_date", lambda k: dt.date(1988, 5, 7))
+    monkeypatch.setattr(user_events, "_today", lambda: dt.date(2024, 1, 1))
+
+    added: list[str] = []
+    monkeypatch.setattr(
+        proactivity, "add_suggestion", lambda text, code: added.append(text) or 1
+    )
+    events: list[Event] = []
+    monkeypatch.setattr(proactivity, "publish", lambda e: events.append(e))
+
+    proactivity._handle_trigger(Event("proactivity.trigger", {"name": "context_hint"}))
+    assert added == []
+    assert events == []
+
+
+def test_event_greeting_allowed(monkeypatch, tmp_path):
+    """Когда событие близко, подсказка проходит."""
+
+    monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
+    monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
+    monkeypatch.setattr(proactivity.llm_engine, "act", lambda *a, **k: "С днём рождения!")
+    monkeypatch.setattr(user_events, "load_event_date", lambda k: dt.date(1988, 5, 7))
+    monkeypatch.setattr(user_events, "_today", lambda: dt.date(2024, 5, 5))
+
+    added: list[str] = []
+    monkeypatch.setattr(proactivity, "add_suggestion", lambda text, code: added.append(text) or 1)
+    events: list[Event] = []
+    monkeypatch.setattr(proactivity, "publish", lambda e: events.append(e))
+
+    proactivity._handle_trigger(Event("proactivity.trigger", {"name": "context_hint"}))
+    assert added
+    assert events and events[0].attrs["text"] == "С днём рождения!"
+
+
+def test_add_suggestion_dedup(monkeypatch, tmp_path):
+    """Повторяющиеся подсказки не добавляются повторно."""
+
+    monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
+    monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
+
+    first = writer.add_suggestion("С днём рождения, Алексей!", "ctx")
+    assert first is not None
+    second = writer.add_suggestion("Поздравляю с днем рождения, Алексей", "ctx")
+    assert second is None
