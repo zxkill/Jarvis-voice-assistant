@@ -10,6 +10,7 @@ Jarvis: разбор фраз, поиск совпадений с именем �
 from typing import Any, Dict, List
 
 import asyncio
+import uuid
 from rapidfuzz import fuzz
 
 import jarvis_skills
@@ -56,6 +57,87 @@ ACTIVATION_CONFIDENCE = 65
 # Словарь доступных команд: ключ — имя команды,
 # значение — список фраз‑вариантов. Заполняется при старте из ``commands.yaml``.
 VA_CMD_LIST: Dict[str, List[str]] = {}
+
+# ─── Переменные режима общения ────────────────────────────────────────────
+# Флаг активности «режима общения», когда LLM ведёт диалог без слова активации.
+CHAT_MODE_ACTIVE: bool = False
+# История текущего диалога [(реплика пользователя, ответ ассистента), ...]
+CHAT_HISTORY: list[tuple[str, str]] = []
+# Таймер автоматического завершения режима общения при отсутствии речи.
+_chat_timer: asyncio.TimerHandle | None = None
+
+
+def _reset_chat_timer() -> None:
+    """Перезапустить таймер ожидания ответа собеседника."""
+
+    global _chat_timer
+    loop = asyncio.get_running_loop()
+    if _chat_timer is not None:
+        _chat_timer.cancel()
+    # Если за минуту не поступит новой реплики — завершаем режим общения
+    _chat_timer = loop.call_later(60, lambda: asyncio.create_task(_end_chat()))
+
+
+def is_chat_stop_phrase(text: str) -> bool:
+    """Проверить, хочет ли пользователь завершить беседу."""
+
+    text = text.lower().strip()
+    return "хватит болтать" in text
+
+
+async def _chat_llm(text: str) -> None:
+    """Отправить реплику в LLM и озвучить ответ, сохранив историю."""
+
+    trace_id = uuid.uuid4().hex
+    log.info("chat message", extra={"ctx": {"text": text, "trace_id": trace_id}})
+    try:
+        reply = await asyncio.to_thread(llm_engine.think, text, trace_id=trace_id)
+    except Exception:  # pragma: no cover - логируем сбои внешней LLM
+        log.exception("llm think failed", extra={"ctx": {"trace_id": trace_id}})
+        return
+    try:
+        await speak_async(reply)
+    except Exception:  # pragma: no cover - синтез речи не критичен для тестов
+        log.exception("failed to speak llm reply", extra={"ctx": {"trace_id": trace_id}})
+    CHAT_HISTORY.append((text, reply))
+    _reset_chat_timer()
+
+
+async def _start_chat(text: str) -> None:
+    """Активировать режим общения и обработать первую реплику."""
+
+    global CHAT_MODE_ACTIVE, CHAT_HISTORY
+    CHAT_MODE_ACTIVE = True
+    CHAT_HISTORY = []
+    log.debug("chat mode started")
+    await _chat_llm(text)
+
+
+async def _end_chat() -> None:
+    """Завершить режим общения, сохранить конспект и озвучить финал."""
+
+    global CHAT_MODE_ACTIVE, _chat_timer
+    if not CHAT_MODE_ACTIVE:
+        return
+    CHAT_MODE_ACTIVE = False
+    if _chat_timer is not None:
+        _chat_timer.cancel()
+        _chat_timer = None
+    conversation = "\n".join(
+        f"Пользователь: {u}\nАссистент: {r}" for u, r in CHAT_HISTORY
+    )
+    if conversation:
+        try:
+            summary = llm_engine.summarise(conversation, labels=["chat"])
+            daily_memory.add({"label": "chat", "text": summary})
+            log.debug("chat summary stored", extra={"ctx": {"summary": summary}})
+        except Exception:  # pragma: no cover - сбой памяти не критичен
+            log.exception("failed to store chat summary")
+    CHAT_HISTORY.clear()
+    try:
+        await speak_async("Режим общения завершён", preset="neutral")
+    except Exception:  # pragma: no cover - озвучка не критична
+        log.exception("failed to speak chat end")
 
 
 def process_suggestion_answer(text: str) -> None:
@@ -274,7 +356,7 @@ def is_exit_phrase(text: str) -> bool:
     """Распознать команду выхода из режима общения."""
 
     text = text.lower().strip()
-    phrases = ("закончим общение", "перейди в режим команд")
+    phrases = ("закончим общение", "перейди в режим команд", "хватит болтать")
     return any(p in text for p in phrases)
 
 
@@ -296,6 +378,18 @@ async def va_respond(voice: str) -> bool:
             return True
         process_suggestion_answer(text)
         return True
+
+    text = voice.strip()
+
+    # Если активирован режим общения, все реплики сразу отправляются в LLM
+    # без проверки слова активации.
+    if CHAT_MODE_ACTIVE:
+        if is_chat_stop_phrase(text):
+            await _end_chat()
+            return True
+        await _chat_llm(text)
+        return True
+
     cmd = extract_cmd(voice)
     if not cmd:
         return False
@@ -311,5 +405,6 @@ async def va_respond(voice: str) -> bool:
     raw_norm = normalize(raw)
     cmd_info = await recognize_cmd(raw_norm)
     if not cmd_info["cmd"] or cmd_info["percent"] < CMD_CONFIDENCE_THRESHOLD:
-        return False
+        await _start_chat(raw)
+        return True
     return await execute_cmd(cmd_info["cmd"], voice)
