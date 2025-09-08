@@ -105,3 +105,33 @@ def test_handle_utterance_passes_trace_id(monkeypatch):
 
     assert jarvis_skills.handle_utterance("тест") is True
     assert traces and len(traces[0]) == 32  # uuid.uuid4().hex имеет длину 32 символа
+
+
+def test_handle_utterance_refreshes_date(monkeypatch):
+    """Проверяем, что при каждой реплике актуализируется текущая дата."""
+
+    import types, sys, datetime as dt
+
+    fake_nlp = types.SimpleNamespace(normalize=lambda s: s)
+    monkeypatch.setitem(sys.modules, "core.nlp", fake_nlp)
+
+    import jarvis_skills
+
+    fake_voice = types.SimpleNamespace(send=lambda *a, **k: None)
+    monkeypatch.setitem(sys.modules, "notifiers.voice", fake_voice)
+
+    refreshed: list[dt.date] = []
+
+    def fake_refresh() -> dt.date:
+        refreshed.append(dt.date(2024, 4, 25))
+        return dt.date(2024, 4, 25)
+
+    monkeypatch.setattr(jarvis_skills, "current_date", types.SimpleNamespace(refresh=fake_refresh))
+
+    def fake_skill(text: str) -> str:
+        return "ok"
+
+    monkeypatch.setattr(jarvis_skills, "_loaded", [(["тест"], fake_skill)])
+
+    assert jarvis_skills.handle_utterance("тест") is True
+    assert refreshed  # убедились, что ``refresh`` был вызван

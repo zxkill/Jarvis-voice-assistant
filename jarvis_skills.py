@@ -25,6 +25,7 @@ from core.logging_json import configure_logging
 from core.nlp import normalize
 from core import llm_engine  # LLM для генерации кратких резюме
 from context import daily_memory  # Дневная память для событий дня
+from context import current_date  # Хранение актуальной календарной даты
 
 _MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -128,6 +129,9 @@ def load_all() -> None:
 # ─── Маршрутизация пользовательской реплики ──────────────────────────────
 def handle_utterance(text: str) -> bool:
     """Возвращает True, если какой-то скилл обработал реплику."""
+    # Актуализируем дату в контексте, чтобы ассистент не путал события
+    current_date.refresh()
+
     text_low = normalize(text).lower()
     best_func, best_score = None, 0
 
