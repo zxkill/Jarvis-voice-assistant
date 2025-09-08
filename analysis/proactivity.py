@@ -9,7 +9,7 @@ from typing import Any, Dict
 import yaml
 
 # Подключаем чтение статистики по отзывам на подсказки
-from memory.reader import get_feedback_stats
+from memory.reader import get_feedback_stats, was_event_triggered
 # Универсальные помощники для поиска дат событий пользователя
 from memory import events as user_events
 
@@ -90,9 +90,21 @@ def _handle_trigger(event: Event) -> None:
     final_prompt = f"{prompt}\nКонтекст: {context_json}" if context else prompt
     trace_id = event.attrs.get("trace_id")
     try:
-        text = llm_engine.act(final_prompt, trace_id=trace_id)
+        # Просим LLM вернуть JSON с полями ``code`` и ``text``. ``code`` служит
+        # идентификатором события, что позволяет отфильтровать дубликаты
+        # ещё до сохранения подсказки.
+        raw = llm_engine.act(final_prompt, trace_id=trace_id)
+        data = json.loads(raw)
+        code = str(data.get("code")) if data.get("code") is not None else ""
+        text = str(data.get("text", ""))
     except Exception as exc:  # pragma: no cover - диагностика сетевых ошибок
         log.exception("llm failure", extra={"ctx": {"err": str(exc)}})
+        return
+
+    # Если LLM вернул код события и он уже встречался недавно, пропускаем
+    # дальнейшую обработку, чтобы не спамить пользователя повторными советами.
+    if code and was_event_triggered(code):
+        log.info("event already triggered", extra={"ctx": {"code": code}})
         return
 
     # Фильтрация преждевременных поздравлений и других датированных событий
@@ -106,7 +118,7 @@ def _handle_trigger(event: Event) -> None:
             return
 
     # Сохраняем подсказку в БД, чтобы получить её уникальный идентификатор.
-    suggestion_id = add_suggestion(text, name)
+    suggestion_id = add_suggestion(text, code or name)
     if suggestion_id is None:
         log.info(
             "duplicate suggestion", extra={"ctx": {"text": text, "name": name}}
@@ -132,7 +144,7 @@ def _handle_trigger(event: Event) -> None:
             "suggestion.created",
             {
                 "text": text,
-                "reason_code": name,
+                "reason_code": code or name,
                 "suggestion_id": suggestion_id,
                 "trace_id": trace_id,
             },
