@@ -16,6 +16,7 @@ from core.logging_json import configure_logging
 from core import llm_engine
 from core.events import Event, publish, fire_proactive_trigger, subscribe
 from memory import db as memory_db
+from context import daily_memory  # Дневная память дневных событий
 
 # Отдельный логгер для задач планировщика
 log = configure_logging("scheduler")
@@ -70,6 +71,28 @@ def _run_nightly_reflection() -> None:
         )
     )
     log.info("daily digest notification sent")
+
+    # После формирования дайджеста переносим накопленные за день краткие
+    # воспоминания в долговременную память. Сначала извлекаем все записи
+    # дневной памяти, объединяем их и просим LLM выделить главное.
+    try:
+        records = daily_memory.fetch_all()
+        if records:
+            combined = "\n".join(r.get("text", "") for r in records)
+            labels = {r.get("label") for r in records if r.get("label")}
+            llm_engine.summarise(combined, labels=labels)
+            log.debug(
+                "daily memory reflected",
+                extra={"ctx": {"records": len(records), "labels": list(labels)}},
+            )
+    except Exception:
+        log.exception("failed to process daily memory")
+    finally:
+        try:
+            daily_memory.clear()
+        except Exception:
+            log.exception("failed to clear daily memory")
+
     # Уведомляем другие подсистемы, что ночная рефлексия завершена
     publish(Event(kind="nightly_reflection.done"))
 

@@ -23,6 +23,8 @@ import uuid  # для генерации trace_id уникальных запр�
 from rapidfuzz import fuzz   # уже есть в requirements.txt
 from core.logging_json import configure_logging
 from core.nlp import normalize
+from core import llm_engine  # LLM для генерации кратких резюме
+from context import daily_memory  # Дневная память для событий дня
 
 _MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -190,6 +192,25 @@ def handle_utterance(text: str) -> bool:
                     ctx_add({"trace_id": trace_id, "user": text, "reply": reply})
                 except Exception:  # pragma: no cover - контекст не критичен
                     pass
+
+                # После отправки ответа кратко конспектируем диалог и
+                # записываем его в дневную память. Это позволит
+                # ночной рефлексии собрать важные события дня и
+                # сохранить их в долговременном контексте.
+                try:
+                    summary = llm_engine.summarise(
+                        f"Пользователь: {text}\nАссистент: {reply}",
+                        labels=[best_func.__module__],
+                    )
+                    daily_memory.add({"label": best_func.__module__, "text": summary})
+                    log.debug(
+                        "daily memory updated",
+                        extra={"trace_id": trace_id, "label": best_func.__module__},
+                    )
+                except Exception:  # pragma: no cover - сохранение не критично
+                    log.exception(
+                        "failed to store daily memory", extra={"trace_id": trace_id}
+                    )
 
                 return True
         except Exception as e:
