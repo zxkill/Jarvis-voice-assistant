@@ -10,6 +10,8 @@ import yaml
 
 # Подключаем чтение статистики по отзывам на подсказки
 from memory.reader import get_feedback_stats
+# Универсальные помощники для поиска дат событий пользователя
+from memory import events as user_events
 
 from core.logging_json import configure_logging
 from core import llm_engine
@@ -93,8 +95,23 @@ def _handle_trigger(event: Event) -> None:
         log.exception("llm failure", extra={"ctx": {"err": str(exc)}})
         return
 
+    # Фильтрация преждевременных поздравлений и других датированных событий
+    t_low = text.lower()
+    if "с днем рождения" in t_low or "с днём рождения" in t_low:
+        # Проверяем, действительно ли праздник скоро наступит
+        if not user_events.is_event_soon("день рожд"):
+            log.info(
+                "skip birthday greeting", extra={"ctx": {"text": text, "name": name}}
+            )
+            return
+
     # Сохраняем подсказку в БД, чтобы получить её уникальный идентификатор.
     suggestion_id = add_suggestion(text, name)
+    if suggestion_id is None:
+        log.info(
+            "duplicate suggestion", extra={"ctx": {"text": text, "name": name}}
+        )
+        return
 
     log.info(
         "suggestion generated",

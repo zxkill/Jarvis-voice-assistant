@@ -7,6 +7,7 @@ import time
 from typing import Any
 from enum import Enum
 import logging
+import re
 
 from .db import get_connection, encrypt
 from .long_memory import store_event as _store_episodic_event
@@ -69,22 +70,57 @@ def end_session(session_id: int) -> None:
         )
 
 
-def add_suggestion(text: str, reason_code: str | None = None) -> int:
+def _fingerprint(text: str) -> str:
+    """Построить нормализованный отпечаток текста подсказки.
+
+    Для борьбы с дубликатами убираем пунктуацию, приводим к нижнему
+    регистру и заменяем типовые фразы вроде «с днём рождения» на
+    единый маркер. Это позволяет отсеивать подсказки с одинаковым
+    смыслом, даже если формулировка немного отличается.
+    """
+
+    text = text.lower()
+    replacements = {
+        r"с\s+дн[её]м\s+рожд\w*": "birthday",
+        r"поздравляю": "",
+    }
+    for pattern, repl in replacements.items():
+        text = re.sub(pattern, repl, text)
+    text = re.sub(r"[^a-zа-я0-9]+", " ", text)
+    return text.strip()
+
+
+def add_suggestion(text: str, reason_code: str | None = None) -> int | None:
     """Добавляет подсказку в очередь и возвращает её ID.
+
+    Если похожая подсказка уже отправлялась в течение суток, новая
+    запись не создаётся и возвращается ``None``.
 
     :param text: текст подсказки
     :param reason_code: код причины (тип подсказки) для последующего анализа
-    :return: идентификатор созданной записи
+    :return: идентификатор созданной записи или ``None`` при дубликате
     """
 
     ts = int(time.time())
+    fp = _fingerprint(text)
     logger.debug(
-        "Добавляем подсказку: text=%r reason_code=%r", text, reason_code
+        "Добавляем подсказку: text=%r reason_code=%r fp=%s", text, reason_code, fp
     )
     with get_connection() as conn:
+        # Проверяем наличие дубликата за последние 24 часа
+        row = conn.execute(
+            "SELECT id FROM suggestions WHERE fingerprint = ? AND ts > ?",
+            (fp, ts - 24 * 3600),
+        ).fetchone()
+        if row:
+            logger.info(
+                "Дубликат подсказки, пропускаем", extra={"ctx": {"id": row["id"]}}
+            )
+            return None
+
         cur = conn.execute(
-            "INSERT INTO suggestions (text, ts, reason_code) VALUES (?, ?, ?)",
-            (text, ts, reason_code),
+            "INSERT INTO suggestions (text, ts, reason_code, fingerprint) VALUES (?, ?, ?, ?)",
+            (text, ts, reason_code, fp),
         )
         suggestion_id = int(cur.lastrowid)
         logger.debug("Подсказка сохранена с id=%s", suggestion_id)
