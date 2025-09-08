@@ -235,18 +235,17 @@ class EmotionManager:
             self._publish_emotion(emotion, policy_res)
 
     def _on_weather_update(self, event: core_events.Event) -> None:
-        """Изменить настроение в зависимости от погоды.
+        """Применить влияние погоды на настроение через коэффициенты.
 
-        Простейшая эвристика: солнечная и тёплая погода улучшает настроение,
-        дождь или снег — ухудшают.  Конкретные значения можно подобрать в
-        конфигурации ``config/affect.yaml``.
+        Скилл ``weather_ru`` публикует событие ``weather.update`` с дельтами
+        по валентности и возбуждению.  Здесь мы просто передаём эти значения
+        в ``Mood.update``, сохраняя подробное логирование.
         """
-        condition = str(event.attrs.get("condition", "")).lower()
-        temp = float(event.attrs.get("temperature", 0))
-        if "rain" in condition or "snow" in condition:
-            self._update_mood(-1.0, -0.5, reason=f"weather {condition}")
-        elif "sun" in condition or temp >= 20:
-            self._update_mood(1.0, 0.5, reason=f"weather {condition}")
+        valence = float(event.attrs.get("valence", 0.0))
+        arousal = float(event.attrs.get("arousal", 0.0))
+        if valence or arousal:
+            self._update_mood(valence, arousal, reason="weather")
+
 
     # --------------------------------------- вспомогательные методы ---
 

@@ -19,6 +19,9 @@ import requests as _rq
 
 from display import DisplayItem, get_driver
 from core.logging_json import configure_logging
+from core import events as core_events
+from core.events import Event
+from context.short_term import add as ctx_add
 
 # ────────────────────────── LOGGING ──────────────────────────────
 log = configure_logging(__name__)
@@ -197,12 +200,72 @@ def _update_cache() -> None:
         _cache_data = data
         _cache_source = source
 
+
+def _calc_mood_coefficients(temp: int, cond: str) -> Tuple[float, float]:
+    """Рассчитать коэффициенты влияния погоды на настроение."""
+    valence = 0.0
+    arousal = 0.0
+    cond_l = cond.lower()
+    if any(w in cond_l for w in ["дожд", "ливень", "морось", "снег"]):
+        valence -= 1.0
+        arousal -= 0.5
+    elif any(w in cond_l for w in ["ясно", "солнечно"]):
+        valence += 0.5
+    if temp <= 0:
+        valence -= 0.5
+        arousal -= 0.5
+    elif temp >= 25:
+        valence += 0.5
+        arousal += 0.5
+    log.debug(
+        "Mood coefficients: valence=%+.2f arousal=%+.2f",
+        valence,
+        arousal,
+        extra={"ctx": {"temperature": temp, "condition": cond}},
+    )
+    return valence, arousal
+
+
+def _update_context(temp: int, cond: str) -> None:
+    """Опубликовать погодные данные в событийную шину и контекст."""
+    val, ar = _calc_mood_coefficients(temp, cond)
+    core_events.publish(Event(kind="weather.update", attrs={"valence": val, "arousal": ar}))
+    try:
+        ctx_add(
+            {
+                "source": "weather",
+                "temperature": temp,
+                "condition": cond,
+                "valence": val,
+                "arousal": ar,
+            }
+        )
+    except Exception:
+        log.exception("Не удалось добавить погодные данные в контекст")
+    log.info(
+        "Weather context updated",
+        extra={
+            "ctx": {
+                "temperature": temp,
+                "condition": cond,
+                "valence": val,
+                "arousal": ar,
+            }
+        },
+    )
+
 # ────────────────────────── PUBLIC API ───────────────────────────
 
 def handle(text: str) -> str:
     """Основной скилл‑хендлер."""
     offset = _detect_offset(text)
     answer = _build_answer(offset)
+    # Дополнительно формируем подсказки и публикуем контекст
+    temp, cond = _conditions(offset)
+    hint = _clothing_hint(temp, cond)
+    if hint:
+        answer = f"{answer} {hint}"
+    _update_context(temp, cond)
     log.info("Weather answer: %s", answer)
     return answer
 
@@ -214,6 +277,9 @@ def auto_update():
     log.debug("Display update: %d°C %s", temp, icon)
     drv = get_driver()
     drv.draw(DisplayItem(kind="weather", payload=f"{temp:02d}°C {icon}"))
+    # Также сообщаем о погоде в контекст и эмоции
+    temp_c, cond = _conditions(0)
+    _update_context(temp_c, cond)
 
 # ────────────────────────── INTERNALS ────────────────────────────
 
@@ -242,6 +308,70 @@ def _current_for_display() -> Tuple[int, str]:
         return 0, ""
 
 
+def _conditions_wttr(data, offset: int) -> Tuple[int, str]:
+    """Извлечь температуру и описание погоды из ответа wttr.in."""
+    if offset == 0:
+        cur = data["current_condition"][0]
+        temp = round(float(cur["temp_C"]))
+        cond_ru = _wttr_desc(cur)
+    else:
+        daily = data["weather"][offset]
+        tmax = round(float(daily["maxtempC"]))
+        tmin = round(float(daily["mintempC"]))
+        temp = round((tmax + tmin) / 2)
+        cond_ru = _wttr_desc(daily["hourly"][4 if len(daily["hourly"]) > 4 else 0])
+    return temp, cond_ru
+
+
+def _conditions_openmeteo(data, offset: int) -> Tuple[int, str]:
+    """Извлечь температуру и описание погоды из Open‑Meteo."""
+    if offset == 0:
+        temp = round(data["current"]["temperature_2m"])
+        code = data["current"]["weather_code"]
+    else:
+        idx = offset
+        tmax = data["daily"]["temperature_2m_max"][idx]
+        tmin = data["daily"]["temperature_2m_min"][idx]
+        temp = round((tmax + tmin) / 2)
+        code = data["daily"]["weather_code"][idx]
+    cond_ru = WEATHER_CODES_RU.get(code, "")
+    return temp, cond_ru
+
+
+def _conditions(offset: int = 0) -> Tuple[int, str]:
+    """Получить температуру и словесное описание погоды из кэша."""
+    with _cache_lock:
+        data = _cache_data
+        source = _cache_source
+    if not data:
+        _update_cache()
+        with _cache_lock:
+            data = _cache_data
+            source = _cache_source
+    if source == "wttr":
+        return _conditions_wttr(data, offset)
+    return _conditions_openmeteo(data, offset)
+
+
+def _clothing_hint(temp: int, cond: str) -> str:
+    """Сформировать подсказку по одежде и необходимости зонта."""
+    cond_l = cond.lower()
+    hints = []
+    if temp <= 0:
+        hints.append("оденься теплее")
+    elif temp < 15:
+        hints.append("возьми лёгкую куртку")
+    elif temp >= 25:
+        hints.append("надень что-нибудь полегче")
+    if any(w in cond_l for w in ["дожд", "ливень", "морось"]):
+        hints.append("не забудь зонт")
+    elif "снег" in cond_l:
+        hints.append("захвати зонт")
+    if hints:
+        return (" ".join(hints)).capitalize() + "."
+    return ""
+
+
 def _build_answer(offset: int = 0) -> str:
     with _cache_lock:
         data = _cache_data
@@ -257,3 +387,7 @@ def _build_answer(offset: int = 0) -> str:
         return _build_answer_wttr(CITY, data, offset)
     log.debug("Using Open‑Meteo cached data")
     return _build_answer_openmeteo(CITY, data, offset)
+
+
+# Экспортируем функцию для тестов и других модулей
+calc_mood_coefficients = _calc_mood_coefficients
