@@ -18,14 +18,16 @@ from core.nlp import normalize
 from working_tts import speak_async
 from core.request_source import get_request_source
 from core.logging_json import configure_logging
-from core import events as core_events
+from core import events as core_events, llm_engine
 from memory.writer import add_suggestion_feedback
+from memory.db import get_connection
 from proactive.engine import (
     is_awaiting_response,
     pop_awaiting,
     classify_feedback,
 )
 from core.metrics import inc_metric
+from context import daily_memory  # Дневная память для конспектов
 
 # Инициализируем модульный логгер, чтобы отслеживать процесс разбора команд.
 log = configure_logging("app.command_processing")
@@ -138,6 +140,39 @@ def process_suggestion_answer(text: str) -> None:
     except Exception:
         log.exception(
             "failed to send ack", extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}}
+        )
+
+    # После отправки реакции фиксируем краткое резюме разговора и сохраняем
+    # его в дневную память с меткой исходной подсказки. Это позволяет позже
+    # агрегировать события дня и перенести их в долговременный контекст.
+    try:
+        reason_code = ""
+        try:
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT reason_code FROM suggestions WHERE id = ?",
+                    (suggestion_id,),
+                ).fetchone()
+            if row and row["reason_code"]:
+                reason_code = str(row["reason_code"])
+        except Exception:
+            log.exception(
+                "failed to fetch reason_code",
+                extra={"ctx": {"suggestion_id": suggestion_id}},
+            )
+        summary = llm_engine.summarise(
+            f"Подсказка: {suggestion_text}\nОтвет: {text}\nРеакция: {reply_text}",
+            labels=[reason_code] if reason_code else None,
+        )
+        daily_memory.add({"label": reason_code or "suggestion", "text": summary})
+        log.debug(
+            "daily memory updated after suggestion",
+            extra={"ctx": {"suggestion_id": suggestion_id, "label": reason_code}},
+        )
+    except Exception:
+        log.exception(
+            "failed to store suggestion summary",
+            extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}},
         )
 
 

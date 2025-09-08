@@ -93,11 +93,13 @@ def _fingerprint(text: str) -> str:
 def add_suggestion(text: str, reason_code: str | None = None) -> int | None:
     """Добавляет подсказку в очередь и возвращает её ID.
 
-    Если похожая подсказка уже отправлялась в течение суток, новая
-    запись не создаётся и возвращается ``None``.
+    В актуальной версии уникальность подсказок контролируется по полю
+    ``reason_code``. Если подсказка с таким кодом уже была отправлена в
+    течение последних суток, новая запись не создаётся. Анализ текста
+    больше не выполняется, что ускоряет проверку.
 
     :param text: текст подсказки
-    :param reason_code: код причины (тип подсказки) для последующего анализа
+    :param reason_code: уникальный код события, порождающего подсказку
     :return: идентификатор созданной записи или ``None`` при дубликате
     """
 
@@ -107,16 +109,18 @@ def add_suggestion(text: str, reason_code: str | None = None) -> int | None:
         "Добавляем подсказку: text=%r reason_code=%r fp=%s", text, reason_code, fp
     )
     with get_connection() as conn:
-        # Проверяем наличие дубликата за последние 24 часа
-        row = conn.execute(
-            "SELECT id FROM suggestions WHERE fingerprint = ? AND ts > ?",
-            (fp, ts - 24 * 3600),
-        ).fetchone()
-        if row:
-            logger.info(
-                "Дубликат подсказки, пропускаем", extra={"ctx": {"id": row["id"]}}
-            )
-            return None
+        if reason_code:
+            # Проверяем, не встречался ли этот код события за последние сутки
+            row = conn.execute(
+                "SELECT id FROM suggestions WHERE reason_code = ? AND ts > ?",
+                (reason_code, ts - 24 * 3600),
+            ).fetchone()
+            if row:
+                logger.info(
+                    "Повтор события, подсказка не сохраняется",
+                    extra={"ctx": {"reason_code": reason_code, "id": row["id"]}},
+                )
+                return None
 
         cur = conn.execute(
             "INSERT INTO suggestions (text, ts, reason_code, fingerprint) VALUES (?, ?, ?, ?)",
