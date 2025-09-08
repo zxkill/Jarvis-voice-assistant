@@ -14,6 +14,8 @@ from core import llm_engine
 from memory import db
 from notifiers import voice
 from display import get_driver, DisplayItem
+from skills.holiday_ru import is_day_off
+from skills.holiday_ru import is_day_off
 
 log = configure_logging("emotion.manager")
 
@@ -74,13 +76,39 @@ class EmotionManager:
         # Сигнал от планировщика о завершении ночной рефлексии
         core_events.subscribe("nightly_reflection.done", self._on_nightly_reflection)
 
+    # ------------------------------------------------------------------
+    def _apply_holiday_bonus(self) -> bool:
+        """Повысить настроение в праздничные и выходные дни.
+
+        Возвращает ``True``, если настроение было изменено.  В противном
+        случае метод ничего не делает и возвращает ``False``.
+        """
+
+        try:
+            flag, name = is_day_off()
+        except Exception as exc:  # pragma: no cover - отказ сети маловероятен
+            log.exception("holiday check failed", extra={"ctx": {"err": str(exc)}})
+            return False
+        if not flag:
+            log.debug("сегодня рабочий день")
+            return False
+
+        # Повышаем настроение и фиксируем факт в логах
+        reason = f"holiday {name}" if name else "day off"
+        log.info("holiday mood boost", extra={"ctx": {"name": name}})
+        self._update_mood(1.0, 0.5, reason=reason)
+        return True
+
     def start(self) -> None:
         """Опубликовать начальное состояние.
 
-        Без вызова этой функции внешний мир не узнает, какая эмоция
-        активна при запуске ассистента.
+        Перед запуском проверяем, не является ли текущий день праздником
+        или выходным.  При обнаружении хорошего повода настроение
+        повышается, и обновлённая эмоция публикуется сразу.
         """
-        self._publish_emotion(self._state.current)
+        changed = self._apply_holiday_bonus()
+        if not changed:
+            self._publish_emotion(self._state.current)
         self._reset_idle_timer()
 
     def stop(self) -> None:  # pragma: no cover - для совместимости API
