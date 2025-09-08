@@ -47,7 +47,11 @@ def test_compose_context_includes_current_datetime(monkeypatch):
     monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: [])
 
     ctx = llm_engine._compose_context()
-    assert ctx == "Сейчас 2024-04-25 15:30:00"
+    expected = (
+        "Текущая дата 25.04.2024, время 15:30:00. "
+        "Используй именно её при ответах, даже если ранее упоминались другие даты."
+    )
+    assert ctx == expected
 
 
 def test_compose_context_refreshes_date(monkeypatch):
