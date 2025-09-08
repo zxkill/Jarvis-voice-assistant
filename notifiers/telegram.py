@@ -11,6 +11,7 @@ import requests
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
 from core.config import load_config
+from utils.reply import extract_reply
 
 log = configure_logging("notifiers.telegram")
 # Счётчик неудачных попыток отправки сообщений.
@@ -35,11 +36,17 @@ class TelegramNotifier:
         self._user_id = user_id
 
     def send(self, text: str) -> None:
-        """Отправить сообщение *text* владельцу."""
+        """Отправить сообщение *text* владельцу.
+
+        Если *text* представляет собой JSON с полем ``reply``,
+        в Telegram отправляется только значение этого поля.
+        """
+        clean = extract_reply(text)
+        log.debug("telegram send text=%r", clean)
         try:
             resp = requests.post(
                 self._api,
-                json={"chat_id": self._user_id, "text": text},
+                json={"chat_id": self._user_id, "text": clean},
                 timeout=5,
             )
             data = resp.json()

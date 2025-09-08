@@ -373,14 +373,21 @@ async def speak_async(
 ) -> None:
     """Неблокирующая озвучка: `working_tts` выполняется в пуле потоков."""
     from core.request_source import get_request_source
+    from utils.reply import extract_reply
+
+    # Извлекаем текст ответа из возможного JSON.
+    clean = extract_reply(text)
+    if clean != text:
+        log.debug("tts extracted reply: %r", clean)
+
     if get_request_source() == "telegram":
         try:
             import importlib
             from core.metrics import inc_metric
 
             tg = importlib.import_module("notifiers.telegram")
-            tg.send(text)
-            log.info("telegram reply text=%r", text)
+            tg.send(clean)
+            log.info("telegram reply text=%r", clean)
             inc_metric("telegram.outgoing")
         except Exception as exc:  # pragma: no cover - защищаемся от сетевых ошибок
             log.warning("telegram reply failed: %s", exc)
@@ -390,7 +397,7 @@ async def speak_async(
     from functools import partial
 
     loop = loop or asyncio.get_running_loop()
-    func = partial(working_tts, text, preset=preset, pitch=pitch, speed=speed, emotion=emotion)
+    func = partial(working_tts, clean, preset=preset, pitch=pitch, speed=speed, emotion=emotion)
     # Используем отдельный executor, чтобы не блокировать поток
     # чтения с микрофона, работающий через asyncio.to_thread
     await loop.run_in_executor(_EXECUTOR, func)

@@ -59,7 +59,7 @@ def test_telegram_notifier_send_success(monkeypatch):
     monkeypatch.setattr(telegram, "inc_metric", fake_inc_metric)
 
     notifier = telegram.TelegramNotifier("TOKEN", 123)
-    notifier.send("hello")
+    notifier.send('{"reply": "hello"}')
 
     assert metric_calls["count"] == 0
     assert sent["url"].endswith("/sendMessage")
@@ -119,7 +119,7 @@ def test_voice_send_processes_queue(monkeypatch):
                 await voice._worker_task
             voice._worker_task = None
 
-        voice.send("test")
+        voice.send('{"reply": "test"}')
         assert voice._worker_task is not None
 
         await asyncio.wait_for(voice._queue.join(), timeout=1)
@@ -332,4 +332,50 @@ def test_voice_skips_tts_for_telegram_source(monkeypatch):
 
     assert sent == ["hi"]
     assert spoken == []
+    sys.modules.pop("working_tts", None)
+
+
+def test_voice_forwards_reply_json_to_telegram(monkeypatch):
+    """При запросе из Telegram в сообщение отправляется только поле reply."""
+    voice = _load_voice(monkeypatch)
+    sent = []
+
+    async def fake_speak_async(text, **kwargs):
+        raise AssertionError("TTS не должен вызываться")
+
+    async def run_test():
+        monkeypatch.setattr(voice, "speak_async", fake_speak_async)
+        monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
+        monkeypatch.setattr(voice, "inc_metric", lambda name: None)
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram",
+            SimpleNamespace(send=lambda text: sent.append(text)),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "notifiers.telegram_listener",
+            SimpleNamespace(is_active=lambda: True, USER_ID=123),
+        )
+
+        voice._queue = asyncio.Queue()
+        if voice._worker_task is not None:
+            voice._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await voice._worker_task
+            voice._worker_task = None
+
+        token = set_request_source("telegram")
+        voice.send('{"reply": "привет"}')
+        await asyncio.wait_for(voice._queue.join(), timeout=1)
+        reset_request_source(token)
+
+        voice._worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await voice._worker_task
+        voice._worker_task = None
+
+    asyncio.run(run_test())
+
+    assert sent == ["привет"]
     sys.modules.pop("working_tts", None)
