@@ -1,3 +1,13 @@
+import types
+import sys
+
+# Заглушки зависимостей, требующих PortAudio и TTS
+sys.modules.setdefault("sounddevice", types.SimpleNamespace())
+sys.modules.setdefault(
+    "working_tts",
+    types.SimpleNamespace(stop_speaking=lambda: None, speak_async=lambda *a, **k: None),
+)
+
 import core.events as core_events
 from core.events import Event
 from emotion.manager import EmotionManager
@@ -66,8 +76,11 @@ def test_presence_absence(manager):
     assert events[-1] == Emotion.SAD
 
 
-def test_weather_rain(manager):
+def test_weather_coefficients(manager):
+    """Негативные коэффициенты погоды должны делать эмоцию грустной."""
     mgr, events = manager
-    core_events.publish(Event(kind="weather.update", attrs={"condition": "rain"}))
+    core_events.publish(
+        Event(kind="weather.update", attrs={"valence": -1.0, "arousal": -0.5})
+    )
     assert events[-1] == Emotion.SAD
 
