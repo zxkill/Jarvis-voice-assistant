@@ -22,12 +22,13 @@ class PolicyConfig:
         запрещено проигрывать голосовые уведомления.
     suggestion_min_interval_min:
         Минимальный интервал в минутах между подсказками. Используется
-        для троттлинга отправок.
+        для троттлинга отправок. По умолчанию установлен в ``1`` минуту,
+        чтобы ассистент не «спамил» рекомендациями.
     """
 
     force_telegram: bool = False
     silence_window: tuple[dt.time, dt.time] | None = None
-    suggestion_min_interval_min: float = 0.0
+    suggestion_min_interval_min: float = 1.0
     # Максимальное количество подсказок в сутки
     daily_limit: int | None = None
     # Ключевые слова, по которым подсказка отменяется

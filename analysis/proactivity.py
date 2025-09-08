@@ -14,6 +14,10 @@ from memory.reader import get_feedback_stats
 from core.logging_json import configure_logging
 from core import llm_engine
 from core.events import Event, publish, subscribe
+# Сохраняем сгенерированные подсказки в базу, чтобы позже учитывать
+# реакцию пользователя. Это обеспечивает уникальный ``suggestion_id``
+# для каждой реплики и позволяет адаптировать политику.
+from memory.writer import add_suggestion
 
 log = configure_logging("analysis.proactivity")
 
@@ -88,11 +92,35 @@ def _handle_trigger(event: Event) -> None:
     except Exception as exc:  # pragma: no cover - диагностика сетевых ошибок
         log.exception("llm failure", extra={"ctx": {"err": str(exc)}})
         return
+
+    # Сохраняем подсказку в БД, чтобы получить её уникальный идентификатор.
+    suggestion_id = add_suggestion(text, name)
+
     log.info(
         "suggestion generated",
-        extra={"ctx": {"name": name, "trace_id": trace_id}},
+        extra={
+            "ctx": {
+                "name": name,
+                "suggestion_id": suggestion_id,
+                "trace_id": trace_id,
+            }
+        },
     )
-    publish(Event("suggestion.created", {"text": text, "reason_code": name}))
+
+    # Публикуем событие с текстом подсказки и ``suggestion_id``. Наличие
+    # идентификатора позволяет ``ProactiveEngine`` войти в режим ожидания
+    # ответа и корректно обрабатывать фидбэк пользователя.
+    publish(
+        Event(
+            "suggestion.created",
+            {
+                "text": text,
+                "reason_code": name,
+                "suggestion_id": suggestion_id,
+                "trace_id": trace_id,
+            },
+        )
+    )
 
 
 # Подписываемся на события триггеров при импортировании модуля.
