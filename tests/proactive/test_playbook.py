@@ -26,14 +26,21 @@ def test_trigger_generates_suggestion(monkeypatch):
 
     monkeypatch.setattr(proactivity.llm_engine, "act", fake_act)
 
+    # Подменяем сохранение в БД, чтобы тест был детерминированным
+    monkeypatch.setattr(proactivity, "add_suggestion", lambda text, code: 42)
+
     captured = {}
 
     def on_suggestion(event: events.Event) -> None:
         captured["text"] = event.attrs["text"]
+        captured["id"] = event.attrs["suggestion_id"]
 
+    events._subscribers.clear()
+    events.subscribe("proactivity.trigger", proactivity._handle_trigger)
     events.subscribe("suggestion.created", on_suggestion)
     events.fire_proactive_trigger("time", "morning_briefing")
     assert captured["text"] == "Привет"
+    assert captured["id"] == 42
     assert "утренний" in calls["prompt"].lower()
 
 

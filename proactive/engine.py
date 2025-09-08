@@ -9,6 +9,8 @@ from __future__ import annotations
 """
 
 import threading
+import json
+import logging
 
 from core.logging_json import configure_logging
 from core.metrics import inc_metric, set_metric
@@ -16,6 +18,7 @@ from proactive.policy import Policy
 from memory.db import get_connection
 from memory.writer import add_suggestion_feedback
 from core import events as core_events
+from core import llm_engine
 
 # Глобальная ссылка на последний созданный экземпляр движка.
 _engine_instance: "ProactiveEngine | None" = None
@@ -48,6 +51,32 @@ def pop_awaiting() -> dict | None:
     return info
 
 
+def classify_feedback(suggestion_text: str, user_text: str, trace_id: str | None = None) -> tuple[bool, str]:
+    """Оценить ответ пользователя с помощью LLM.
+
+    Возвращает кортеж ``(accepted, reply)``. Если LLM недоступна,
+    используется простая эвристика, а ``reply`` может оказаться пустым.
+    """
+
+    log = logging.getLogger("proactive.feedback")
+    prompt = (
+        "Подсказка ассистента: {s}\n"
+        "Ответ пользователя: {u}\n"
+        "Определи, положительный или отрицательный ответ. "
+        "Верни JSON с полями accepted (true/false) и reply — краткая реакция."
+    ).format(s=suggestion_text, u=user_text)
+    try:
+        result = llm_engine.think(prompt, trace_id=trace_id or "")
+        data = json.loads(result)
+        accepted = bool(data.get("accepted"))
+        reply = str(data.get("reply", ""))
+        return accepted, reply
+    except Exception as exc:  # pragma: no cover - fallback используется редко
+        log.exception("llm classification failed", extra={"ctx": {"err": str(exc)}})
+        accepted = ProactiveEngine._is_positive(user_text)
+        return accepted, ""
+
+
 class ProactiveEngine:
     """Обрабатывает проактивные подсказки и отправляет их пользователю."""
 
@@ -55,7 +84,7 @@ class ProactiveEngine:
         self,
         policy: Policy,
         *,
-        response_timeout_sec: int = 10,
+        response_timeout_sec: int = 120,
     ) -> None:
         # ``policy`` определяет канал доставки подсказок.
         self.policy = policy
@@ -159,7 +188,9 @@ class ProactiveEngine:
             self._mark_processed(suggestion_id)
             # Если у подсказки есть ID — ожидаем ответ пользователя.
             if suggestion_id:
-                self._await_response(suggestion_id, text, trace_id)
+                # Запускаем режим ожидания ответа, передавая канал доставки,
+                # чтобы потом знать, как отвечать пользователю.
+                self._await_response(suggestion_id, text, channel, trace_id)
 
     # ------------------------------------------------------------------
     def _send(
@@ -217,12 +248,13 @@ class ProactiveEngine:
 
     # ------------------------------------------------------------------
     def _await_response(
-        self, suggestion_id: int, text: str, trace_id: str | None = None
+        self, suggestion_id: int, text: str, channel: str, trace_id: str | None = None
     ) -> None:
         """Перейти в режим ожидания ответа пользователя.
 
         :param suggestion_id: идентификатор подсказки в БД
         :param text: текст, который был отправлен пользователю
+        :param channel: канал, через который подсказка была доставлена
         :param trace_id: уникальный идентификатор диалога, может отсутствовать
 
         Запускается таймер и публикуется событие изменения контекста,
@@ -239,6 +271,8 @@ class ProactiveEngine:
         self._awaiting = {
             "id": suggestion_id,
             "text": text,
+             # Канал доставки исходной подсказки, нужен для ответного уведомления
+            "channel": channel,
             "timer": timer,
             # Если идентификатор не передан, сохраняем пустую строку, чтобы
             # дальнейший код мог безопасно использовать поле без проверок
@@ -289,12 +323,14 @@ class ProactiveEngine:
         if not text:
             return
         suggestion_id = self._awaiting["id"]
+        suggestion_text = self._awaiting.get("text", "")
         trace_id = self._awaiting.get("trace_id")
         timer = self._awaiting.get("timer")
         if timer:
             timer.cancel()
         self._awaiting = None
-        accepted = self._is_positive(text)
+        # Анализируем ответ пользователя через LLM, чтобы понять отношение
+        accepted, reply = classify_feedback(suggestion_text, text, trace_id)
         # Сохраняем отзыв и публикуем событие для остальных компонентов.
         add_suggestion_feedback(suggestion_id, text, accepted)
         core_events.publish(
@@ -347,16 +383,14 @@ class ProactiveEngine:
             inc_metric("suggestions.accepted")
         else:
             inc_metric("suggestions.declined")
-        # После фиксации ответа отправляем пользователю небольшое подтверждение
-        # в Telegram, чтобы он видел, что система приняла реплику.  Это помогает
-        # при удалённом управлении и упрощает отладку.
+        # Формируем текст ответа: используем реакцию от LLM либо дефолтную фразу
+        reply_text = reply or ("Отлично, записал" if accepted else "Хорошо, отложим")
+        # После фиксации ответа отправляем подтверждение в Telegram, чтобы
+        # пользователь видел, что система приняла реплику.
         try:
             from notifiers import telegram as notifier
 
-            reply = (
-                "Отлично, записал" if accepted else "Хорошо, отложим"
-            )
-            notifier.send(reply)
+            notifier.send(reply_text)
             self.log.debug(
                 "ack sent",
                 extra={

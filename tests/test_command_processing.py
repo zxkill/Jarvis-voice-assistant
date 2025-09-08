@@ -20,7 +20,11 @@ def _load_cp(monkeypatch):
 
     dummy_skills = SimpleNamespace(handle_utterance=lambda cmd: False)
     dummy_nlp = SimpleNamespace(normalize=lambda x: x)
-    dummy_tts = SimpleNamespace(speak_async=lambda *a, **k: None)
+
+    async def _dummy_speak(*a, **k):
+        return None
+
+    dummy_tts = SimpleNamespace(speak_async=_dummy_speak)
     monkeypatch.setitem(sys.modules, "jarvis_skills", dummy_skills)
     monkeypatch.setitem(sys.modules, "core.nlp", dummy_nlp)
     monkeypatch.setitem(sys.modules, "working_tts", dummy_tts)
@@ -93,7 +97,7 @@ def test_suggestion_answer_bypasses_handlers(monkeypatch):
     )
 
     # Имитируем ожидание ответа на подсказку.
-    engine._await_response(1, "выпей воды")
+    engine._await_response(1, "выпей воды", "voice")
 
     called = {"skill": False, "cmd": False}
     monkeypatch.setattr(
@@ -119,8 +123,11 @@ def test_suggestion_answer_bypasses_handlers(monkeypatch):
 
     core_events.subscribe("suggestion.response", lambda e: events.append(e))
 
+    # Подменяем анализ ответа, чтобы не дергать реальную LLM
+    monkeypatch.setattr(cp, "classify_feedback", lambda *a, **k: (True, ""))
+
     async def run():
-        assert await cp.va_respond("джарвис ок") is True
+        assert await cp.va_respond("ок") is True
 
     asyncio.run(run())
 
@@ -128,4 +135,30 @@ def test_suggestion_answer_bypasses_handlers(monkeypatch):
     assert called["cmd"] is False
     assert feedback == [(1, "ок", True)]
     assert events and events[0].attrs["suggestion_id"] == 1
+
+
+def test_exit_conversation(monkeypatch):
+    """Фраза "закончим общение" должна отменять режим ожидания."""
+
+    cp = _load_cp(monkeypatch)
+
+    from proactive.engine import ProactiveEngine, is_awaiting_response
+    from proactive.policy import Policy, PolicyConfig
+
+    class DummyPolicy(Policy):
+        def __init__(self) -> None:
+            super().__init__(PolicyConfig())
+
+        def choose_channel(self, present: bool, *, now=None, text: str | None = None):  # type: ignore[override]
+            return "voice"
+
+    engine = ProactiveEngine(DummyPolicy(), response_timeout_sec=1)
+    engine._await_response(2, "выпей воды", "voice")
+
+    async def run():
+        assert await cp.va_respond("закончим общение") is True
+
+    asyncio.run(run())
+
+    assert is_awaiting_response() is False
 

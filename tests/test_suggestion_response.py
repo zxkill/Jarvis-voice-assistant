@@ -76,13 +76,17 @@ def test_positive_response_speech(monkeypatch):
         types.SimpleNamespace(handle_utterance=lambda cmd: False, set_main_loop=lambda loop: None),
     )
     sys.modules.setdefault("core.nlp", types.SimpleNamespace(normalize=lambda x: x))
-    sys.modules.setdefault("working_tts", types.SimpleNamespace(speak_async=lambda *a, **k: None))
+    async def _dummy_speak(*a, **k):
+        return None
+
+    sys.modules.setdefault("working_tts", types.SimpleNamespace(speak_async=_dummy_speak))
     import app.command_processing as cp
 
     monkeypatch.setattr(cp, "handle_utterance", lambda cmd: False)
     monkeypatch.setattr(cp, "execute_cmd", lambda cmd, voice: False)
     monkeypatch.setattr(cp, "normalize", lambda x: x)
     monkeypatch.setattr(cp, "add_suggestion_feedback", lambda sid, text, acc: feedback.append((sid, text, acc)))
+    monkeypatch.setattr(cp, "classify_feedback", lambda *a, **k: (True, ""))
 
     trace_id = "test-trace-positive"
     core_events.publish(
@@ -94,7 +98,7 @@ def test_positive_response_speech(monkeypatch):
 
     # Ответ пользователя обрабатывается через ``va_respond`` и не попадает
     # в общую цепочку команд.
-    asyncio.run(cp.va_respond("джарвис ок"))
+    asyncio.run(cp.va_respond("ок"))
 
     assert feedback == [(1, "ок", True)]
     assert events and events[0].attrs["accepted"] is True
@@ -116,6 +120,7 @@ def test_negative_response_telegram(monkeypatch):
         "proactive.engine.add_suggestion_feedback",
         lambda sid, text, acc: feedback.append((sid, text, acc)),
     )
+    monkeypatch.setattr("proactive.engine.classify_feedback", lambda *a, **k: (False, ""))
     trace_id = "test-trace-negative"
     core_events.publish(
         core_events.Event(
@@ -148,6 +153,7 @@ def test_positive_response_telegram(monkeypatch):
     )
     fake_tg = types.SimpleNamespace(send=lambda text: acks.append(text))
     monkeypatch.setitem(sys.modules, "notifiers.telegram", fake_tg)
+    monkeypatch.setattr("proactive.engine.classify_feedback", lambda *a, **k: (True, "Отлично"))
 
     core_events.publish(
         core_events.Event(
@@ -160,7 +166,7 @@ def test_positive_response_telegram(monkeypatch):
     )
 
     assert feedback == [(5, "да", True)]
-    assert acks and "записал" in acks[0].lower()
+    assert acks == ["Отлично"]
 
 
 def test_response_timeout(monkeypatch):

@@ -20,7 +20,11 @@ from core.request_source import get_request_source
 from core.logging_json import configure_logging
 from core import events as core_events
 from memory.writer import add_suggestion_feedback
-from proactive.engine import is_awaiting_response, pop_awaiting
+from proactive.engine import (
+    is_awaiting_response,
+    pop_awaiting,
+    classify_feedback,
+)
 from core.metrics import inc_metric
 
 # Инициализируем модульный логгер, чтобы отслеживать процесс разбора команд.
@@ -52,20 +56,6 @@ ACTIVATION_CONFIDENCE = 65
 VA_CMD_LIST: Dict[str, List[str]] = {}
 
 
-def _is_positive_answer(text: str) -> bool:
-    """Определить, является ли ответ пользователя согласием."""
-
-    text = text.lower()
-    positives = ("да", "ок", "хорошо", "ладно")
-    negatives = ("нет", "не", "потом", "позже")
-    if any(word in text for word in positives):
-        return True
-    if any(word in text for word in negatives):
-        return False
-    # По умолчанию считаем ответ отрицательным.
-    return False
-
-
 def process_suggestion_answer(text: str) -> None:
     """Обработать ответ пользователя на проактивную подсказку."""
 
@@ -80,7 +70,10 @@ def process_suggestion_answer(text: str) -> None:
         "processing suggestion answer",
         extra={"ctx": {"suggestion_id": suggestion_id, "text": text, "trace_id": trace_id}},
     )
-    accepted = _is_positive_answer(text)
+    suggestion_text = awaiting.get("text", "")
+    channel = awaiting.get("channel", "telegram")
+    # Запрашиваем у LLM анализ ответа: определяем отношение и возможную реакцию.
+    accepted, reply = classify_feedback(suggestion_text, text, trace_id)
     # Сохраняем отзыв пользователя в памяти.
     add_suggestion_feedback(suggestion_id, text, accepted)
     # Фиксируем метрики реакции пользователя
@@ -131,6 +124,21 @@ def process_suggestion_answer(text: str) -> None:
             }
         },
     )
+
+    # Отправляем пользователю реакцию: голосом или через Telegram
+    reply_text = reply or ("Отлично, записал" if accepted else "Хорошо, отложим")
+    try:
+        if channel == "voice":
+            # Планируем асинхронное озвучивание, чтобы не блокировать поток
+            asyncio.create_task(speak_async(reply_text))
+        else:
+            from notifiers import telegram as notifier
+
+            notifier.send(reply_text)
+    except Exception:
+        log.exception(
+            "failed to send ack", extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}}
+        )
 
 
 async def execute_cmd(cmd: str, voice: str) -> bool:
@@ -227,6 +235,14 @@ def contains_stop(text: str) -> bool:
     return False
 
 
+def is_exit_phrase(text: str) -> bool:
+    """Распознать команду выхода из режима общения."""
+
+    text = text.lower().strip()
+    phrases = ("закончим общение", "перейди в режим команд")
+    return any(p in text for p in phrases)
+
+
 async def va_respond(voice: str) -> bool:
     """Главная реакция ассистента на распознанный текст.
 
@@ -236,14 +252,18 @@ async def va_respond(voice: str) -> bool:
        набором встроенных команд.
     Возвращает ``True``, если что‑то было выполнено.
     """
+    # Сначала проверяем, не ждёт ли система ответа на подсказку.
+    if is_awaiting_response():
+        text = voice.strip()
+        if is_exit_phrase(text):
+            pop_awaiting()
+            await speak_async("Режим общения завершён", preset="neutral")
+            return True
+        process_suggestion_answer(text)
+        return True
     cmd = extract_cmd(voice)
     if not cmd:
         return False
-    # Если ``ProactiveEngine`` ждёт ответа на подсказку, обрабатываем его
-    # отдельно и выходим, чтобы не запускать обычный пайплайн команд.
-    if is_awaiting_response():
-        process_suggestion_answer(cmd)
-        return True
     # Сохраняем текущий event loop, чтобы jarvis_skills мог
     # безопасно отправлять ответы из побочного потока.
     getattr(jarvis_skills, "set_main_loop", lambda loop: None)(
