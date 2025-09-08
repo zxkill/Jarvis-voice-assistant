@@ -17,10 +17,11 @@ import json
 from pathlib import Path
 from typing import Iterable
 import os
+import datetime as dt  # получение текущих даты и времени
 
 import requests
 
-from context import long_term, short_term
+from context import long_term, short_term, current_date
 from memory import long_memory, preferences
 
 logger = logging.getLogger(__name__)
@@ -169,8 +170,24 @@ def _load_prompt(name: str) -> str:
 
 
 def _compose_context() -> str:
-    """Собрать краткосрочный контекст в одну строку."""
-    return "\n".join(map(str, short_term.get_last()))
+    """Собрать краткосрочный контекст вместе с текущими датой и временем.
+
+    Возвращает строку, начинающуюся с отметки времени вида
+    ``"Сейчас 2024-04-25 15:30:00"``. Далее перечисляются последние
+    реплики из краткосрочной памяти. Такая конструкция позволяет передавать
+    LLM точный момент обращения, что особенно важно для проактивных
+    подсказок и планирования.
+    """
+
+    # Обновляем дату в общем контексте и получаем её значение
+    day = current_date.refresh()
+    # Фиксируем текущее время без микросекунд для стабильности тестов
+    now = dt.datetime.now().time().replace(microsecond=0)
+    timestamp = f"Сейчас {day.isoformat()} {now.isoformat()}"
+
+    logger.debug("compose_context", extra={"ctx": {"datetime": timestamp}})
+    # Возвращаем отметку времени и последние реплики, объединённые через перевод строки
+    return "\n".join([timestamp, *map(str, short_term.get_last())])
 
 
 def _run(

@@ -2,6 +2,7 @@ from core import llm_engine
 from context import short_term, long_term
 import requests
 import pytest
+import datetime as dt
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +25,45 @@ class DummyQuery:
 def clear_short_term():
     # Доступ к внутреннему буферу для очистки между тестами
     short_term._buffer.clear()
+
+
+def test_compose_context_includes_current_datetime(monkeypatch):
+    """Проверяем, что контекст начинается с актуальных даты и времени."""
+
+    # Подменяем refresh, чтобы вернуть предсказуемую дату
+    monkeypatch.setattr(
+        llm_engine.current_date,
+        "refresh",
+        lambda: dt.date(2024, 4, 25),
+    )
+
+    # Фиксируем текущее время через подстановку собственного класса
+    class _FakeDatetime(dt.datetime):
+        @classmethod
+        def now(cls):  # type: ignore[override]
+            return dt.datetime(2024, 4, 25, 15, 30, 0)
+
+    monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
+    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: [])
+
+    ctx = llm_engine._compose_context()
+    assert ctx == "Сейчас 2024-04-25 15:30:00"
+
+
+def test_compose_context_refreshes_date(monkeypatch):
+    """Убеждаемся, что при составлении контекста обновляется дата."""
+
+    called: list[dt.date] = []
+
+    def fake_refresh() -> dt.date:
+        called.append(dt.date(2024, 4, 25))
+        return dt.date(2024, 4, 25)
+
+    monkeypatch.setattr(llm_engine.current_date, "refresh", fake_refresh)
+    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: [])
+
+    llm_engine._compose_context()
+    assert called  # проверяем, что функция была вызвана
 
 
 def test_think_uses_context_and_light_profile(monkeypatch):
