@@ -134,9 +134,6 @@ async def main() -> None:
         for k, variants in command_processing.VA_CMD_LIST.items()
     }
     mic_idx = cfg.getint("MIC", "microphone_index")
-    suggestion_interval = cfg.getint(
-        "SUGGESTIONS", "interval_sec", fallback=60
-    )
     # Загружаем структуру конфигурации (``core.config``) для передачи
     # параметров в отдельные подсистемы.
     app_cfg = load_config()
@@ -202,7 +199,8 @@ async def main() -> None:
     policy = Policy(PolicyConfig())  # пока используем значения по умолчанию
     ProactiveEngine(policy)
 
-    start_background_tasks(suggestion_interval)
+    # Запускаем фоновые задачи анализа и плейбука
+    start_background_tasks()
 
     # --- Telegram listener -------------------------------------------------
     global tg_task

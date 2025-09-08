@@ -31,6 +31,8 @@ def test_trigger_generates_suggestion(monkeypatch):
     def on_suggestion(event: events.Event) -> None:
         captured["text"] = event.attrs["text"]
 
+    events._subscribers.clear()
+    events.subscribe("proactivity.trigger", proactivity._handle_trigger)
     events.subscribe("suggestion.created", on_suggestion)
     events.fire_proactive_trigger("time", "morning_briefing")
     assert captured["text"] == "Привет"

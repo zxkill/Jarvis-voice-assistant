@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 
-from analysis import suggestions as analysis_suggestions
+# Переносим генерацию подсказок полностью на LLM, поэтому модуль
+# ``analysis.suggestions`` больше не используется.
 from analysis.habits import schedule_daily_aggregation
 from analysis.proactivity import load_playbook
 from core.logging_json import configure_logging
@@ -20,21 +21,15 @@ from memory import db as memory_db
 log = configure_logging("scheduler")
 
 
-def start_background_tasks(suggestion_interval: int) -> None:
-    """Запустить задачи генерации подсказок и ежедневной агрегации."""
+def start_background_tasks() -> None:
+    """Запустить фоновые задачи анализа и плейбука проактивности.
 
-    async def suggestion_scheduler() -> None:
-        """Периодически вызывать генератор подсказок."""
-        while True:
-            try:
-                analysis_suggestions.generate()
-            except Exception:
-                log.exception("suggestion generation failed")
-            # Засыпаем на заданный интервал перед следующей проверкой
-            await asyncio.sleep(suggestion_interval)
+    Статический генератор подсказок удалён: теперь все рекомендации
+    формируются через LLM по триггерам из плейбука, поэтому отдельная
+    периодическая задача больше не нужна.
+    """
 
-    # Создаём корутины в фоне, чтобы не блокировать основной поток
-    asyncio.create_task(suggestion_scheduler())
+    # Запускаем асинхронные задачи в фоне, чтобы не блокировать event loop
     asyncio.create_task(schedule_daily_aggregation())
     asyncio.create_task(nightly_reflect())
     asyncio.create_task(_schedule_playbook())
