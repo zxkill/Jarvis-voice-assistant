@@ -201,6 +201,116 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
     return text
 
 
+def _query_ollama_stream(prompt: str, profile: str, trace_id: str = "") -> Iterable[str]:
+    """Потоковый вариант запроса к Ollama.
+
+    Возвращает генератор, выдающий части ответа по мере их поступления.
+    Это позволяет начинать озвучку ещё до завершения генерации, что
+    значительно ускоряет отклик ассистента при длинных ответах.
+    """
+
+    if profile not in PROFILES:
+        raise ValueError(f"Неизвестный профиль: {profile}")
+    model = PROFILES[profile]
+
+    url = f"{BASE_URL}/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+    }
+    headers = {"X-Trace-Id": trace_id} if trace_id else None
+
+    logger.debug(
+        "stream request to Ollama",
+        extra={"url": url, "model": model, "trace_id": trace_id},
+    )
+
+    try:
+        response = requests.post(
+            url, json=payload, headers=headers, stream=True, timeout=60
+        )
+    except requests.RequestException as exc:  # pragma: no cover - сетевые сбои
+        logger.error("Ошибка при обращении к Ollama: %s", exc)
+        raise RuntimeError("Ollama недоступна") from exc
+
+    use_legacy = False
+    if response.status_code == 404:
+        try:
+            error_msg = response.json().get("error", "")
+        except Exception:
+            error_msg = response.text
+        if "model" in error_msg.lower() and "not found" in error_msg.lower():
+            logger.error(
+                "Модель %s не найдена: %s", model, error_msg, extra={"trace_id": trace_id}
+            )
+            raise RuntimeError(f"Модель {model} не найдена")
+
+        logger.warning(
+            "Эндпоинт /v1/chat/completions не найден, пробуем /api/generate",
+            extra={"trace_id": trace_id},
+        )
+        url = f"{BASE_URL}/api/generate"
+        payload = {"model": model, "prompt": prompt, "stream": True}
+        try:
+            response = requests.post(
+                url, json=payload, headers=headers, stream=True, timeout=60
+            )
+        except requests.RequestException as exc:  # pragma: no cover - сетевые сбои
+            logger.error("Ошибка при обращении к Ollama: %s", exc)
+            raise RuntimeError("Ollama недоступна") from exc
+        if response.status_code == 404:
+            try:
+                error_msg = response.json().get("error", "")
+            except Exception:
+                error_msg = response.text
+            logger.error(
+                "Модель %s не найдена: %s", model, error_msg, extra={"trace_id": trace_id}
+            )
+            raise RuntimeError(f"Модель {model} не найдена")
+        try:
+            response.raise_for_status()
+            use_legacy = True
+        except requests.RequestException as exc:
+            logger.error("Ошибка при обращении к Ollama: %s", exc)
+            raise RuntimeError("Ollama недоступна") from exc
+    else:
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.error("Ошибка при обращении к Ollama: %s", exc)
+            raise RuntimeError("Ollama недоступна") from exc
+
+    def _iter() -> Iterable[str]:
+        """Внутренний генератор, построчно читающий поток."""
+
+        for raw in response.iter_lines():
+            if not raw:
+                continue
+            if raw.startswith(b"data: "):
+                raw = raw[6:]
+            if raw == b"[DONE]":
+                break
+            try:
+                data = json.loads(raw)
+            except Exception:  # pragma: no cover - некорректный JSON
+                logger.debug("пропущен некорректный chunk: %r", raw)
+                continue
+            if use_legacy:
+                chunk = data.get("response", "")
+            else:
+                choices = data.get("choices") or []
+                delta = choices[0].get("delta", {}) if choices else {}
+                chunk = delta.get("content", "")
+            if chunk:
+                logger.debug(
+                    "stream chunk", extra={"length": len(chunk), "trace_id": trace_id}
+                )
+                yield str(chunk)
+
+    return _iter()
+
+
 def _load_prompt(name: str) -> str:
     """Загрузить шаблон с диска."""
     path = PROMPTS_DIR / f"{name}.txt"
@@ -272,6 +382,51 @@ def _run(
     return reply
 
 
+def _run_stream(
+    prompt_name: str,
+    profile: str = "light",
+    *,
+    user_input: str = "",
+    trace_id: str = "",
+    **kwargs: str,
+) -> Iterable[str]:
+    """Потоковый запуск запроса к LLM.
+
+    Формирует prompt и передаёт его в :func:`_query_ollama_stream`,
+    возвращая генератор кусочков ответа. После завершения стрима полный
+    текст сохраняется в памяти и логах, как и при обычном вызове.
+    """
+
+    template = _load_prompt(prompt_name)
+    prompt = template.format(**kwargs)
+    logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
+
+    stream = _query_ollama_stream(prompt, profile=profile, trace_id=trace_id)
+
+    def _iterator() -> Iterable[str]:
+        collected = ""
+        for chunk in stream:
+            collected += chunk
+            yield chunk
+        _log_llm_exchange(
+            stage=prompt_name,
+            prompt=prompt,
+            reply=collected,
+            trace_id=trace_id,
+            context=str(kwargs.get("context", "")),
+        )
+        if user_input:
+            short_term.add({"trace_id": trace_id, "user": user_input, "reply": collected})
+            long_term.add_daily_event(
+                f"user: {user_input}\nassistant: {collected}", [prompt_name]
+            )
+        else:
+            short_term.add({"stage": prompt_name, "text": collected})
+        logger.info("Ответ %s: %s", prompt_name, collected)
+
+    return _iterator()
+
+
 def think(topic: str, *, trace_id: str) -> str:
     """Сформировать размышление по заданной теме.
 
@@ -291,6 +446,31 @@ def think(topic: str, *, trace_id: str) -> str:
     logger.debug("Учтённые предпочтения: %s", prefs)
     long_context = "\n".join(events + similar + prefs)
     return _run(
+        "think",
+        topic=topic,
+        context=context_text,
+        long_context=long_context,
+        profile="light",
+        user_input=topic,
+        trace_id=trace_id,
+    )
+
+
+def stream_think(topic: str, *, trace_id: str) -> Iterable[str]:
+    """Потоковая версия :func:`think`.
+
+    Возвращает генератор, выдающий части ответа без ожидания полной
+    генерации. Используется для мгновенной озвучки длинных ответов.
+    """
+
+    context_text = _compose_context()
+    events = long_term.get_events_by_label("think")
+    similar = [text for text, _ in long_memory.retrieve_similar(topic)]
+    prefs = preferences.load_preferences()
+    logger.debug("Релевантные события для темы %r: %s", topic, similar)
+    logger.debug("Учтённые предпочтения: %s", prefs)
+    long_context = "\n".join(events + similar + prefs)
+    return _run_stream(
         "think",
         topic=topic,
         context=context_text,
