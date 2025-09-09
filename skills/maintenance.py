@@ -65,7 +65,20 @@ def handle(text: str, trace_id: str | None = None) -> str:
         return "Дневные дайджесты очищены."
 
     if "рефлекс" in text_low or "агрег" in text_low:
-        scheduler._run_nightly_reflection()
+        # Пытаемся вручную запустить ночную рефлексию и перенос
+        # накопленных данных в долгосрочную память.  Иногда LLM
+        # может вернуть некорректный JSON или произойти другая
+        # ошибка, поэтому оборачиваем вызов в ``try`` для устойчивости.
+        try:
+            scheduler._run_nightly_reflection()
+        except Exception:
+            # Логируем исключение с уровнем ``exception`` – в лог попадёт
+            # полный стектрейс, что поможет при диагностике.
+            logger.exception(
+                "nightly reflection failed", extra={"trace_id": trace_id}
+            )
+            return "Не удалось выполнить рефлексию и агрегацию данных."
+
         logger.info("nightly reflection forced", extra={"trace_id": trace_id})
         return "Рефлексия и агрегация данных выполнены."
 
