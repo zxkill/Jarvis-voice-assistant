@@ -24,6 +24,7 @@ def _load_cp(monkeypatch):
     dummy_llm = SimpleNamespace(
         think=lambda text, trace_id=None: f"ответ:{text}",
         summarise=lambda text, labels=None: "summary",
+        stream_think=lambda text, trace_id=None: [f"ответ:{text}"],
     )
 
     dummy_daily = SimpleNamespace(add=lambda item: summaries.append(item))

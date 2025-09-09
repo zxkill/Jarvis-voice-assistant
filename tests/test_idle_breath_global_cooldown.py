@@ -38,6 +38,7 @@ def test_global_idle_breath_cooldown(monkeypatch):  # type: ignore[no-untyped-de
     monkeypatch.setattr(
         sounds, "_idle_breath_last", -sounds.MIN_IDLE_BREATH_COOLDOWN
     )
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
 
     # Создаём два драйвера с минимальным cooldown, чтобы проверить именно
     # глобальное ограничение
@@ -49,8 +50,7 @@ def test_global_idle_breath_cooldown(monkeypatch):  # type: ignore[no-untyped-de
         cooldown=0.0,
         last_played=-sounds.MIN_IDLE_BREATH_COOLDOWN,
     )
-    driver1._effects = {"IDLE_BREATH": effect}
-    driver2._effects = {"IDLE_BREATH": effect}
+    sounds._EFFECTS = {"IDLE_BREATH": effect}
 
     now = [0.0]
     monkeypatch.setattr(sounds.time, "monotonic", lambda: now[0])

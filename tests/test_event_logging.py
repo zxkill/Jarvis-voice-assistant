@@ -9,6 +9,8 @@ from emotion.state import Emotion
 
 
 def test_event_logging_throttles(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_DB_KEY", raising=False)
+    monkeypatch.setattr(writer, "encrypt", lambda s: s)
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
@@ -40,6 +42,8 @@ def test_event_logging_throttles(monkeypatch, tmp_path):
 
 
 def test_rotation_removes_old_events(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_DB_KEY", raising=False)
+    monkeypatch.setattr(writer, "encrypt", lambda s: s)
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
@@ -66,6 +70,8 @@ def test_rotation_removes_old_events(monkeypatch, tmp_path):
 
 
 def test_write_event_serializes_enum(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_DB_KEY", raising=False)
+    monkeypatch.setattr(writer, "encrypt", lambda s: s)
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
@@ -77,6 +83,8 @@ def test_write_event_serializes_enum(monkeypatch, tmp_path):
 
 
 def test_speech_recognized_logged(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_DB_KEY", raising=False)
+    monkeypatch.setattr(writer, "encrypt", lambda s: s)
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
@@ -94,6 +102,8 @@ def test_speech_recognized_logged(monkeypatch, tmp_path):
 
 
 def test_user_query_started_logged(monkeypatch, tmp_path):
+    monkeypatch.delenv("JARVIS_DB_KEY", raising=False)
+    monkeypatch.setattr(writer, "encrypt", lambda s: s)
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
