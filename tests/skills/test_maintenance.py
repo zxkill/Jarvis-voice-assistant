@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 # Добавляем корень репозитория в путь импорта
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
@@ -20,7 +22,8 @@ def test_clear_daily_memory(monkeypatch):
     assert "очищена" in reply
 
 
-def test_force_reflection(monkeypatch):
+@pytest.mark.parametrize("command", ["запусти рефлексию", "агрегируй данные"])
+def test_force_reflection(monkeypatch, command):
     called = False
 
     def fake_reflection():
@@ -28,9 +31,31 @@ def test_force_reflection(monkeypatch):
         called = True
 
     monkeypatch.setattr(maintenance.scheduler, "_run_nightly_reflection", fake_reflection)
-    reply = maintenance.handle("запусти рефлексию")
+    reply = maintenance.handle(command)
     assert called
     assert "Рефлексия" in reply
+
+
+def test_reflection_failure(monkeypatch):
+    """При ошибке рефлексии скилл должен сообщить об этом, а не падать."""
+
+    def bad_reflection():
+        raise ValueError("digest")
+
+    # Подменяем функцию планировщика, чтобы она бросала исключение
+    monkeypatch.setattr(maintenance.scheduler, "_run_nightly_reflection", bad_reflection)
+
+    logged = {}
+
+    def fake_exception(msg, *, extra=None):
+        logged["msg"] = msg
+
+    # Перехватываем логгер, чтобы убедиться в регистрации ошибки
+    monkeypatch.setattr(maintenance.logger, "exception", fake_exception)
+
+    reply = maintenance.handle("агрегируй данные")
+    assert "Не удалось" in reply
+    assert logged["msg"] == "nightly reflection failed"
 
 
 def test_clear_episodic(monkeypatch):
