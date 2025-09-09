@@ -55,14 +55,12 @@ def _shutdown(signum: int, frame: Any):
     # и другие обработчики), чтобы выход был максимально быстрым.
     log.info("Останавливаю фоновые подсистемы")
     stop_mgr.trigger()
-    # Аккуратно просим asyncio‑цикл завершиться. Если он уже закрыт,
-    # игнорируем исключение, чтобы избежать шумных трассировок.
-    try:
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(loop.stop)
-        log.debug("Запрошена остановка event loop")
-    except RuntimeError:
-        log.debug("Event loop уже остановлен")
+    # Сообщаем в лог о завершении и немедленно выходим через ``SystemExit``.
+    # Такой подход не вмешивается в текущий ``event loop`` и исключает
+    # ошибку ``RuntimeError: Event loop stopped before Future completed``.
+    log.info("Ассистент завершил работу по запросу пользователя")
+    log.debug("Завершение приложения через SystemExit")
+    raise SystemExit(0)
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
