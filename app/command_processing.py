@@ -17,7 +17,12 @@ from rapidfuzz import fuzz
 import jarvis_skills
 handle_utterance = jarvis_skills.handle_utterance
 from core.nlp import normalize
-from working_tts import speak_async, MAX_CHARS
+# Импортируем модуль озвучки целиком, чтобы корректно работать даже при его
+# частичной подмене в тестах. Если в заглушке отсутствует константа
+# ``MAX_CHARS``, используем безопасное значение по умолчанию.
+import working_tts as _working_tts
+speak_async = _working_tts.speak_async  # удобный псевдоним для вызова
+MAX_CHARS = getattr(_working_tts, "MAX_CHARS", 180)
 from core.request_source import get_request_source
 from core.logging_json import configure_logging
 from core import events as core_events, llm_engine
