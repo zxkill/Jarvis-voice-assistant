@@ -48,11 +48,16 @@ def _run_nightly_reflection() -> None:
         "night reflection parsed",
         extra={"ctx": {"digest": digest, "priorities": priorities, "mood": mood}},
     )
-    memory_db.add_daily_digest(digest, priorities, mood)
+    digest_id = memory_db.add_daily_digest(digest, priorities, mood)
     log.info(
         "daily digest saved",
-        extra={"ctx": {"length": len(digest)}},
+        extra={"ctx": {"length": len(digest), "id": digest_id}},
     )
+    removed = memory_db.cleanup_old_digests()
+    if removed:
+        log.debug(
+            "old digests cleaned", extra={"ctx": {"removed": removed}}
+        )
     if priorities:
         memory_db.set_priorities(str(priorities))
         log.debug(
@@ -64,10 +69,11 @@ def _run_nightly_reflection() -> None:
             memory_db.set_mood_level(int(mood))
         except Exception:
             log.exception("failed to set mood", extra={"ctx": {"mood": mood}})
+    last = memory_db.get_last_digest()
     publish(
         Event(
             kind="suggestion.created",
-            attrs={"text": digest, "reason_code": "daily_digest"},
+            attrs={"text": last["digest"] if last else digest, "reason_code": "daily_digest"},
         )
     )
     log.info("daily digest notification sent")

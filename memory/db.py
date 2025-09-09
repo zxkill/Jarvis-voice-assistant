@@ -182,6 +182,7 @@ def get_connection() -> sqlite3.Connection:
     _migrate(conn)  # выполняем миграции при каждом подключении
     _rotate_events(conn)  # удаляем старые события
     _cleanup_timers(conn)  # удаляем истекшие таймеры
+    _cleanup_old_digests(conn)  # очищаем устаревшие дайджесты
     conn.commit()
     return conn
 
@@ -213,6 +214,25 @@ def _cleanup_timers(conn: sqlite3.Connection) -> None:
     now = int(time.time())
     cutoff = now - 24 * 3600  # оставляем информацию за последние 24 часа
     conn.execute("DELETE FROM timers WHERE end_ts <= ?", (cutoff,))
+
+
+def _cleanup_old_digests(
+    conn: sqlite3.Connection, retention_days: int = 30
+) -> int:
+    """Удалить из таблицы ``daily_digest`` записи старше ``retention_days``.
+
+    Возвращает количество удалённых строк, что помогает контролировать
+    рост базы данных. По умолчанию хранятся дайджесты за последний месяц,
+    более старые записи удаляются автоматически при каждом подключении к БД.
+    """
+
+    cutoff = int(time.time() - retention_days * 24 * 3600)
+    cur = conn.execute("DELETE FROM daily_digest WHERE ts < ?", (cutoff,))
+    deleted = cur.rowcount
+    logging.getLogger(__name__).debug(
+        "удалено старых дайджестов", extra={"ctx": {"count": deleted}}
+    )
+    return deleted
 
 
 # --- Mood level helpers ----------------------------------------------------
@@ -261,7 +281,51 @@ def add_daily_digest(digest: str, priorities: str | None, mood: int | None) -> i
             "INSERT INTO daily_digest (ts, digest, priorities, mood) VALUES (?, ?, ?, ?)",
             (ts, digest, priorities, mood),
         )
-        return int(cur.lastrowid)
+        digest_id = int(cur.lastrowid)
+        logging.getLogger(__name__).debug(
+            "сохранён новый дайджест", extra={"ctx": {"id": digest_id}}
+        )
+        return digest_id
+
+
+def get_last_digest() -> dict | None:
+    """Вернуть последний сохранённый дайджест или ``None``."""
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT id, ts, digest, priorities, mood FROM daily_digest ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+    if row:
+        result = dict(row)
+        logging.getLogger(__name__).debug(
+            "получен последний дайджест", extra={"ctx": {"id": result["id"]}}
+        )
+        return result
+    logging.getLogger(__name__).debug("дайджестов в БД не найдено")
+    return None
+
+
+def list_digests(limit: int = 100) -> list[dict]:
+    """Вернуть список последних ``limit`` дайджестов."""
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, ts, digest, priorities, mood FROM daily_digest ORDER BY ts DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    result = [dict(r) for r in rows]
+    logging.getLogger(__name__).debug(
+        "получен список дайджестов", extra={"ctx": {"count": len(result)}}
+    )
+    return result
+
+
+def cleanup_old_digests(retention_days: int = 30) -> int:
+    """Публичная обёртка для удаления старых дайджестов."""
+
+    with get_connection() as conn:
+        deleted = _cleanup_old_digests(conn, retention_days)
+    return deleted
 
 
 # --- Extended mood state helpers -------------------------------------------

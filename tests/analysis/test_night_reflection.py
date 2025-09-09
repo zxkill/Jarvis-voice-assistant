@@ -53,17 +53,14 @@ def test_nightly_reflection(monkeypatch, tmp_path):
     # Запускаем саму рефлексию
     scheduler._run_nightly_reflection()
 
-    # Проверяем, что данные сохранились в таблице
-    with memory_db.get_connection() as conn:
-        row = conn.execute(
-            "SELECT digest, priorities, mood FROM daily_digest"
-        ).fetchone()
-
-    assert dict(row) == {
-        "digest": "итоги дня",
-        "priorities": "работа, отдых",
-        "mood": 7,
-    }
+    # Проверяем, что данные сохранились в таблице через новый API
+    last = memory_db.get_last_digest()
+    assert last["digest"] == "итоги дня"
+    assert last["priorities"] == "работа, отдых"
+    assert last["mood"] == 7
+    # ``list_digests`` возвращает список, поэтому дополнительно проверяем его
+    all_digests = memory_db.list_digests()
+    assert len(all_digests) == 1
     assert mood_holder["mood"] == 7
     assert priorities_holder["priorities"] == "работа, отдых"
 
