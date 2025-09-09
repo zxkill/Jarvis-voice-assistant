@@ -523,12 +523,13 @@ def act(command: str, *, trace_id: str) -> str:
 def reflect(note: str | None = None) -> dict:
     """Проанализировать недавний опыт и вернуть структурированный результат.
 
-    Функция ожидает от LLM строго валидный JSON с полями ``digest``,
-    ``priorities`` и ``mood``.  При любой ошибке парсинга возбуждается
-    ``ValueError``.  Дополнительные сведения выводятся в лог для удобства
-    отладки.
+    Если LLM возвращает невалидный или пустой ответ, функция не падает с
+    исключением, а возвращает «пустой» результат.  Это позволяет ночной
+    задаче рефлексии выполняться до конца и не прерывать работу ассистента.
+    Все аномалии подробно логируются для последующего анализа.
     """
 
+    # Собираем текущий контекст и недавние события, связанные с рефлексией
     context_text = _compose_context()
     events = "\n".join(long_term.get_events_by_label("reflect"))
     raw = _run(
@@ -539,21 +540,44 @@ def reflect(note: str | None = None) -> dict:
         profile="heavy",
     )
 
+    def _extract_json(text: str) -> str:
+        """Выделить JSON-объект из произвольной строки.
+
+        Некоторые модели могут окружать ответ служебными фразами.  Мы ищем
+        первую и последнюю фигурные скобки и возвращаем всё между ними.  В
+        случае отсутствия скобок возвращаем пустую строку, что будет признаком
+        некорректного ответа.
+        """
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return ""
+        return text[start : end + 1]
+
+    json_block = _extract_json(raw)
+    if not json_block:
+        logger.error("рефлексия вернула пустой ответ", extra={"raw": raw})
+        return {"digest": "", "priorities": "", "mood": 0}
+
     try:
-        data = json.loads(raw)
+        data = json.loads(json_block)
     except json.JSONDecodeError as exc:
-        logger.error("рефлексия вернула невалидный JSON", extra={"raw": raw})
-        raise ValueError("ответ рефлексии должен быть JSON") from exc
+        logger.error(
+            "не удалось разобрать JSON рефлексии", extra={"raw": raw}, exc_info=exc
+        )
+        return {"digest": "", "priorities": "", "mood": 0}
+
     if not isinstance(data, dict):
         logger.error("рефлексия ожидает JSON-объект, получено %s", type(data))
-        raise ValueError("формат рефлексии должен быть объект JSON")
+        return {"digest": "", "priorities": "", "mood": 0}
     try:
-        digest = str(data["digest"])
+        digest = str(data.get("digest", ""))
         priorities = str(data.get("priorities", ""))
-        mood = int(data["mood"])
+        mood = int(data.get("mood", 0))
     except Exception as exc:
-        logger.error("некорректные поля в JSON рефлексии", extra={"json": data})
-        raise ValueError("JSON рефлексии должен содержать digest, priorities, mood") from exc
+        logger.error("некорректные поля в JSON рефлексии", extra={"json": data}, exc_info=exc)
+        return {"digest": "", "priorities": "", "mood": 0}
 
     result = {"digest": digest, "priorities": priorities, "mood": mood}
     logger.debug("разобран результат рефлексии", extra={"ctx": result})
