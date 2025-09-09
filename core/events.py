@@ -6,6 +6,8 @@ import logging
 import threading
 from typing import Any, Callable, Dict, List
 
+from core import stop as stop_mgr
+
 
 @dataclass
 class Event:
@@ -24,6 +26,12 @@ _global_subscribers: List[Callable[[Event], None]] = []
 
 
 log = logging.getLogger(__name__)
+
+# Список активных потоков, публикующих проактивные триггеры.
+# Необходим для корректного завершения работы приложения: при поступлении
+# команды "стоп" мы ожидаем завершения всех таких потоков, чтобы
+# избежать "висячих" задач и долгого выхода.
+_proactive_threads: List[threading.Thread] = []
 
 
 def subscribe(kind: str, callback: Callable[[Event], None]) -> None:
@@ -54,6 +62,29 @@ def publish(event: Event) -> None:
         callback(event)
 
 
+def _stop_proactivity_threads() -> bool:
+    """Ожидает завершение всех потоков проактивных подсказок.
+
+    Возвращает ``True``, если хотя бы один поток был ещё активен.
+    Функция регистрируется в ``core.stop`` и вызывается при глобальной
+    остановке ассистента.
+    """
+
+    handled = False
+    for th in list(_proactive_threads):
+        if th.is_alive():
+            log.debug("Ждём завершения потока %s", th.name)
+            th.join(timeout=1.0)
+            handled = True
+    _proactive_threads.clear()
+    return handled
+
+
+# Регистрация обработчика остановки: гарантируем, что все фоновые
+# публикации завершены до выхода из программы.
+stop_mgr.register(_stop_proactivity_threads)
+
+
 # --- Утилиты для проактивных подсказок ------------------------------------
 def fire_proactive_trigger(
     kind: str, name: str, context: Dict[str, Any] | None = None
@@ -80,6 +111,9 @@ def fire_proactive_trigger(
         необходимости, позволяет дождаться завершения обработки.
     """
 
+    # Очищаем список от уже завершённых потоков, чтобы он не рос бесконечно.
+    _proactive_threads[:] = [t for t in _proactive_threads if t.is_alive()]
+
     attrs = {"trigger": kind, "name": name}
     if context:
         attrs["context"] = context
@@ -98,6 +132,13 @@ def fire_proactive_trigger(
                 "proactivity trigger failed", extra={"ctx": attrs}
             )
 
-    thread = threading.Thread(target=_worker, name="proactivity-trigger", daemon=True)
+    # Создаём поток-демон, который не блокирует завершение программы.
+    thread = threading.Thread(
+        target=_worker,
+        name="proactivity-trigger",
+        daemon=True,
+    )
     thread.start()
+    # Сохраняем ссылку на поток для последующей корректной остановки.
+    _proactive_threads.append(thread)
     return thread
