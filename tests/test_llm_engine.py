@@ -257,6 +257,24 @@ def test_reflect_invalid_json(monkeypatch):
         llm_engine.reflect()
 
 
+def test_run_handles_curly_braces(monkeypatch):
+    """Проверяем, что шаблон ``reflect`` с фигурными скобками корректно формируется."""
+
+    clear_short_term()
+    dummy = DummyQuery()
+    # Подменяем сетевой запрос и логирование, чтобы сосредоточиться на шаблоне
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
+    monkeypatch.setattr(llm_engine, "_log_llm_exchange", lambda **kw: None)
+    monkeypatch.setattr(llm_engine.short_term, "add", lambda *a, **kw: None)
+
+    result = llm_engine._run(
+        "reflect", context="", long_context="", note="", profile="light"
+    )
+    assert result == "ответ"
+    # Убеждаемся, что запрос действительно был выполнен
+    assert dummy.calls
+
+
 def test_run_logs_interaction(tmp_path, monkeypatch):
     """_run должен записывать prompt, контекст и ответ в отдельный файл."""
 

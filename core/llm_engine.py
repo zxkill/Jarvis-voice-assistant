@@ -356,7 +356,15 @@ def _run(
     """
 
     template = _load_prompt(prompt_name)
-    prompt = template.format(**kwargs)
+    try:
+        # Формируем prompt и при отсутствии нужных параметров логируем ошибку,
+        # чтобы упростить отладку проблем с шаблонами
+        prompt = template.format(**kwargs)
+    except KeyError as exc:
+        logger.exception(
+            "Отсутствует параметр %s в шаблоне %s", exc, prompt_name
+        )
+        raise
     logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
     reply = _query_ollama(prompt, profile=profile, trace_id=trace_id)
     # Логируем каждый запрос и ответ в отдельный файл для последующего анализа
@@ -398,7 +406,14 @@ def _run_stream(
     """
 
     template = _load_prompt(prompt_name)
-    prompt = template.format(**kwargs)
+    try:
+        # Аналогично _run обрабатываем отсутствие параметров в шаблоне
+        prompt = template.format(**kwargs)
+    except KeyError as exc:
+        logger.exception(
+            "Отсутствует параметр %s в шаблоне %s", exc, prompt_name
+        )
+        raise
     logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
 
     stream = _query_ollama_stream(prompt, profile=profile, trace_id=trace_id)
