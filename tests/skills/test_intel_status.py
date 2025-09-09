@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -48,3 +50,34 @@ def test_handle_saves_note(recorders):
     assert reply == "Запомнил"
     assert pref.calls == []
     assert note.calls == [(("купить молоко", [intel_status.LABEL]), {})]
+
+
+def test_get_last_context_items_filters_extraneous(monkeypatch, caplog):
+    """Функция должна игнорировать записи с чужими префиксами."""
+
+    # Создаём временную БД в памяти и заполняем тестовыми данными
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE context_items (key TEXT PRIMARY KEY, value TEXT, ts INTEGER NOT NULL)"
+    )
+    entries = [
+        ("emotion:mood", "5", 300),  # посторонняя запись
+        ("user:2", json.dumps({"text": "вторая"}, ensure_ascii=False), 200),
+        ("misc", json.dumps({"text": "не нужна"}, ensure_ascii=False), 100),
+        ("user:1", json.dumps({"text": "первая"}, ensure_ascii=False), 50),
+    ]
+    conn.executemany("INSERT INTO context_items VALUES (?, ?, ?)", entries)
+    conn.commit()
+
+    # Подменяем подключение к БД в модуле intel_status
+    monkeypatch.setattr(intel_status, "get_connection", lambda: conn)
+
+    with caplog.at_level("DEBUG"):
+        items = intel_status._get_last_context_items(limit=2)
+
+    # Проверяем, что вернулись только пользовательские записи в хронологическом порядке
+    assert items == ["первая", "вторая"]
+
+    # Убеждаемся, что лог содержит информацию о количестве отфильтрованных строк
+    assert any("отфильтровано 2" in rec.message for rec in caplog.records)
