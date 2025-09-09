@@ -4,6 +4,7 @@ import requests
 import pytest
 import datetime as dt
 import json
+import logging
 
 
 @pytest.fixture(autouse=True)
@@ -248,13 +249,24 @@ def test_reflect_parses_json(monkeypatch):
     assert llm_engine.reflect() == {"digest": "d", "priorities": "p", "mood": 5}
 
 
-def test_reflect_invalid_json(monkeypatch):
-    """При невалидном ответе должна возникать ``ValueError``."""
+def test_reflect_invalid_json(monkeypatch, caplog):
+    """При невалидном ответе возвращается пустой результат и пишется ошибка."""
     monkeypatch.setattr(llm_engine, "_compose_context", lambda: "")
     monkeypatch.setattr(llm_engine.long_term, "get_events_by_label", lambda label: [])
     monkeypatch.setattr(llm_engine, "_run", lambda *a, **kw: "not json")
-    with pytest.raises(ValueError):
-        llm_engine.reflect()
+    with caplog.at_level(logging.ERROR):
+        result = llm_engine.reflect()
+    assert result == {"digest": "", "priorities": "", "mood": 0}
+    assert "рефлексия вернула пустой ответ" in caplog.text
+
+
+def test_reflect_extracts_json(monkeypatch):
+    """JSON может быть окружён произвольным текстом, но должен выделяться."""
+    monkeypatch.setattr(llm_engine, "_compose_context", lambda: "")
+    monkeypatch.setattr(llm_engine.long_term, "get_events_by_label", lambda label: [])
+    raw = "префикс {\"digest\": \"d\", \"priorities\": \"p\", \"mood\": 7} суффикс"
+    monkeypatch.setattr(llm_engine, "_run", lambda *a, **kw: raw)
+    assert llm_engine.reflect() == {"digest": "d", "priorities": "p", "mood": 7}
 
 
 def test_run_handles_curly_braces(monkeypatch):
