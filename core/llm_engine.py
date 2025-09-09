@@ -40,6 +40,44 @@ PROFILES = {
 # Базовый URL локального сервера Ollama
 BASE_URL = "http://localhost:11434"
 
+# Файл для записи подробных запросов и ответов LLM. Путь можно переопределить
+# переменной окружения ``LLM_LOG_FILE``.  По умолчанию журнал создаётся в
+# рабочем каталоге под именем ``llm_interactions.log``.
+LLM_LOG_FILE = Path(os.getenv("LLM_LOG_FILE", "llm_interactions.log"))
+
+
+def _log_llm_exchange(
+    stage: str,
+    prompt: str,
+    reply: str,
+    trace_id: str,
+    context: str,
+) -> None:
+    """Сохранить обмен с LLM в отдельный файл для дальнейшего анализа.
+
+    Записываем каждое взаимодействие в формате JSON: этап, trace-id,
+    сформированный prompt, изначальный контекст и ответ модели.  Это позволяет
+    легко воспроизводить диалог и понимать, какой контекст отправлялся в LLM.
+    В случае ошибки логирование не должно прерывать основной поток исполнения,
+    поэтому любые исключения перехватываются и выводятся в стандартный логгер.
+    """
+
+    try:
+        entry = {
+            "timestamp": dt.datetime.now().isoformat(),
+            "stage": stage,
+            "trace_id": trace_id,
+            "context": context,
+            "prompt": prompt,
+            "reply": reply,
+        }
+        # Гарантируем существование каталога и дописываем строку в конец файла
+        LLM_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LLM_LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:  # pragma: no cover - сбой логирования не критичен
+        logger.error("Не удалось записать лог LLM", exc_info=exc)
+
 
 def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
     """Отправить HTTP-запрос к Ollama и вернуть ответ.
@@ -254,6 +292,14 @@ def _run(
     prompt = template.format(**kwargs)
     logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
     reply = _query_ollama(prompt, profile=profile, trace_id=trace_id)
+    # Логируем каждый запрос и ответ в отдельный файл для последующего анализа
+    _log_llm_exchange(
+        stage=prompt_name,
+        prompt=prompt,
+        reply=reply,
+        trace_id=trace_id,
+        context=str(kwargs.get("context", "")),
+    )
 
     if user_input:
         # Сохраняем диалог в краткосрочную и долговременную память
