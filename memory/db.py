@@ -132,6 +132,10 @@ SCHEMA = [
     )
     """,
     """
+    -- Индекс для быстрого поиска и очистки по временным меткам
+    CREATE INDEX IF NOT EXISTS idx_daily_digest_ts ON daily_digest(ts)
+    """,
+    """
     -- История изменений настроения и текстовых профилей
     CREATE TABLE IF NOT EXISTS mood_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +150,10 @@ SCHEMA = [
 
 # Удерживаем события не дольше двух недель
 RETENTION_SECONDS = 14 * 24 * 3600  # две недели
+
+# Политика хранения дневных дайджестов
+DIGEST_RETENTION_DAYS = 30  # сохраняем дайджесты за последние 30 дней
+MAX_DIGESTS = 100  # и не более 100 последних записей
 
 # ---------------------------------------------------------------------------
 # Работа с ключом шифрования
@@ -196,7 +204,9 @@ def get_connection() -> sqlite3.Connection:
     _migrate(conn)  # выполняем миграции при каждом подключении
     _rotate_events(conn)  # удаляем старые события
     _cleanup_timers(conn)  # удаляем истекшие таймеры
-    _cleanup_old_digests(conn)  # очищаем устаревшие дайджесты
+    _cleanup_old_digests(
+        conn, DIGEST_RETENTION_DAYS, MAX_DIGESTS
+    )  # очищаем устаревшие дайджесты
     conn.commit()
     return conn
 
@@ -231,22 +241,62 @@ def _cleanup_timers(conn: sqlite3.Connection) -> None:
 
 
 def _cleanup_old_digests(
-    conn: sqlite3.Connection, retention_days: int = 30
+    conn: sqlite3.Connection,
+    retention_days: int | None = DIGEST_RETENTION_DAYS,
+    max_count: int | None = MAX_DIGESTS,
 ) -> int:
-    """Удалить из таблицы ``daily_digest`` записи старше ``retention_days``.
+    """Удалить устаревшие записи из таблицы ``daily_digest``.
 
-    Возвращает количество удалённых строк, что помогает контролировать
-    рост базы данных. По умолчанию хранятся дайджесты за последний месяц,
-    более старые записи удаляются автоматически при каждом подключении к БД.
+    Поддерживаются две стратегии хранения, которые можно комбинировать:
+    по времени и по максимальному количеству записей. Это позволяет
+    контролировать размер базы данных и упрощает последующий анализ.
+
+    :param retention_days: Максимальный возраст записи в днях, ``None`` –
+        не ограничивать по времени.
+    :param max_count: Максимальное число последних записей, которое
+        следует оставить, ``None`` – не ограничивать по количеству.
+    :return: Общее число удалённых строк.
     """
 
-    cutoff = int(time.time() - retention_days * 24 * 3600)
-    cur = conn.execute("DELETE FROM daily_digest WHERE ts < ?", (cutoff,))
-    deleted = cur.rowcount
+    total_deleted = 0
+
+    # --- Удаление по времени ------------------------------------------------
+    if retention_days is not None:
+        cutoff = int(time.time() - retention_days * 24 * 3600)
+        cur = conn.execute("DELETE FROM daily_digest WHERE ts < ?", (cutoff,))
+        deleted_time = cur.rowcount
+        total_deleted += deleted_time
+    else:
+        deleted_time = 0
+
+    # --- Ограничение по количеству -----------------------------------------
+    deleted_count = 0
+    if max_count is not None:
+        # Выбираем идентификаторы записей, которые превышают лимит по числу
+        cur = conn.execute(
+            "SELECT id FROM daily_digest ORDER BY ts DESC LIMIT -1 OFFSET ?",
+            (max_count,),
+        )
+        ids = [row[0] for row in cur.fetchall()]
+        if ids:
+            cur = conn.execute(
+                f"DELETE FROM daily_digest WHERE id IN ({','.join('?' for _ in ids)})",
+                ids,
+            )
+            deleted_count = cur.rowcount
+            total_deleted += deleted_count
+
     logging.getLogger(__name__).debug(
-        "удалено старых дайджестов", extra={"ctx": {"count": deleted}}
+        "очистка дайджестов",
+        extra={
+            "ctx": {
+                "by_time": deleted_time,
+                "by_count": deleted_count,
+                "total": total_deleted,
+            }
+        },
     )
-    return deleted
+    return total_deleted
 
 
 # --- Mood helpers ----------------------------------------------------------
@@ -452,11 +502,18 @@ def list_digests(limit: int = 100) -> list[dict]:
     return result
 
 
-def cleanup_old_digests(retention_days: int = 30) -> int:
-    """Публичная обёртка для удаления старых дайджестов."""
+def cleanup_old_digests(
+    retention_days: int | None = DIGEST_RETENTION_DAYS,
+    max_count: int | None = MAX_DIGESTS,
+) -> int:
+    """Публичная обёртка для удаления старых дайджестов.
+
+    Аргументы аналогичны :func:`_cleanup_old_digests` и позволяют гибко
+    управлять политикой хранения без прямого доступа к соединению БД.
+    """
 
     with get_connection() as conn:
-        deleted = _cleanup_old_digests(conn, retention_days)
+        deleted = _cleanup_old_digests(conn, retention_days, max_count)
     return deleted
 
 
