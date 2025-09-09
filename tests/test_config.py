@@ -28,7 +28,8 @@ def write_cfg(tmp_path, text=BASE_CFG):
     path.write_text(text, encoding="utf-8")
     return path
 
-def test_load_config_success(tmp_path):
+def test_load_config_success(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
     cfg = load_config(write_cfg(tmp_path))
     assert cfg.user.name == "Jarvis"
     assert cfg.telegram.token == "t"
@@ -39,7 +40,8 @@ def test_missing_section(tmp_path):
     with pytest.raises(ConfigError):
         load_config(path)
 
-def test_missing_option(tmp_path):
+def test_missing_option(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_TOKEN", raising=False)
     text = BASE_CFG.replace("token = t\n", "")
     path = write_cfg(tmp_path, text)
     with pytest.raises(ConfigError):

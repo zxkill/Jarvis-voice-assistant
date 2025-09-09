@@ -552,6 +552,56 @@ def cleanup_old_digests(
     return deleted
 
 
+def clear_daily_digest() -> int:
+    """Полностью удалить содержимое таблицы ``daily_digest``.
+
+    Возвращает количество удалённых записей. Функция полезна для
+    ручной очистки дневных дайджестов при отладке или обнаружении
+    некорректных данных.
+    """
+
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM daily_digest")
+        deleted = cur.rowcount
+    logging.getLogger(__name__).debug(
+        "daily digest cleared", extra={"ctx": {"count": deleted}}
+    )
+    return deleted
+
+
+def clear_episodic_memory() -> int:
+    """Очистить таблицу ``episodic_memory`` и связанные метки.
+
+    Используется для удаления всех эпизодических воспоминаний. Возвращает
+    количество удалённых записей из основной таблицы.
+    """
+
+    with get_connection() as conn:
+        conn.execute("DELETE FROM event_labels")
+        cur = conn.execute("DELETE FROM episodic_memory")
+        deleted = cur.rowcount
+    logging.getLogger(__name__).debug(
+        "episodic memory cleared", extra={"ctx": {"count": deleted}}
+    )
+    return deleted
+
+
+def clear_semantic_memory() -> int:
+    """Очистить таблицу ``semantic_memory``.
+
+    Удаляет все факты и возвращает число затронутых строк, позволяя
+    администратору при необходимости сбросить знания ассистента.
+    """
+
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM semantic_memory")
+        deleted = cur.rowcount
+    logging.getLogger(__name__).debug(
+        "semantic memory cleared", extra={"ctx": {"count": deleted}}
+    )
+    return deleted
+
+
 # --- Mood history helpers --------------------------------------------------
 
 def add_mood_history(valence: float, arousal: float, source: str, profile: str) -> None:
