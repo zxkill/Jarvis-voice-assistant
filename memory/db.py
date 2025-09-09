@@ -197,18 +197,53 @@ def decrypt(token: str) -> str:
     return data.decode("utf-8")
 
 
-def get_connection() -> sqlite3.Connection:
-    """Вернуть подключение SQLite с миграциями и ротацией."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    _migrate(conn)  # выполняем миграции при каждом подключении
-    _rotate_events(conn)  # удаляем старые события
-    _cleanup_timers(conn)  # удаляем истекшие таймеры
-    _cleanup_old_digests(
-        conn, DIGEST_RETENTION_DAYS, MAX_DIGESTS
-    )  # очищаем устаревшие дайджесты
-    conn.commit()
-    return conn
+def get_connection(retries: int = 5, delay: float = 0.2) -> sqlite3.Connection:
+    """Вернуть подключение SQLite с миграциями и ротацией.
+
+    При активной записи из нескольких потоков SQLite иногда выдаёт
+    ``OperationalError: database is locked``. Чтобы не терять события, мы
+    повторяем попытку подключения и коммита несколько раз с небольшой
+    паузой. Такая стратегия значительно повышает стабильность работы
+    подсистемы памяти.
+
+    :param retries: число повторных попыток при блокировке БД
+    :param delay: задержка между попытками в секундах
+    """
+
+    logger = logging.getLogger(__name__)
+
+    for attempt in range(1, retries + 1):
+        conn: sqlite3.Connection | None = None
+        try:
+            # ``timeout`` и ``busy_timeout`` заставляют SQLite подождать
+            # освобождения файла, вместо мгновенного выброса исключения
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 30000")
+
+            # Выполняем обслуживание базы перед отдачей соединения
+            _migrate(conn)  # миграции
+            _rotate_events(conn)  # очистка старых событий
+            _cleanup_timers(conn)  # удаление просроченных таймеров
+            _cleanup_old_digests(
+                conn, DIGEST_RETENTION_DAYS, MAX_DIGESTS
+            )  # очистка дайджестов
+
+            conn.commit()
+            return conn
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.close()
+            if "locked" in str(exc).lower() and attempt < retries:
+                # Подробно логируем, чтобы понимать частоту блокировок
+                logger.warning(
+                    "База данных заблокирована, повторяем попытку",
+                    extra={"ctx": {"attempt": attempt, "retries": retries}},
+                )
+                time.sleep(delay)
+            else:
+                logger.exception("Не удалось получить подключение к БД")
+                raise
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
