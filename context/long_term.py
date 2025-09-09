@@ -1,15 +1,15 @@
-"""Долгосрочный контекст, основанный на таблице ``context_items``.
+"""Долгосрочный контекст на основе **эпизодической памяти**.
 
-Позволяет добавлять «события дня» с произвольными метками и
-извлекать их по одной метке.  Хранение осуществляется в таблице
-``context_items`` БД памяти (см. ``memory/db.py``).  В поле ``value``
-сохраняется JSON с текстом события и списком меток.
+Ранее события дня дублировались в таблице ``context_items`` и в
+эпизодической памяти. Теперь используется только таблица
+``episodic_memory``: в столбце ``meta`` хранится JSON с текстом события и
+его метками. Такой подход упрощает поддержку и исключает расхождения
+между источниками данных.
 """
 
 from __future__ import annotations
 
 import json
-import time
 import logging
 from typing import Iterable, List
 
@@ -21,55 +21,73 @@ logger = logging.getLogger(__name__)
 
 
 def add_daily_event(text: str, labels: Iterable[str]) -> str:
-    """Добавить событие дня и вернуть его ключ."""
-    ts = int(time.time())
-    key = f"event:{ts}"
-    payload = json.dumps({"text": text, "labels": list(labels)})
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO context_items (key, value, ts) VALUES (?, ?, ?)",
-            (key, payload, ts),
-        )
-    logger.debug("long_term.add_daily_event: %s -> %s", labels, text)
+    """Сохранить событие дня в эпизодической памяти и вернуть его id.
 
-    # Дополнительно сохраняем событие в эпизодической памяти
+    :param text: текстовое описание события
+    :param labels: набор меток для последующего поиска
+    :return: идентификатор записи в виде строки
+    """
+
+    # Преобразуем список меток в обычный список, чтобы можно было
+    # сериализовать его в JSON. Дополнительные проверки позволяют
+    # заметить проблемы уже на этапе сохранения.
+    labels_list = list(labels)
+    logger.debug("add_daily_event: сохраняем %s с метками %s", text, labels_list)
+
     try:
-        store_event(text, {"labels": list(labels)})
+        # Сохраняем событие в таблице ``episodic_memory``. Функция
+        # ``store_event`` сама вычисляет эмбеддинг и возвращает id
+        # добавленной записи.
+        event_id = store_event(text, {"labels": labels_list})
     except Exception:
-        logger.exception("Не удалось сохранить событие в эпизодической памяти")
+        # Подробный лог поможет понять причину ошибки сохранения.
+        logger.exception("Не удалось сохранить событие дня")
+        raise
 
-    return key
+    logger.debug("add_daily_event: событие сохранено с id=%s", event_id)
+    # Возвращаем id в виде строки для обратной совместимости с прошлой
+    # версией API, где ключ представлялся строкой.
+    return str(event_id)
 
 
 def get_events_by_label(label: str) -> List[str]:
-    """Вернуть список текстов событий, помеченных *label*."""
+    """Вернуть список текстов событий, помеченных меткой ``label``.
+
+    Проходим по всей таблице ``episodic_memory`` и фильтруем записи,
+    где в метаданных присутствует указанная метка. Такой подход остаётся
+    простым и надёжным, хотя и не самый быстрый для больших объёмов.
+    """
+
     with get_connection() as conn:
-        rows = conn.execute("SELECT value FROM context_items").fetchall()
+        # Загружаем текст события и его метаданные. Здесь может быть
+        # большое количество строк, поэтому включаем подробный лог только
+        # на уровне отладки.
+        rows = conn.execute("SELECT text, meta FROM episodic_memory").fetchall()
+
     events: List[str] = []
     for row in rows:
         try:
-            data = json.loads(row["value"])
+            meta = json.loads(row["meta"])
         except Exception:
-            # Если значение не парсится как JSON, запись повреждена —
-            # пропускаем её, чтобы не ломать остальной вывод.
+            # Повреждённые JSON-метаданные не должны ломать всю выборку.
             logger.debug(
-                "long_term.get_events_by_label: пропуск повреждённой записи",
+                "get_events_by_label: пропуск записи с повреждёнными данными",
                 extra={"label": label},
             )
             continue
 
-        # В старых версиях данные могли быть не словарём, например числом.
-        # Чтобы не получить AttributeError при .get(), проверяем тип.
-        if not isinstance(data, dict):
+        if not isinstance(meta, dict):
             logger.debug(
-                "long_term.get_events_by_label: неожиданное значение %r",
-                data,
+                "get_events_by_label: неожиданный формат метаданных %r",
+                meta,
                 extra={"label": label},
             )
             continue
 
-        # Добавляем текст события, если среди меток присутствует нужная.
-        if label in data.get("labels", []):
-            events.append(str(data.get("text", "")))
-    logger.debug("long_term.get_events_by_label(%s): %s", label, events)
+        # Если искомая метка присутствует, добавляем текст события в
+        # итоговый список.
+        if label in meta.get("labels", []):
+            events.append(str(row["text"]))
+
+    logger.debug("get_events_by_label(%s): найдено %d событий", label, len(events))
     return events
