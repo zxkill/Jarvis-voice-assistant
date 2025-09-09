@@ -37,7 +37,9 @@ def test_nightly_reflection(monkeypatch, tmp_path):
     # Перехватываем обновление настроения и приоритетов
     mood_holder = {}
     monkeypatch.setattr(
-        memory_db, "set_mood_level", lambda level: mood_holder.setdefault("mood", level)
+        memory_db,
+        "set_mood",
+        lambda mood: mood_holder.setdefault("mood", mood.get("level")),
     )
     priorities_holder = {}
     monkeypatch.setattr(

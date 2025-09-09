@@ -100,7 +100,8 @@ class Mood:
     def save(self, trace_id: str | None = None) -> None:
         """Сохранить текущее состояние в БД."""
         start = time.time()
-        db.set_mood_state(self.valence, self.arousal, trace_id=trace_id)
+        # Сохраняем valence и arousal через новый унифицированный интерфейс
+        db.set_mood({"valence": self.valence, "arousal": self.arousal}, trace_id=trace_id)
         duration = int((time.time() - start) * 1000)
         self._logger.info(
             json.dumps(
@@ -117,7 +118,9 @@ class Mood:
     def load(cls, trace_id: str | None = None) -> "Mood":
         """Восстановить объект из БД."""
         start = time.time()
-        valence, arousal = db.get_mood_state(trace_id=trace_id)
+        # Загружаем valence и arousal из единой структуры настроения
+        mood = db.get_mood(trace_id=trace_id)
+        valence, arousal = mood["valence"], mood["arousal"]
         duration = int((time.time() - start) * 1000)
         logging.getLogger(__name__).info(
             json.dumps(
