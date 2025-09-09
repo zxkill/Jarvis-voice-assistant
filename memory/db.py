@@ -98,6 +98,20 @@ SCHEMA = [
     )
     """,
     """
+    -- Таблица связывает события с их метками для быстрого поиска
+    CREATE TABLE IF NOT EXISTS event_labels (
+        event_id INTEGER NOT NULL,
+        label    TEXT    NOT NULL,
+        PRIMARY KEY (event_id, label),
+        FOREIGN KEY (event_id) REFERENCES episodic_memory(id) ON DELETE CASCADE
+    )
+    """,
+    """
+    -- Индекс ускоряет выборку событий по метке
+    CREATE INDEX IF NOT EXISTS idx_event_labels_label
+        ON event_labels(label)
+    """,
+    """
     -- Таблица для семантической памяти: факты и знания
     CREATE TABLE IF NOT EXISTS semantic_memory (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Iterable, List
 
@@ -45,6 +44,22 @@ def add_daily_event(text: str, labels: Iterable[str]) -> str:
         raise
 
     logger.debug("add_daily_event: событие сохранено с id=%s", event_id)
+
+    # После сохранения события привязываем каждую метку к отдельной записи
+    # в таблице ``event_labels``. Это позволит фильтровать события
+    # непосредственно на уровне SQL без полного обхода таблицы.
+    try:
+        with get_connection() as conn:
+            for lbl in labels_list:
+                conn.execute(
+                    "INSERT OR IGNORE INTO event_labels (event_id, label) VALUES (?, ?)",
+                    (int(event_id), lbl),
+                )
+    except Exception:
+        # Логируем, но не прерываем выполнение: основное событие уже
+        # сохранено, а проблема с метками не должна ломать основной поток.
+        logger.exception("add_daily_event: не удалось сохранить метки %s", labels_list)
+
     # Возвращаем id в виде строки для обратной совместимости с прошлой
     # версией API, где ключ представлялся строкой.
     return str(event_id)
@@ -53,41 +68,28 @@ def add_daily_event(text: str, labels: Iterable[str]) -> str:
 def get_events_by_label(label: str) -> List[str]:
     """Вернуть список текстов событий, помеченных меткой ``label``.
 
-    Проходим по всей таблице ``episodic_memory`` и фильтруем записи,
-    где в метаданных присутствует указанная метка. Такой подход остаётся
-    простым и надёжным, хотя и не самый быстрый для больших объёмов.
+    В новой реализации фильтрация выполняется на стороне SQLite с
+    использованием вспомогательной таблицы ``event_labels``. Благодаря
+    этому нет необходимости загружать все записи в память и разбирать
+    JSON-метаданные, что значительно ускоряет запросы на больших объёмах
+    данных.
     """
 
     with get_connection() as conn:
-        # Загружаем текст события и его метаданные. Здесь может быть
-        # большое количество строк, поэтому включаем подробный лог только
-        # на уровне отладки.
-        rows = conn.execute("SELECT text, meta FROM episodic_memory").fetchall()
+        # Выполняем объединение ``episodic_memory`` и ``event_labels``
+        # и выбираем только тексты событий с нужной меткой. Индекс по
+        # столбцу ``label`` обеспечивает высокую скорость выборки.
+        rows = conn.execute(
+            """
+            SELECT e.text
+              FROM episodic_memory AS e
+              JOIN event_labels AS l ON e.id = l.event_id
+             WHERE l.label = ?
+             ORDER BY e.ts
+            """,
+            (label,),
+        ).fetchall()
 
-    events: List[str] = []
-    for row in rows:
-        try:
-            meta = json.loads(row["meta"])
-        except Exception:
-            # Повреждённые JSON-метаданные не должны ломать всю выборку.
-            logger.debug(
-                "get_events_by_label: пропуск записи с повреждёнными данными",
-                extra={"label": label},
-            )
-            continue
-
-        if not isinstance(meta, dict):
-            logger.debug(
-                "get_events_by_label: неожиданный формат метаданных %r",
-                meta,
-                extra={"label": label},
-            )
-            continue
-
-        # Если искомая метка присутствует, добавляем текст события в
-        # итоговый список.
-        if label in meta.get("labels", []):
-            events.append(str(row["text"]))
-
+    events = [str(row["text"]) for row in rows]
     logger.debug("get_events_by_label(%s): найдено %d событий", label, len(events))
     return events
