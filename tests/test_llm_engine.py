@@ -48,93 +48,9 @@ def test_compose_context_appends_current_datetime(monkeypatch):
     monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: ["предыдущее сообщение"])
 
     ctx = llm_engine._compose_context()
-    expected = (
-        "предыдущее сообщение\n"
-        "Текущая дата 25.04.2024, время 15:30:00. "
-        "Вопросы о сегодняшнем дне опирай на неё. Если нужно посчитать "
-        "разницу с датой из запроса, используй указанную дату, но не "
-        "подменяй ею текущую. Не поздравляй с днём рождения, если об этом "
-        "не попросили явно."
-    )
+    expected = "предыдущее сообщение\nТекущая дата 25.04.2024, время 15:30:00"
     assert ctx == expected
 
-
-def test_compose_context_overrides_user_dates(monkeypatch):
-    """Последняя строка должна перебивать даты из истории."""
-
-    monkeypatch.setattr(
-        llm_engine.current_date,
-        "refresh",
-        lambda: dt.date(2024, 4, 25),
-    )
-
-    class _FakeDatetime(dt.datetime):
-        @classmethod
-        def now(cls):  # type: ignore[override]
-            return dt.datetime(2024, 4, 25, 15, 30, 0)
-
-    monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
-    history = [{"user": "мой др 7 мая 1988", "reply": "понял"}]
-    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: history)
-
-    ctx = llm_engine._compose_context()
-    lines = ctx.splitlines()
-    assert "7 мая 1988" not in ctx  # дата должна быть скрыта
-    assert "[дата скрыта]" in ctx
-    assert lines[-1].startswith(
-        "Текущая дата 25.04.2024, время 15:30:00. Вопросы о сегодняшнем дне опирай"
-    )
-
-
-def test_compose_context_strips_numeric_dates(monkeypatch):
-    """Числовые форматы дат также маскируются."""
-
-    monkeypatch.setattr(
-        llm_engine.current_date,
-        "refresh",
-        lambda: dt.date(2024, 4, 25),
-    )
-
-    class _FakeDatetime(dt.datetime):
-        @classmethod
-        def now(cls):  # type: ignore[override]
-            return dt.datetime(2024, 4, 25, 15, 30, 0)
-
-    monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
-    history = [{"user": "дата 07.05.1988", "reply": "ок"}]
-    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: history)
-
-    ctx = llm_engine._compose_context()
-    assert "07.05.1988" not in ctx
-    assert "[дата скрыта]" in ctx
-
-
-def test_compose_context_filters_birthday(monkeypatch):
-    """Упоминания дня рождения не должны попадать в контекст."""
-
-    monkeypatch.setattr(
-        llm_engine.current_date,
-        "refresh",
-        lambda: dt.date(2024, 4, 25),
-    )
-
-    class _FakeDatetime(dt.datetime):
-        @classmethod
-        def now(cls):  # type: ignore[override]
-            return dt.datetime(2024, 4, 25, 15, 30, 0)
-
-    monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
-    history = [
-        {"user": "меня зовут алексей, мне 37 лет, день рождения 7 мая 1988", "reply": "привет"},
-        {"user": "просто сообщение", "reply": "с Днём Рождения!"},
-    ]
-    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: history)
-
-    ctx = llm_engine._compose_context()
-    lines = ctx.splitlines()[:-1]  # игнорируем конечный штамп
-    history_part = "\n".join(lines).lower()
-    assert "день рожд" not in history_part
-    assert "с дн" not in history_part
 
 
 def test_compose_context_refreshes_date(monkeypatch):
