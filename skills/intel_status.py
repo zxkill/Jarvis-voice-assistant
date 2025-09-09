@@ -47,24 +47,61 @@ def _get_last_presence() -> str | None:
     end = _format_ts(int(end_ts))
     return f"{start} – {end}"
 
+# Префикс ключей, относящихся к пользовательскому контексту
+_CONTEXT_PREFIX = "user:"
+
 
 def _get_last_context_items(limit: int = 3) -> List[str]:
-    """Вернуть последние *limit* записей контекста."""
+    """Вернуть последние *limit* пользовательских записей контекста.
+
+    Записи в таблице ``context_items`` могут включать служебные значения,
+    например уровень настроения или приоритеты. Мы оставляем только те
+    элементы, ключ которых начинается с :data:`_CONTEXT_PREFIX`. Одновременно
+    подсчитываем количество отброшенных строк для последующего анализа в
+    логах.
+    """
+
+    items: List[str] = []  # конечный список текстов
+    filtered = 0  # счётчик пропущенных записей
+    offset = 0  # смещение для пагинации запроса
+    batch = max(limit, 5)  # размер выборки за один проход
+
     with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT value FROM context_items ORDER BY ts DESC LIMIT ?", (limit,)
-        ).fetchall()
-    items: List[str] = []
-    for row in rows:
-        val = row["value"]
-        try:
-            data = json.loads(val)
-            text = str(data.get("text", ""))
-        except Exception:
-            text = str(val)
-        if text:
-            items.append(text)
-    items.reverse()  # хронологический порядок
+        while len(items) < limit:
+            # Получаем очередную порцию элементов в порядке убывания времени
+            rows = conn.execute(
+                "SELECT key, value FROM context_items ORDER BY ts DESC LIMIT ? OFFSET ?",
+                (batch, offset),
+            ).fetchall()
+            if not rows:
+                break  # достигли конца таблицы
+            offset += len(rows)
+
+            for row in rows:
+                key = str(row["key"])
+                if not key.startswith(_CONTEXT_PREFIX):
+                    # Игнорируем чужие записи и увеличиваем счётчик фильтрации
+                    filtered += 1
+                    continue
+
+                val = row["value"]
+                try:
+                    data = json.loads(val)
+                    text = str(data.get("text", ""))
+                except Exception:
+                    text = str(val)
+
+                if text:
+                    items.append(text)
+                    if len(items) >= limit:
+                        break
+
+    items.reverse()  # преобразуем в хронологический порядок
+    logger.debug(
+        "_get_last_context_items: отобрано %d, отфильтровано %d",
+        len(items),
+        filtered,
+    )
     return items
 
 
