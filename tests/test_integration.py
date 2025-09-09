@@ -40,10 +40,15 @@ def test_trigger_sends_telegram_when_absent(monkeypatch, tmp_path):
     core_events.publish(Event(kind="presence.update", attrs={"present": False}))
 
     # Генерацию подсказки через LLM делаем предсказуемой
-    monkeypatch.setattr(proactivity.llm_engine, "act", lambda prompt, trace_id=None: "разминка?")
+    monkeypatch.setattr(
+        proactivity.llm_engine,
+        "act",
+        lambda prompt, trace_id=None: '{"code": "hc", "text": "разминка?"}',
+    )
 
-    # Запускаем сценарий плейбука
-    core_events.fire_proactive_trigger("event", "health_check")
+    # Запускаем сценарий плейбука и ждём завершения обработки
+    thread = core_events.fire_proactive_trigger("event", "health_check")
+    thread.join(timeout=2)
 
     assert sent == [("telegram", "разминка?")]
 
@@ -75,9 +80,14 @@ def test_trigger_sends_voice_when_present(monkeypatch, tmp_path):
     ProactiveEngine(policy)
     core_events.publish(Event(kind="presence.update", attrs={"present": True}))
 
-    monkeypatch.setattr(proactivity.llm_engine, "act", lambda prompt, trace_id=None: "разминка?")
+    monkeypatch.setattr(
+        proactivity.llm_engine,
+        "act",
+        lambda prompt, trace_id=None: '{"code": "hc", "text": "разминка?"}',
+    )
 
-    core_events.fire_proactive_trigger("event", "health_check")
+    thread = core_events.fire_proactive_trigger("event", "health_check")
+    thread.join(timeout=2)
 
     assert sent == [("voice", "разминка?")]
 

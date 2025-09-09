@@ -95,3 +95,21 @@ def test_chat_llm_streams_to_telegram(monkeypatch):
 
     assert sent == ["Привет.", "Как дела?"]
     assert actions == ["typing", "typing"]
+
+
+def test_command_processing_defaults_max_chars(monkeypatch):
+    """Если ``working_tts`` не предоставляет ``MAX_CHARS``,
+    модуль должен использовать безопасное значение по умолчанию.
+    """
+
+    dummy_tts = SimpleNamespace(speak_async=lambda *a, **k: None)
+    dummy_skills = SimpleNamespace(handle_utterance=lambda *a, **k: None)
+    dummy_nlp = SimpleNamespace(normalize=lambda text: text)
+
+    monkeypatch.setitem(sys.modules, "working_tts", dummy_tts)
+    monkeypatch.setitem(sys.modules, "jarvis_skills", dummy_skills)
+    monkeypatch.setitem(sys.modules, "core.nlp", dummy_nlp)
+    monkeypatch.delitem(sys.modules, "app.command_processing", raising=False)
+
+    cp = importlib.import_module("app.command_processing")
+    assert cp.MAX_CHARS == 180

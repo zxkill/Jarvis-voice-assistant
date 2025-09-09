@@ -22,7 +22,8 @@ def test_trigger_generates_suggestion(monkeypatch):
 
     def fake_act(prompt: str, trace_id: str | None = None) -> str:
         calls["prompt"] = prompt
-        return "Привет"
+        # Возвращаем JSON, как ожидает обработчик триггера
+        return '{"code": "demo", "text": "Привет"}'
 
     monkeypatch.setattr(proactivity.llm_engine, "act", fake_act)
 
@@ -38,7 +39,10 @@ def test_trigger_generates_suggestion(monkeypatch):
     events._subscribers.clear()
     events.subscribe("proactivity.trigger", proactivity._handle_trigger)
     events.subscribe("suggestion.created", on_suggestion)
-    events.fire_proactive_trigger("time", "morning_briefing")
+    # fire_proactive_trigger теперь возвращает поток, который необходимо
+    # дождаться, чтобы обработчик успел опубликовать событие
+    thread = events.fire_proactive_trigger("time", "morning_briefing")
+    thread.join(timeout=2)
     assert captured["text"] == "Привет"
     assert captured["id"] == 42
     assert "утренний" in calls["prompt"].lower()

@@ -30,21 +30,37 @@ log = configure_logging("app")
 # Глобальные объекты для управления Telegram-слушателем
 tg_stop_event = threading.Event()
 tg_task: asyncio.Task | None = None
+# Флаг, предотвращающий повторную обработку сигнала завершения.
+_shutdown_flag = threading.Event()
 
 # ────────────────────────── SIGNALS ──────────────────────────────
 
 def _shutdown(signum: int, frame: Any):
     """Корректное завершение по Ctrl‑C/SIGTERM."""
+
+    # Предотвращаем повторный запуск логики остановки, если сигнал пришёл
+    # несколько раз подряд.
+    if _shutdown_flag.is_set():
+        log.debug("Игнорируем повторный сигнал %s", signum)
+        return
+    _shutdown_flag.set()
+
     log.info("Получен сигнал %s, завершаюсь…", signum)
     # Просим Telegram-слушатель остановиться
     tg_stop_event.set()
     if tg_task is not None:
         log.info("Останавливаю Telegram-слушатель")
         tg_task.cancel()
-    # Вместо принудительного sys.exit() генерируем KeyboardInterrupt,
-    # чтобы дать ``asyncio.run`` корректно остановить цикл событий и
-    # закрыть все задействованные ресурсы.
-    raise KeyboardInterrupt
+    # Останавливаем все зарегистрированные подсистемы (проактивные потоки
+    # и другие обработчики), чтобы выход был максимально быстрым.
+    log.info("Останавливаю фоновые подсистемы")
+    stop_mgr.trigger()
+    # Сообщаем в лог о завершении и немедленно выходим через ``SystemExit``.
+    # Такой подход не вмешивается в текущий ``event loop`` и исключает
+    # ошибку ``RuntimeError: Event loop stopped before Future completed``.
+    log.info("Ассистент завершил работу по запросу пользователя")
+    log.debug("Завершение приложения через SystemExit")
+    raise SystemExit(0)
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
@@ -332,9 +348,8 @@ async def main() -> None:
         log.debug("Размер кольцевого буфера: %d", len(pcm_buffer))
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # Пользователь запросил остановку (Ctrl+C). Дополнительный
-        # лог помогает отследить завершение приложения.
+    asyncio.run(main())
+    if _shutdown_flag.is_set():
+        # Пользователь запросил остановку (Ctrl+C). Дополнительный лог
+        # помогает отследить завершение приложения.
         log.info("Ассистент завершил работу по запросу пользователя")
