@@ -77,10 +77,34 @@ def test_compose_context_overrides_user_dates(monkeypatch):
 
     ctx = llm_engine._compose_context()
     lines = ctx.splitlines()
-    assert str(history[0]) in ctx
+    assert "7 мая 1988" not in ctx  # дата должна быть скрыта
+    assert "[дата скрыта]" in ctx
     assert lines[-1].startswith(
         "Текущая дата 25.04.2024, время 15:30:00. Вопросы о сегодняшнем дне опирай"
     )
+
+
+def test_compose_context_strips_numeric_dates(monkeypatch):
+    """Числовые форматы дат также маскируются."""
+
+    monkeypatch.setattr(
+        llm_engine.current_date,
+        "refresh",
+        lambda: dt.date(2024, 4, 25),
+    )
+
+    class _FakeDatetime(dt.datetime):
+        @classmethod
+        def now(cls):  # type: ignore[override]
+            return dt.datetime(2024, 4, 25, 15, 30, 0)
+
+    monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
+    history = [{"user": "дата 07.05.1988", "reply": "ок"}]
+    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: history)
+
+    ctx = llm_engine._compose_context()
+    assert "07.05.1988" not in ctx
+    assert "[дата скрыта]" in ctx
 
 
 def test_compose_context_refreshes_date(monkeypatch):
