@@ -3,6 +3,7 @@ from context import short_term, long_term
 import requests
 import pytest
 import datetime as dt
+import json
 
 
 @pytest.fixture(autouse=True)
@@ -27,8 +28,8 @@ def clear_short_term():
     short_term._buffer.clear()
 
 
-def test_compose_context_includes_current_datetime(monkeypatch):
-    """Проверяем, что контекст начинается с актуальных даты и времени."""
+def test_compose_context_appends_current_datetime(monkeypatch):
+    """Контекст должен завершаться актуальной датой и временем."""
 
     # Подменяем refresh, чтобы вернуть предсказуемую дату
     monkeypatch.setattr(
@@ -44,10 +45,12 @@ def test_compose_context_includes_current_datetime(monkeypatch):
             return dt.datetime(2024, 4, 25, 15, 30, 0)
 
     monkeypatch.setattr(llm_engine.dt, "datetime", _FakeDatetime)
-    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: [])
+    monkeypatch.setattr(llm_engine.short_term, "get_last", lambda: ["предыдущее сообщение"])
 
     ctx = llm_engine._compose_context()
-    assert ctx == "Сейчас 2024-04-25 15:30:00"
+    expected = "предыдущее сообщение\nТекущая дата 25.04.2024, время 15:30:00"
+    assert ctx == expected
+
 
 
 def test_compose_context_refreshes_date(monkeypatch):
@@ -252,3 +255,33 @@ def test_reflect_invalid_json(monkeypatch):
     monkeypatch.setattr(llm_engine, "_run", lambda *a, **kw: "not json")
     with pytest.raises(ValueError):
         llm_engine.reflect()
+
+
+def test_run_logs_interaction(tmp_path, monkeypatch):
+    """_run должен записывать prompt, контекст и ответ в отдельный файл."""
+
+    clear_short_term()
+    dummy = DummyQuery()
+
+    # Подменяем внешние зависимости, чтобы избежать сетевых запросов
+    monkeypatch.setattr(llm_engine, "_query_ollama", dummy)
+    monkeypatch.setattr(llm_engine, "_compose_context", lambda: "контекст")
+    monkeypatch.setattr(long_term, "get_events_by_label", lambda label: [])
+    monkeypatch.setattr(llm_engine.long_memory, "retrieve_similar", lambda q, top_k=5: [])
+
+    # Указываем путь для логов в временном каталоге и подменяем константу
+    log_file = tmp_path / "log.jsonl"
+    monkeypatch.setattr(llm_engine, "LLM_LOG_FILE", log_file)
+
+    result = llm_engine.think("тест", trace_id="tid42")
+    assert result == "ответ"
+
+    # Проверяем, что запись появилась и содержит нужные поля
+    data = log_file.read_text(encoding="utf-8").strip().splitlines()
+    assert len(data) == 1
+    entry = json.loads(data[0])
+    assert entry["trace_id"] == "tid42"
+    assert entry["stage"] == "think"
+    assert entry["context"] == "контекст"
+    assert "тест" in entry["prompt"]
+    assert entry["reply"] == "ответ"
