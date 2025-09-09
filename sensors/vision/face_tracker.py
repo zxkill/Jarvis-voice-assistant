@@ -69,7 +69,7 @@ class FaceTracker:
             if self.state.present:
                 self.state.present = False
                 publish(Event(kind="vision.face_tracker", attrs={"present": False}))
-                log.info("Лицо потеряно")
+                log.debug("Лицо потеряно")
                 _clear_track()
                 _tracking_active = False
             return
