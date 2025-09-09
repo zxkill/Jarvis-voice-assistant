@@ -3,6 +3,7 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
 import logging
+import threading
 from typing import Any, Callable, Dict, List
 
 
@@ -54,8 +55,14 @@ def publish(event: Event) -> None:
 
 
 # --- Утилиты для проактивных подсказок ------------------------------------
-def fire_proactive_trigger(kind: str, name: str, context: Dict[str, Any] | None = None) -> None:
-    """Опубликовать событие проактивного триггера.
+def fire_proactive_trigger(
+    kind: str, name: str, context: Dict[str, Any] | None = None
+) -> threading.Thread:
+    """Асинхронно опубликовать событие проактивного триггера.
+
+    Длительная генерация подсказок через LLM не должна блокировать поток,
+    из которого был инициирован триггер (например, цикл чтения камеры).
+    Поэтому публикация события выполняется в отдельном **daemon**‑потоке.
 
     Parameters
     ----------
@@ -65,9 +72,32 @@ def fire_proactive_trigger(kind: str, name: str, context: Dict[str, Any] | None 
         Имя сценария из плейбука.
     context:
         Дополнительные атрибуты, передаваемые обработчику.
+
+    Returns
+    -------
+    threading.Thread
+        Объект запущенного потока, что упрощает тестирование и, при
+        необходимости, позволяет дождаться завершения обработки.
     """
 
     attrs = {"trigger": kind, "name": name}
     if context:
         attrs["context"] = context
-    publish(Event("proactivity.trigger", attrs))
+
+    def _worker() -> None:
+        """Фактическая публикация события в отдельном потоке."""
+
+        try:
+            log.debug(
+                "proactivity trigger async publish", extra={"ctx": attrs}
+            )
+            publish(Event("proactivity.trigger", attrs))
+        except Exception:
+            # Любая ошибка не должна убивать поток вызывающего кода
+            log.exception(
+                "proactivity trigger failed", extra={"ctx": attrs}
+            )
+
+    thread = threading.Thread(target=_worker, name="proactivity-trigger", daemon=True)
+    thread.start()
+    return thread
