@@ -44,7 +44,8 @@ class EmotionState:
         # Числовой уровень настроения [-100;100]. При запуске
         # восстанавливаем его из постоянного хранилища, чтобы Jarvis
         # помнил предыдущее состояние между перезапусками.
-        self.mood = db.get_mood_level()
+        # Загружаем числовой уровень настроения из единого хранилища
+        self.mood = db.get_mood()["level"]
         # Инициализируем логгер для удобной отладки.
         self._log = configure_logging("emotion.state")
 
@@ -59,7 +60,8 @@ class EmotionState:
 
     def _save_mood(self) -> None:
         """Сохранить текущее значение настроения в БД."""
-        db.set_mood_level(self.mood)
+        # Сохраняем только уровень, не затрагивая valence/arousal
+        db.set_mood({"level": self.mood})
 
     def raise_mood(self, delta: int = 10, reason: str = "") -> int:
         """Повысить настроение на ``delta`` и вернуть новое значение.

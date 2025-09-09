@@ -66,7 +66,8 @@ def _run_nightly_reflection() -> None:
         )
     if mood is not None:
         try:
-            memory_db.set_mood_level(int(mood))
+            # Обновляем только числовой уровень настроения через новый API
+            memory_db.set_mood({"level": int(mood)})
         except Exception:
             log.exception("failed to set mood", extra={"ctx": {"mood": mood}})
     last = memory_db.get_last_digest()

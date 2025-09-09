@@ -65,7 +65,7 @@ def test_daily_memory_transferred(monkeypatch, tmp_path):
 
     monkeypatch.setattr(memory_db, "add_daily_digest", lambda *a, **k: None)
     monkeypatch.setattr(memory_db, "set_priorities", lambda *a, **k: None)
-    monkeypatch.setattr(memory_db, "set_mood_level", lambda *a, **k: None)
+    monkeypatch.setattr(memory_db, "set_mood", lambda *a, **k: None)
 
     # Записываем подсказку в БД для получения reason_code
     with memory_db.get_connection() as conn:
