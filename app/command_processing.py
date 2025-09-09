@@ -11,12 +11,13 @@ from typing import Any, Dict, List
 
 import asyncio
 import uuid
+import re
 from rapidfuzz import fuzz
 
 import jarvis_skills
 handle_utterance = jarvis_skills.handle_utterance
 from core.nlp import normalize
-from working_tts import speak_async
+from working_tts import speak_async, MAX_CHARS
 from core.request_source import get_request_source
 from core.logging_json import configure_logging
 from core import events as core_events, llm_engine
@@ -58,6 +59,11 @@ ACTIVATION_CONFIDENCE = 65
 # значение — список фраз‑вариантов. Заполняется при старте из ``commands.yaml``.
 VA_CMD_LIST: Dict[str, List[str]] = {}
 
+# Регулярное выражение для разделения текста на предложения.
+# Используется при потоковой озвучке ответов LLM, чтобы не обрывать
+# фразы на середине.
+_STREAM_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
+
 # ─── Переменные режима общения ────────────────────────────────────────────
 # Флаг активности «режима общения», когда LLM ведёт диалог без слова активации.
 CHAT_MODE_ACTIVE: bool = False
@@ -86,19 +92,90 @@ def is_chat_stop_phrase(text: str) -> bool:
 
 
 async def _chat_llm(text: str) -> None:
-    """Отправить реплику в LLM и озвучить ответ, сохранив историю."""
+    """Отправить реплику в LLM и озвучивать ответ по мере генерации."""
 
     trace_id = uuid.uuid4().hex
     log.info("chat message", extra={"ctx": {"text": text, "trace_id": trace_id}})
+
+    loop = asyncio.get_running_loop()
+    # Определяем источник запроса: голос или Telegram.
+    source = get_request_source()
+
+    def _worker() -> str:
+        """Выполняет потоковый запрос к LLM и выводит ответ по мере готовности."""
+
+        buffer = ""  # накопленный хвост, ещё не отправленный
+        chunk = ""   # текущий чанк из завершённых предложений
+        full_reply = ""
+
+        notifier = None
+        if source == "telegram":
+            # Импортируем модуль отправки сообщений только при необходимости.
+            from notifiers import telegram as notifier  # локальный импорт для тестов
+
+            notifier.send_action()  # показываем пользователю, что мы «печатаем»
+
+        def _flush(text: str, *, final: bool = False) -> None:
+            """Отправить или озвучить готовый кусок ответа."""
+
+            if source == "telegram":
+                assert notifier is not None
+                notifier.send(text)
+                log.debug(
+                    "telegram chunk sent",
+                    extra={"ctx": {"chunk": text, "trace_id": trace_id}},
+                )
+                if not final:
+                    # Продолжаем показывать индикатор набора, пока генерация идёт.
+                    notifier.send_action()
+            else:
+                # Озвучиваем текст через TTS в основном event loop.
+                fut = asyncio.run_coroutine_threadsafe(speak_async(text), loop)
+                fut.result()
+                log.debug(
+                    "spoken chunk", extra={"ctx": {"chunk": text, "trace_id": trace_id}}
+                )
+
+        try:
+            for part in llm_engine.stream_think(text, trace_id=trace_id):
+                full_reply += part
+                buffer += part
+
+                # Делим буфер по предложениям: последний элемент может быть
+                # незавершённой фразой и остаётся в ``buffer``.
+                sentences = _STREAM_SENTENCE_RE.split(buffer)
+                buffer = sentences.pop() if sentences else ""
+
+                for sent in sentences:
+                    if len(chunk) + len(sent) + 1 <= MAX_CHARS:
+                        chunk = f"{chunk} {sent}".strip()
+                    else:
+                        _flush(chunk)
+                        chunk = sent
+
+        except Exception:  # pragma: no cover - сетевые сбои LLM
+            log.exception("llm stream failed", extra={"ctx": {"trace_id": trace_id}})
+            return full_reply
+
+        # После завершения потока обрабатываем оставшийся буфер
+        if buffer:
+            if len(chunk) + len(buffer) + 1 <= MAX_CHARS:
+                chunk = f"{chunk} {buffer}".strip()
+            else:
+                _flush(chunk)
+                chunk = buffer
+
+        if chunk:
+            _flush(chunk, final=True)
+
+        return full_reply
+
     try:
-        reply = await asyncio.to_thread(llm_engine.think, text, trace_id=trace_id)
-    except Exception:  # pragma: no cover - логируем сбои внешней LLM
-        log.exception("llm think failed", extra={"ctx": {"trace_id": trace_id}})
+        reply = await asyncio.to_thread(_worker)
+    except Exception:  # pragma: no cover - защита от непредвиденных ошибок
+        log.exception("llm worker failed", extra={"ctx": {"trace_id": trace_id}})
         return
-    try:
-        await speak_async(reply)
-    except Exception:  # pragma: no cover - синтез речи не критичен для тестов
-        log.exception("failed to speak llm reply", extra={"ctx": {"trace_id": trace_id}})
+
     CHAT_HISTORY.append((text, reply))
     _reset_chat_timer()
 

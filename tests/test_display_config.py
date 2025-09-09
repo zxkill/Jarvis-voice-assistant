@@ -8,6 +8,16 @@ os.environ.setdefault("TELEGRAM_TOKEN", "test")
 
 from start import init_display_from_config
 from display.drivers.console import ConsoleDisplayDriver
+from display.drivers.none import NoneDisplayDriver
+import display
+
+
+@pytest.fixture(autouse=True)
+def reset_display_driver():
+    """Сбрасываем глобальный драйвер перед каждым тестом."""
+    display._driver = None  # type: ignore[attr-defined]
+    yield
+    display._driver = None  # type: ignore[attr-defined]
 
 
 def test_init_display_console():
@@ -37,3 +47,19 @@ def test_init_display_wait_ready(monkeypatch):
 
     with pytest.raises(RuntimeError):
         init_display_from_config(cfg)
+
+
+def test_init_display_none():
+    """Если выбран драйвер ``none``, вывод полностью отключается."""
+    cfg = configparser.ConfigParser()
+    cfg.add_section("DISPLAY")
+    cfg.set("DISPLAY", "driver", "none")
+    driver = init_display_from_config(cfg)
+    assert isinstance(driver, NoneDisplayDriver)
+
+
+def test_init_display_default_none():
+    """При отсутствии секции ``DISPLAY`` используется драйвер ``none``."""
+    cfg = configparser.ConfigParser()
+    driver = init_display_from_config(cfg)
+    assert isinstance(driver, NoneDisplayDriver)

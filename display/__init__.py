@@ -6,10 +6,12 @@
  ├── __init__.py    # загрузчик драйверов и базовый класс
  └── drivers/       # папка с драйверами
      ├── __init__.py
-     └── console.py # драйвер вывода текста в консоль
+     ├── console.py # драйвер вывода текста в консоль
+     └── none.py    # заглушка без вывода
 """
 from abc import ABC, abstractmethod
 import importlib
+import logging
 
 
 from dataclasses import dataclass
@@ -64,8 +66,11 @@ class DisplayDriver(ABC):
 # Внутренний экземпляр текущего драйвера
 _driver: DisplayDriver | None = None
 
+# Настраиваем логгер модуля
+_log = logging.getLogger(__name__)
 
-def init_driver(name: str = "console", driver: DisplayDriver | None = None) -> DisplayDriver:
+
+def init_driver(name: str = "none", driver: DisplayDriver | None = None) -> DisplayDriver:
     """
     Инициализировать драйвер дисплея:
       - name: имя модуля внутри ``display.drivers`` (без ``.py``)
@@ -80,18 +85,19 @@ def init_driver(name: str = "console", driver: DisplayDriver | None = None) -> D
         _driver = driver
         return _driver
 
-    # динамический импорт по имени
+    # Динамический импорт выбранного драйвера
     module_path = f"display.drivers.{name}"
-    print(f"[LOG] Display module {module_path}")
+    _log.debug("Загрузка модуля дисплея %s", module_path)
     module = importlib.import_module(module_path)
-    # ожидаем, что класс называется <Name>DisplayDriver
+    # Ожидаем, что класс называется <Name>DisplayDriver
     class_name = name.capitalize() + "DisplayDriver"
     driver_cls = getattr(module, class_name)
     _driver = driver_cls()
     try:
         _driver.process_events()
     except Exception:
-        pass
+        # Ошибки обработки событий не критичны и логируются для отладки
+        _log.debug("Ошибка запуска цикла событий дисплея", exc_info=True)
     return _driver
 
 def get_driver() -> DisplayDriver:
