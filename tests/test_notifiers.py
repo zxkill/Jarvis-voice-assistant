@@ -86,6 +86,24 @@ def test_telegram_notifier_send_failure(monkeypatch):
     assert metric_calls["count"] == 1
 
 
+def test_telegram_notifier_send_action(monkeypatch):
+    telegram = _load_telegram(monkeypatch)
+    sent = {}
+
+    def fake_post(url, json, timeout):
+        sent["url"] = url
+        sent["json"] = json
+        return DummyResp()
+
+    monkeypatch.setattr(telegram.requests, "post", fake_post)
+
+    notifier = telegram.TelegramNotifier("TOKEN", 123)
+    notifier.send_action("typing")
+
+    assert sent["url"].endswith("/sendChatAction")
+    assert sent["json"] == {"chat_id": 123, "action": "typing"}
+
+
 def test_telegram_send_wrapper(monkeypatch):
     telegram = _load_telegram(monkeypatch)
     sent = []
@@ -98,6 +116,20 @@ def test_telegram_send_wrapper(monkeypatch):
     telegram.send("hi")
 
     assert sent == ["hi"]
+
+
+def test_telegram_send_action_wrapper(monkeypatch):
+    telegram = _load_telegram(monkeypatch)
+    actions = []
+
+    class DummyNotifier:
+        def send_action(self, action):
+            actions.append(action)
+
+    monkeypatch.setattr(telegram, "_notifier", DummyNotifier())
+    telegram.send_action("typing")
+
+    assert actions == ["typing"]
 
 
 def test_voice_send_processes_queue(monkeypatch):

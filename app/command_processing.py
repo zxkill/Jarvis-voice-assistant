@@ -98,13 +98,43 @@ async def _chat_llm(text: str) -> None:
     log.info("chat message", extra={"ctx": {"text": text, "trace_id": trace_id}})
 
     loop = asyncio.get_running_loop()
+    # Определяем источник запроса: голос или Telegram.
+    source = get_request_source()
 
     def _worker() -> str:
-        """Выполняет потоковый запрос к LLM и запускает озвучку."""
+        """Выполняет потоковый запрос к LLM и выводит ответ по мере готовности."""
 
-        buffer = ""  # накопленный хвост, ещё не отправленный на озвучку
-        chunk = ""   # текущий чанк, собранный из завершённых предложений
+        buffer = ""  # накопленный хвост, ещё не отправленный
+        chunk = ""   # текущий чанк из завершённых предложений
         full_reply = ""
+
+        notifier = None
+        if source == "telegram":
+            # Импортируем модуль отправки сообщений только при необходимости.
+            from notifiers import telegram as notifier  # локальный импорт для тестов
+
+            notifier.send_action()  # показываем пользователю, что мы «печатаем»
+
+        def _flush(text: str, *, final: bool = False) -> None:
+            """Отправить или озвучить готовый кусок ответа."""
+
+            if source == "telegram":
+                assert notifier is not None
+                notifier.send(text)
+                log.debug(
+                    "telegram chunk sent",
+                    extra={"ctx": {"chunk": text, "trace_id": trace_id}},
+                )
+                if not final:
+                    # Продолжаем показывать индикатор набора, пока генерация идёт.
+                    notifier.send_action()
+            else:
+                # Озвучиваем текст через TTS в основном event loop.
+                fut = asyncio.run_coroutine_threadsafe(speak_async(text), loop)
+                fut.result()
+                log.debug(
+                    "spoken chunk", extra={"ctx": {"chunk": text, "trace_id": trace_id}}
+                )
 
         try:
             for part in llm_engine.stream_think(text, trace_id=trace_id):
@@ -120,13 +150,7 @@ async def _chat_llm(text: str) -> None:
                     if len(chunk) + len(sent) + 1 <= MAX_CHARS:
                         chunk = f"{chunk} {sent}".strip()
                     else:
-                        fut = asyncio.run_coroutine_threadsafe(
-                            speak_async(chunk), loop
-                        )
-                        fut.result()
-                        log.debug(
-                            "spoken chunk", extra={"ctx": {"chunk": chunk, "trace_id": trace_id}}
-                        )
+                        _flush(chunk)
                         chunk = sent
 
         except Exception:  # pragma: no cover - сетевые сбои LLM
@@ -138,19 +162,11 @@ async def _chat_llm(text: str) -> None:
             if len(chunk) + len(buffer) + 1 <= MAX_CHARS:
                 chunk = f"{chunk} {buffer}".strip()
             else:
-                fut = asyncio.run_coroutine_threadsafe(speak_async(chunk), loop)
-                fut.result()
-                log.debug(
-                    "spoken chunk", extra={"ctx": {"chunk": chunk, "trace_id": trace_id}}
-                )
+                _flush(chunk)
                 chunk = buffer
 
         if chunk:
-            fut = asyncio.run_coroutine_threadsafe(speak_async(chunk), loop)
-            fut.result()
-            log.debug(
-                "spoken chunk", extra={"ctx": {"chunk": chunk, "trace_id": trace_id}}
-            )
+            _flush(chunk, final=True)
 
         return full_reply
 

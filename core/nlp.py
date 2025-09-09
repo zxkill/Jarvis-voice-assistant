@@ -5,6 +5,17 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
+import inspect
+
+if not hasattr(inspect, "getargspec"):
+    # ``pymorphy2`` использует устаревший ``getargspec``; определяем
+    # совместимую обёртку на базе ``getfullargspec``.
+    def _getargspec(func):  # type: ignore[override]
+        spec = inspect.getfullargspec(func)
+        return spec.args, spec.varargs, spec.varkw, spec.defaults
+
+    inspect.getargspec = _getargspec  # type: ignore[attr-defined]
+
 import pymorphy2
 from num2words import num2words
 

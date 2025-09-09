@@ -1,7 +1,7 @@
 """Отправка личных сообщений владельцу через Telegram.
 
-Публичный API модуля — функция :func:`send`, использующая
-предсозданный экземпляр :class:`TelegramNotifier`.
+Публичный API модуля — функции :func:`send` и :func:`send_action`,
+использующие предсозданный экземпляр :class:`TelegramNotifier`.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ class TelegramNotifier:
     def __init__(self, token: str, user_id: int) -> None:
         # Готовим URL метода ``sendMessage`` с токеном бота.
         self._api = f"https://api.telegram.org/bot{token}/sendMessage"
+        # Отдельный URL для ``sendChatAction`` показывает в чате, что бот печатает.
+        self._api_action = f"https://api.telegram.org/bot{token}/sendChatAction"
         # Telegram ID пользователя, которому адресуются уведомления.
         self._user_id = user_id
 
@@ -59,6 +61,23 @@ class TelegramNotifier:
             log.warning("telegram request failed: %s", exc)
             inc_metric("telegram.failures")
 
+    def send_action(self, action: str = "typing") -> None:
+        """Отправить пользователю индикатор действия.
+
+        Используется для отображения статуса «печатает…», чтобы собеседник
+        видел, что ассистент формирует ответ. По умолчанию применяется
+        действие ``typing``.
+        """
+        log.debug("telegram send action=%s", action)
+        try:
+            requests.post(
+                self._api_action,
+                json={"chat_id": self._user_id, "action": action},
+                timeout=5,
+            )
+        except requests.RequestException as exc:  # pragma: no cover - сетевые сбои
+            log.warning("telegram action failed: %s", exc)
+
 
 # Создаём уведомитель после определения класса.
 _notifier = TelegramNotifier(
@@ -70,3 +89,8 @@ _notifier = TelegramNotifier(
 def send(text: str) -> None:
     """Публичная обёртка, отправляющая сообщение владельцу."""
     _notifier.send(text)
+
+
+def send_action(action: str = "typing") -> None:
+    """Публичная обёртка для отправки индикатора действия."""
+    _notifier.send_action(action)
