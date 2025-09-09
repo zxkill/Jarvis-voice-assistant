@@ -55,14 +55,16 @@ signal.signal(signal.SIGTERM, _shutdown)
 def init_display_from_config(cfg: configparser.ConfigParser) -> DisplayDriver:
     """Инициализировать драйвер дисплея на основе ``config.ini``.
 
-    Параметр ``[DISPLAY] driver`` позволяет выбирать между выводом в
-    консоль и работой с M5Stack.  Если драйвер поддерживает метод
-    ``wait_ready`` (например, Serial‑мост M5), он будет вызван для
-    проверки готовности устройства.
+    Параметр ``[DISPLAY] driver`` принимает значения:
+      * ``none``   — полностью отключить вывод (по умолчанию);
+      * ``console`` — отрисовка в терминале;
+      * ``serial``  — работа с реальным устройством M5Stack.
+    Если драйвер поддерживает метод ``wait_ready`` (например, Serial‑мост
+    M5), он будет вызван для проверки готовности устройства.
     """
 
-    # Получаем имя драйвера, по умолчанию используем консоль для удобной отладки
-    driver_name = cfg.get("DISPLAY", "driver", fallback="console")
+    # Получаем имя драйвера, по умолчанию отключаем вывод для чистых логов
+    driver_name = cfg.get("DISPLAY", "driver", fallback="none")
     log.info("Инициализация дисплея через драйвер '%s'", driver_name)
     driver = init_driver(driver_name)
 
