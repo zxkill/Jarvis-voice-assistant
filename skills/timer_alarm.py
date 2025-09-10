@@ -30,6 +30,7 @@ from memory.db import get_connection
 from notifiers.telegram import send as _tg_send
 from core import stop as _stop_mgr
 from core.logging_json import configure_logging
+from utils import ru_datetime as _ru_dt
 
 log = configure_logging("skills.timer_alarm")
 
@@ -95,71 +96,10 @@ _UNITS = {
     "часов": 3600,
 }
 
-_NUM_WORDS = {
-    "ноль": 0, "ноля": 0,
-    "один": 1, "одна": 1, "одну": 1, "одной": 1,
-    "два": 2, "две": 2,
-    "три": 3,
-    "четыре": 4,
-    "пять": 5,
-    "шесть": 6,
-    "семь": 7,
-    "восемь": 8,
-    "девять": 9,
-    "десять": 10,
-    "одиннадцать": 11,
-    "двенадцать": 12,
-    "тринадцать": 13,
-    "четырнадцать": 14,
-    "пятнадцать": 15,
-    "шестнадцать": 16,
-    "семнадцать": 17,
-    "восемнадцать": 18,
-    "девятнадцать": 19,
-    "двадцать": 20,
-    "тридцать": 30,
-    "сорок": 40,
-    "пятьдесят": 50,
-    "шестьдесят": 60,
-}
-
-
-def _words_to_number(chunk: str) -> int | None:
-    """Конвертирует "двадцать пять" → 25."""
-    numbers: list[int] = []
-    acc: int | None = None
-    for w in chunk.lower().split():
-        if w.isdigit():
-            numbers.append(int(w))
-            acc = None
-            continue
-        val = _NUM_WORDS.get(w)
-        if val is None:
-            if acc is not None:
-                numbers.append(acc)
-                acc = None
-            continue
-        if val < 10 and acc is not None and acc >= 20:
-            numbers.append(acc + val)
-            acc = None
-        elif val % 10 == 0 and val >= 20:
-            acc = val
-        else:
-            numbers.append(val)
-            acc = None
-    if acc is not None:
-        numbers.append(acc)
-    return numbers[0] if numbers else None
-
-
 _DUR_RE = re.compile(r"(?:на|через)\s+(?P<num>[\dа-яё\s]+?)\s+(?P<unit>[а-я]+)")
 _TIME_RE = re.compile(r"(?:в|на)\s*(?P<h>\d{1,2})(?:[:.\s](?P<m>\d{1,2}))?")
 
 
-def _to_int(tok: str) -> int | None:
-    """Преобразует отдельное слово или число в int."""
-    tok = tok.strip()
-    return int(tok) if tok.isdigit() else _words_to_number(tok)
 
 
 def _beep(freq: int = 880, duration: float = 0.2) -> None:
@@ -297,7 +237,7 @@ def _parse_duration(text: str, default: str) -> Tuple[int, str] | None:
     sec_per = _UNITS.get(unit)  # переводим единицу в секунды
     if not sec_per:
         return None
-    num = _to_int(num_token)
+    num = _ru_dt.to_int(num_token)
     if num is None:
         return None
     sec = num * sec_per
@@ -327,7 +267,7 @@ def _parse_time(text: str, default: str) -> Tuple[int, str] | None:
         tokens = m2.group(1).split()
         if not tokens:
             return None
-        h = _to_int(tokens[0])
+        h = _ru_dt.to_int(tokens[0])
         if h is None:
             return None
         idx = 1
@@ -336,14 +276,14 @@ def _parse_time(text: str, default: str) -> Tuple[int, str] | None:
             if t.startswith("час"):
                 idx += 1
                 if idx < len(tokens):
-                    cand = _to_int(tokens[idx])
+                    cand = _ru_dt.to_int(tokens[idx])
                     if cand is not None:
                         mnt = cand
                         idx += 1
                         if idx < len(tokens) and tokens[idx].startswith("мин"):
                             idx += 1
             else:
-                cand = _to_int(t)
+                cand = _ru_dt.to_int(t)
                 if cand is not None:
                     mnt = cand
                     idx += 1
@@ -377,9 +317,11 @@ def _list_timers() -> str:
             m, s = divmod(max(rem, 0), 60)
             kind = "Таймер" if typ == "timer" else "Напоминание"
             if m:
-                lines.append(f"{kind} {label}: {m} мин {s} с")
+                lines.append(
+                    f"{kind} {label}: {m} {_ru_dt.minutes_decl(m)} {s} {_ru_dt.seconds_decl(s)}"
+                )
             else:
-                lines.append(f"{kind} {label}: {s} с")
+                lines.append(f"{kind} {label}: {s} {_ru_dt.seconds_decl(s)}")
         else:
             kind = "Будильник" if typ == "alarm" else "Напоминание"
             lines.append(f"{kind} {label}: {end.strftime('%H:%M')}")
@@ -469,7 +411,12 @@ def handle(text: str) -> str:
             _schedule(sec, label, "timer")
             return f"Перезапускаю таймер {label}"
         _schedule(sec, label, "timer")
-        return f"Таймер {label} на {sec // 60 if sec >= 60 else sec} {'минут' if sec >= 60 else 'секунд'} запущен"
+        if sec >= 60:
+            minutes = sec // 60
+            unit = _ru_dt.minutes_decl(minutes)
+            return f"Таймер {label} на {minutes} {unit} запущен"
+        unit = _ru_dt.seconds_decl(sec)
+        return f"Таймер {label} на {sec} {unit} запущен"
     # установка будильника на конкретное время
     if "разбуди" in txt:
         parsed = _parse_time(txt, "будильник")
@@ -499,10 +446,12 @@ def handle(text: str) -> str:
         _schedule(sec, label, typ)
         if typ == "reminder_timer":
             if sec >= 3600:
-                return f"Напоминание {label} через {sec // 3600} часов"
+                hours = sec // 3600
+                return f"Напоминание {label} через {hours} {_ru_dt.hours_decl(hours)}"
             if sec >= 60:
-                return f"Напоминание {label} через {sec // 60} минут"
-            return f"Напоминание {label} через {sec} секунд"
+                minutes = sec // 60
+                return f"Напоминание {label} через {minutes} {_ru_dt.minutes_decl(minutes)}"
+            return f"Напоминание {label} через {sec} {_ru_dt.seconds_decl(sec)}"
         end = (_dt.datetime.now() + _dt.timedelta(seconds=sec)).strftime('%H:%M')
         return f"Напоминание {label} на {end} установлено"
     return ""

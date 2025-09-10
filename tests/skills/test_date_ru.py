@@ -24,12 +24,11 @@ def test_handle_today(monkeypatch):
     """При запросе сегодняшнего дня возвращается корректная дата."""
 
     _freeze_today(monkeypatch)
-    assert date_ru.handle("какой сегодня день") == "25 апреля, четверг"
+    assert date_ru.handle("какой сегодня день") == "двадцать пятое апреля, четверг"
 
 
 def test_handle_tomorrow(monkeypatch):
     """При запросе завтрашнего дня дата сдвигается на сутки вперёд."""
 
     _freeze_today(monkeypatch)
-    assert date_ru.handle("какой завтра день") == "26 апреля, пятница"
-
+    assert date_ru.handle("какой завтра день") == "двадцать шестое апреля, пятница"

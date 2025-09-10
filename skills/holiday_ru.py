@@ -1,8 +1,8 @@
 """Скилл: рассказывает о праздниках в России.
 
 Использует API https://date.nager.at для получения списка официальных
-праздников.  При ошибках сеть/формата возвращается дружелюбное
-сообщение.
+праздников.  Также знает несколько популярных ИТ‑праздников.
+При ошибках сеть/формата возвращается дружелюбное сообщение.
 """
 
 from __future__ import annotations
@@ -13,6 +13,8 @@ from typing import List, Tuple
 
 import requests
 
+from utils import ru_datetime as _ru_dt
+
 # Настраиваем логгер с отдельным неймспейсом для удобной фильтрации
 log = logging.getLogger("skills.holiday_ru")
 
@@ -21,6 +23,8 @@ PATTERNS = [
     "какие праздники сегодня",
     "какой завтра праздник",
 ]
+
+
 def _get_holidays(year: int) -> List[dict]:
     """Получить список официальных праздников на указанный год."""
 
@@ -29,6 +33,40 @@ def _get_holidays(year: int) -> List[dict]:
     resp = requests.get(url, timeout=10)
     resp.raise_for_status()
     return resp.json()
+
+
+def _day_of_programmer(year: int) -> _dt.date:
+    """Вычислить дату Дня программиста (256‑й день года)."""
+
+    return _dt.date(year, 1, 1) + _dt.timedelta(days=255)
+
+
+def _sysadmin_day(year: int) -> _dt.date:
+    """Последняя пятница июля — День системного администратора."""
+
+    day = _dt.date(year, 7, 31)
+    while day.weekday() != 4:  # 4 соответствует пятнице
+        day -= _dt.timedelta(days=1)
+    return day
+
+
+def get_it_holiday(day: _dt.date) -> str:
+    """Вернуть название ИТ‑праздника для указанной даты или пустую строку."""
+
+    mapping = {
+        _dt.date(day.year, 3, 31): "День резервного копирования",
+        _dt.date(day.year, 4, 4): "День веб-мастера",
+        _dt.date(day.year, 9, 9): "День тестировщика",
+        _day_of_programmer(day.year): "День программиста",
+        _sysadmin_day(day.year): "День системного администратора",
+    }
+    name = mapping.get(day, "")
+    if name:
+        log.info(
+            "обнаружен ИТ-праздник",
+            extra={"ctx": {"day": day.isoformat(), "name": name}},
+        )
+    return name
 
 
 def is_day_off(day: _dt.date | None = None) -> Tuple[bool, str]:
@@ -76,11 +114,15 @@ def handle(text: str) -> str:
     log.debug("обработка запроса", extra={"ctx": {"day": day.isoformat(), "text": text}})
     try:
         flag, name = is_day_off(day)
+        formatted = _ru_dt.format_date(day)
         if flag and name != "выходной":
-            return f"{day.strftime('%d %B %Y')} — {name}"
+            return f"{formatted} — {name}"
+        it_name = get_it_holiday(day)
+        if it_name:
+            return f"{formatted} — {it_name}"
         if flag:
-            return f"{day.strftime('%d %B %Y')} — выходной день"
-        return "Сегодня официальных праздников нет"
+            return f"{formatted} — выходной день"
+        return "Сегодня праздников нет"
     except Exception as exc:  # pragma: no cover - сетевые ошибки маловероятны
-        log.exception("не удалось получить информацию", extra={"ctx": {"err": str(exc)}})
+        log.exception("не удалось получиь информацию", extra={"ctx": {"err": str(exc)}})
         return "Не удалось получить информацию о праздниках"
