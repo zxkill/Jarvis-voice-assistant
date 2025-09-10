@@ -23,6 +23,8 @@ from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
 from emotion import sounds
 from notifiers.telegram_listener import launch as launch_telegram_listener
+from behavior.tree import create_behavior_tree
+from py_trees.trees import BehaviourTree
 
 # ────────────────────────── LOGGING ──────────────────────────────
 log = configure_logging("app")
@@ -89,6 +91,39 @@ def init_display_from_config(cfg: configparser.ConfigParser) -> DisplayDriver:
         raise RuntimeError("display not ready")
 
     return driver
+
+
+def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
+    """Запустить поведенческое дерево и тикать его периодически."""
+
+    # Создаём дерево поведения Jarvis на основе py_trees
+    tree = create_behavior_tree()
+
+    async def _ticker() -> None:
+        """Циклически вызываем ``tick`` с указанным интервалом."""
+        while True:
+            log.debug("tick поведенческого дерева")
+            tree.tick()
+            await asyncio.sleep(interval)
+
+    # Запускаем асинхронную задачу тикера
+    ticker = asyncio.create_task(_ticker())
+
+    def _stop_tree() -> bool:
+        """Остановить тикер и само дерево при завершении приложения."""
+
+        log.info("Останавливаю поведенческое дерево")
+        ticker.cancel()
+        try:
+            tree.stop()
+        except Exception:  # pragma: no cover - защита от редких ошибок
+            log.exception("ошибка остановки дерева")
+        return True
+
+    # Регистрируем обработчик остановки, чтобы корректно завершить дерево
+    stop_mgr.register(_stop_tree)
+    log.info("Поведенческое дерево запущено")
+    return tree
 
 async def main() -> None:
     """Инициализация и основной цикл ассистента."""
@@ -219,6 +254,11 @@ async def main() -> None:
 
     # Запускаем фоновые задачи анализа и плейбука
     start_background_tasks()
+
+    # ── Поведенческое дерево ─────────────────────────────────────
+    # После инициализации подсистем формируем дерево и запускаем
+    # его тикер, чтобы ассистент реагировал на окружение.
+    start_behavior_tree()
 
     # --- Telegram listener -------------------------------------------------
     global tg_task
