@@ -11,21 +11,18 @@ from typing import Any, Dict, List
 
 import asyncio
 import uuid
-import re
 from rapidfuzz import fuzz
 
 import jarvis_skills
 handle_utterance = jarvis_skills.handle_utterance
 from core.nlp import normalize
 # Импортируем модуль озвучки целиком, чтобы корректно работать даже при его
-# частичной подмене в тестах. Если в заглушке отсутствует константа
-# ``MAX_CHARS``, используем безопасное значение по умолчанию.
+# частичной подмене в тестах.
 import working_tts as _working_tts
 speak_async = _working_tts.speak_async  # удобный псевдоним для вызова
-MAX_CHARS = getattr(_working_tts, "MAX_CHARS", 180)
-from core.request_source import get_request_source
 from core.logging_json import configure_logging
-from core import events as core_events, llm_engine
+from core import events as core_events
+from core.request_source import get_request_source
 from memory.writer import add_suggestion_feedback
 from memory.db import get_connection
 from proactive.engine import (
@@ -64,162 +61,6 @@ ACTIVATION_CONFIDENCE = 65
 # значение — список фраз‑вариантов. Заполняется при старте из ``commands.yaml``.
 VA_CMD_LIST: Dict[str, List[str]] = {}
 
-# Регулярное выражение для разделения текста на предложения.
-# Используется при потоковой озвучке ответов LLM, чтобы не обрывать
-# фразы на середине.
-_STREAM_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
-
-# ─── Переменные режима общения ────────────────────────────────────────────
-# Флаг активности «режима общения», когда LLM ведёт диалог без слова активации.
-CHAT_MODE_ACTIVE: bool = False
-# История текущего диалога [(реплика пользователя, ответ ассистента), ...]
-CHAT_HISTORY: list[tuple[str, str]] = []
-# Таймер автоматического завершения режима общения при отсутствии речи.
-_chat_timer: asyncio.TimerHandle | None = None
-
-
-def _reset_chat_timer() -> None:
-    """Перезапустить таймер ожидания ответа собеседника."""
-
-    global _chat_timer
-    loop = asyncio.get_running_loop()
-    if _chat_timer is not None:
-        _chat_timer.cancel()
-    # Если за минуту не поступит новой реплики — завершаем режим общения
-    _chat_timer = loop.call_later(60, lambda: asyncio.create_task(_end_chat()))
-
-
-def is_chat_stop_phrase(text: str) -> bool:
-    """Проверить, хочет ли пользователь завершить беседу."""
-
-    text = text.lower().strip()
-    return "хватит болтать" in text
-
-
-async def _chat_llm(text: str) -> None:
-    """Отправить реплику в LLM и озвучивать ответ по мере генерации."""
-
-    trace_id = uuid.uuid4().hex
-    log.info("chat message", extra={"ctx": {"text": text, "trace_id": trace_id}})
-
-    loop = asyncio.get_running_loop()
-    # Определяем источник запроса: голос или Telegram.
-    source = get_request_source()
-
-    def _worker() -> str:
-        """Выполняет потоковый запрос к LLM и выводит ответ по мере готовности."""
-
-        buffer = ""  # накопленный хвост, ещё не отправленный
-        chunk = ""   # текущий чанк из завершённых предложений
-        full_reply = ""
-
-        notifier = None
-        if source == "telegram":
-            # Импортируем модуль отправки сообщений только при необходимости.
-            from notifiers import telegram as notifier  # локальный импорт для тестов
-
-            notifier.send_action()  # показываем пользователю, что мы «печатаем»
-
-        def _flush(text: str, *, final: bool = False) -> None:
-            """Отправить или озвучить готовый кусок ответа."""
-
-            if source == "telegram":
-                assert notifier is not None
-                notifier.send(text)
-                log.debug(
-                    "telegram chunk sent",
-                    extra={"ctx": {"chunk": text, "trace_id": trace_id}},
-                )
-                if not final:
-                    # Продолжаем показывать индикатор набора, пока генерация идёт.
-                    notifier.send_action()
-            else:
-                # Озвучиваем текст через TTS в основном event loop.
-                fut = asyncio.run_coroutine_threadsafe(speak_async(text), loop)
-                fut.result()
-                log.debug(
-                    "spoken chunk", extra={"ctx": {"chunk": text, "trace_id": trace_id}}
-                )
-
-        try:
-            for part in llm_engine.stream_think(text, trace_id=trace_id):
-                full_reply += part
-                buffer += part
-
-                # Делим буфер по предложениям: последний элемент может быть
-                # незавершённой фразой и остаётся в ``buffer``.
-                sentences = _STREAM_SENTENCE_RE.split(buffer)
-                buffer = sentences.pop() if sentences else ""
-
-                for sent in sentences:
-                    if len(chunk) + len(sent) + 1 <= MAX_CHARS:
-                        chunk = f"{chunk} {sent}".strip()
-                    else:
-                        _flush(chunk)
-                        chunk = sent
-
-        except Exception:  # pragma: no cover - сетевые сбои LLM
-            log.exception("llm stream failed", extra={"ctx": {"trace_id": trace_id}})
-            return full_reply
-
-        # После завершения потока обрабатываем оставшийся буфер
-        if buffer:
-            if len(chunk) + len(buffer) + 1 <= MAX_CHARS:
-                chunk = f"{chunk} {buffer}".strip()
-            else:
-                _flush(chunk)
-                chunk = buffer
-
-        if chunk:
-            _flush(chunk, final=True)
-
-        return full_reply
-
-    try:
-        reply = await asyncio.to_thread(_worker)
-    except Exception:  # pragma: no cover - защита от непредвиденных ошибок
-        log.exception("llm worker failed", extra={"ctx": {"trace_id": trace_id}})
-        return
-
-    CHAT_HISTORY.append((text, reply))
-    _reset_chat_timer()
-
-
-async def _start_chat(text: str) -> None:
-    """Активировать режим общения и обработать первую реплику."""
-
-    global CHAT_MODE_ACTIVE, CHAT_HISTORY
-    CHAT_MODE_ACTIVE = True
-    CHAT_HISTORY = []
-    log.debug("chat mode started")
-    await _chat_llm(text)
-
-
-async def _end_chat() -> None:
-    """Завершить режим общения, сохранить конспект и озвучить финал."""
-
-    global CHAT_MODE_ACTIVE, _chat_timer
-    if not CHAT_MODE_ACTIVE:
-        return
-    CHAT_MODE_ACTIVE = False
-    if _chat_timer is not None:
-        _chat_timer.cancel()
-        _chat_timer = None
-    conversation = "\n".join(
-        f"Пользователь: {u}\nАссистент: {r}" for u, r in CHAT_HISTORY
-    )
-    if conversation:
-        try:
-            summary = llm_engine.summarise(conversation, labels=["chat"])
-            daily_memory.add({"label": "chat", "text": summary})
-            log.debug("chat summary stored", extra={"ctx": {"summary": summary}})
-        except Exception:  # pragma: no cover - сбой памяти не критичен
-            log.exception("failed to store chat summary")
-    CHAT_HISTORY.clear()
-    try:
-        await speak_async("Режим общения завершён", preset="neutral")
-    except Exception:  # pragma: no cover - озвучка не критична
-        log.exception("failed to speak chat end")
 
 
 def process_suggestion_answer(text: str) -> None:
@@ -324,11 +165,14 @@ def process_suggestion_answer(text: str) -> None:
                 "failed to fetch reason_code",
                 extra={"ctx": {"suggestion_id": suggestion_id}},
             )
-        summary = llm_engine.summarise(
-            f"Подсказка: {suggestion_text}\nОтвет: {text}\nРеакция: {reply_text}",
-            labels=[reason_code] if reason_code else None,
+        daily_memory.add(
+            {
+                "label": reason_code or "suggestion",
+                "text": (
+                    f"Подсказка: {suggestion_text}\nОтвет: {text}\nРеакция: {reply_text}"
+                ),
+            }
         )
-        daily_memory.add({"label": reason_code or "suggestion", "text": summary})
         log.debug(
             "daily memory updated after suggestion",
             extra={"ctx": {"suggestion_id": suggestion_id, "label": reason_code}},
@@ -461,17 +305,6 @@ async def va_respond(voice: str) -> bool:
         process_suggestion_answer(text)
         return True
 
-    text = voice.strip()
-
-    # Если активирован режим общения, все реплики сразу отправляются в LLM
-    # без проверки слова активации.
-    if CHAT_MODE_ACTIVE:
-        if is_chat_stop_phrase(text):
-            await _end_chat()
-            return True
-        await _chat_llm(text)
-        return True
-
     cmd = extract_cmd(voice)
     if not cmd:
         return False
@@ -487,6 +320,24 @@ async def va_respond(voice: str) -> bool:
     raw_norm = normalize(raw)
     cmd_info = await recognize_cmd(raw_norm)
     if not cmd_info["cmd"] or cmd_info["percent"] < CMD_CONFIDENCE_THRESHOLD:
-        await _start_chat(raw)
+        reply = "можете повторить?"
+        await speak_async(reply)
+        trace_id = uuid.uuid4().hex
+        log.info(
+            "fallback reply",
+            extra={"ctx": {"text": cmd, "trace_id": trace_id}},
+        )
+        try:
+            from context.short_term import add as ctx_add
+
+            ctx_add({"trace_id": trace_id, "user": cmd, "reply": reply})
+            daily_memory.add(
+                {
+                    "label": "fallback",
+                    "text": f"Пользователь: {cmd}\nАссистент: {reply}",
+                }
+            )
+        except Exception:
+            pass
         return True
     return await execute_cmd(cmd_info["cmd"], voice)

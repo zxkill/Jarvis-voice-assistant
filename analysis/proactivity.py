@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Dict
 
@@ -14,7 +13,6 @@ from memory.reader import get_feedback_stats, was_event_triggered
 from memory import events as user_events
 
 from core.logging_json import configure_logging
-from core import llm_engine
 from core.events import Event, publish, subscribe
 # Сохраняем сгенерированные подсказки в базу, чтобы позже учитывать
 # реакцию пользователя. Это обеспечивает уникальный ``suggestion_id``
@@ -86,20 +84,14 @@ def _handle_trigger(event: Event) -> None:
         return
     prompt = scenario.get("prompt", "")
     context = event.attrs.get("context", {})
-    context_json = json.dumps(context, ensure_ascii=False)
-    final_prompt = f"{prompt}\nКонтекст: {context_json}" if context else prompt
     trace_id = event.attrs.get("trace_id")
+    # Без обращения к LLM используем текст плейбука напрямую.
+    code = scenario.get("code", "")
+    text_template = scenario.get("text") or prompt
     try:
-        # Просим LLM вернуть JSON с полями ``code`` и ``text``. ``code`` служит
-        # идентификатором события, что позволяет отфильтровать дубликаты
-        # ещё до сохранения подсказки.
-        raw = llm_engine.act(final_prompt, trace_id=trace_id)
-        data = json.loads(raw)
-        code = str(data.get("code")) if data.get("code") is not None else ""
-        text = str(data.get("text", ""))
-    except Exception as exc:  # pragma: no cover - диагностика сетевых ошибок
-        log.exception("llm failure", extra={"ctx": {"err": str(exc)}})
-        return
+        text = text_template.format(**context) if context else text_template
+    except Exception:
+        text = text_template
 
     # Если LLM вернул код события и он уже встречался недавно, пропускаем
     # дальнейшую обработку, чтобы не спамить пользователя повторными советами.

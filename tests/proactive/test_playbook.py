@@ -18,15 +18,6 @@ def test_playbook_contains_scenarios():
 
 
 def test_trigger_generates_suggestion(monkeypatch):
-    calls = {}
-
-    def fake_act(prompt: str, trace_id: str | None = None) -> str:
-        calls["prompt"] = prompt
-        # Возвращаем JSON, как ожидает обработчик триггера
-        return '{"code": "demo", "text": "Привет"}'
-
-    monkeypatch.setattr(proactivity.llm_engine, "act", fake_act)
-
     # Подменяем сохранение в БД, чтобы тест был детерминированным
     monkeypatch.setattr(proactivity, "add_suggestion", lambda text, code: 42)
 
@@ -43,9 +34,8 @@ def test_trigger_generates_suggestion(monkeypatch):
     # дождаться, чтобы обработчик успел опубликовать событие
     thread = events.fire_proactive_trigger("time", "morning_briefing")
     thread.join(timeout=2)
-    assert captured["text"] == "Привет"
+    assert captured["text"].startswith("Сформируй краткий утренний брифинг")
     assert captured["id"] == 42
-    assert "утренний" in calls["prompt"].lower()
 
 
 def test_policy_limits_and_keywords(monkeypatch):
@@ -55,6 +45,7 @@ def test_policy_limits_and_keywords(monkeypatch):
         cancel_keywords={"стоп"},
     )
     policy = Policy(cfg)
+    monkeypatch.setattr("proactive.policy.is_quiet_now", lambda: False)
     now = dt.datetime(2024, 1, 1, 12, 0)
     # первая отправка проходит
     assert policy.choose_channel(True, now=now, text="безопасно") == "voice"

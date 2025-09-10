@@ -18,7 +18,6 @@ from proactive.policy import Policy
 from memory.db import get_connection
 from memory.writer import add_suggestion_feedback
 from core import events as core_events
-from core import llm_engine
 from skills.holiday_ru import is_day_off
 
 # Глобальная ссылка на последний созданный экземпляр движка.
@@ -52,30 +51,23 @@ def pop_awaiting() -> dict | None:
     return info
 
 
-def classify_feedback(suggestion_text: str, user_text: str, trace_id: str | None = None) -> tuple[bool, str]:
-    """Оценить ответ пользователя с помощью LLM.
+def classify_feedback(
+    suggestion_text: str, user_text: str, trace_id: str | None = None
+) -> tuple[bool, str]:
+    """Оценить ответ пользователя простыми эвристиками.
 
-    Возвращает кортеж ``(accepted, reply)``. Если LLM недоступна,
-    используется простая эвристика, а ``reply`` может оказаться пустым.
+    Возвращает кортеж ``(accepted, reply)``, где ``reply`` всегда пустой, а
+    ``accepted`` определяется по набору ключевых слов. Такой подход позволяет
+    обходиться без обращения к LLM, ускоряя обработку и снижая нагрузку.
     """
 
     log = logging.getLogger("proactive.feedback")
-    prompt = (
-        "Подсказка ассистента: {s}\n"
-        "Ответ пользователя: {u}\n"
-        "Определи, положительный или отрицательный ответ. "
-        "Верни JSON с полями accepted (true/false) и reply — краткая реакция."
-    ).format(s=suggestion_text, u=user_text)
-    try:
-        result = llm_engine.think(prompt, trace_id=trace_id or "")
-        data = json.loads(result)
-        accepted = bool(data.get("accepted"))
-        reply = str(data.get("reply", ""))
-        return accepted, reply
-    except Exception as exc:  # pragma: no cover - fallback используется редко
-        log.exception("llm classification failed", extra={"ctx": {"err": str(exc)}})
-        accepted = ProactiveEngine._is_positive(user_text)
-        return accepted, ""
+    accepted = ProactiveEngine._is_positive(user_text)
+    log.debug(
+        "feedback classified",
+        extra={"ctx": {"suggestion": suggestion_text, "text": user_text, "accepted": accepted, "trace_id": trace_id}},
+    )
+    return accepted, ""
 
 
 class ProactiveEngine:
@@ -85,7 +77,7 @@ class ProactiveEngine:
         self,
         policy: Policy,
         *,
-        response_timeout_sec: int = 120,
+        response_timeout_sec: int = 60,
     ) -> None:
         # ``policy`` определяет канал доставки подсказок.
         self.policy = policy
@@ -329,6 +321,12 @@ class ProactiveEngine:
             "response timeout",
             extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}},
         )
+        core_events.publish(
+            core_events.Event(
+                kind="context.set",
+                attrs={"state": "command", "trace_id": trace_id},
+            )
+        )
 
     # ------------------------------------------------------------------
     def _on_user_response(self, event: core_events.Event) -> None:
@@ -345,7 +343,13 @@ class ProactiveEngine:
         if timer:
             timer.cancel()
         self._awaiting = None
-        # Анализируем ответ пользователя через LLM, чтобы понять отношение
+        core_events.publish(
+            core_events.Event(
+                kind="context.set",
+                attrs={"state": "command", "trace_id": trace_id},
+            )
+        )
+        # Анализируем ответ пользователя, чтобы понять отношение
         accepted, reply = classify_feedback(suggestion_text, text, trace_id)
         # Сохраняем отзыв и публикуем событие для остальных компонентов.
         add_suggestion_feedback(suggestion_id, text, accepted)

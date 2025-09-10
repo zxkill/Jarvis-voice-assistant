@@ -30,6 +30,7 @@ def test_trigger_sends_telegram_when_absent(monkeypatch, tmp_path):
     monkeypatch.setitem(
         sys.modules, "notifiers.voice", types.SimpleNamespace(send=fake_send_voice)
     )
+    monkeypatch.setattr("proactive.policy.is_quiet_now", lambda: False)
 
     core_events._subscribers.clear()
     core_events.subscribe("proactivity.trigger", proactivity._handle_trigger)
@@ -39,18 +40,19 @@ def test_trigger_sends_telegram_when_absent(monkeypatch, tmp_path):
     # Пользователь отсутствует
     core_events.publish(Event(kind="presence.update", attrs={"present": False}))
 
-    # Генерацию подсказки через LLM делаем предсказуемой
-    monkeypatch.setattr(
-        proactivity.llm_engine,
-        "act",
-        lambda prompt, trace_id=None: '{"code": "hc", "text": "разминка?"}',
-    )
+    # Искусственно возвращаем идентификатор подсказки, не обращаясь к БД
+    monkeypatch.setattr(proactivity, "add_suggestion", lambda text, code: 1)
 
     # Запускаем сценарий плейбука и ждём завершения обработки
     thread = core_events.fire_proactive_trigger("event", "health_check")
     thread.join(timeout=2)
 
-    assert sent == [("telegram", "разминка?")]
+    assert sent == [
+        (
+            "telegram",
+            "Вежливо напомни сделать разминку, размять глаза и выпить воды.\n",
+        )
+    ]
 
 
 def test_trigger_sends_voice_when_present(monkeypatch, tmp_path):
@@ -73,6 +75,7 @@ def test_trigger_sends_voice_when_present(monkeypatch, tmp_path):
     monkeypatch.setitem(
         sys.modules, "notifiers.voice", types.SimpleNamespace(send=fake_send_voice)
     )
+    monkeypatch.setattr("proactive.policy.is_quiet_now", lambda: False)
 
     core_events._subscribers.clear()
     core_events.subscribe("proactivity.trigger", proactivity._handle_trigger)
@@ -80,16 +83,17 @@ def test_trigger_sends_voice_when_present(monkeypatch, tmp_path):
     ProactiveEngine(policy)
     core_events.publish(Event(kind="presence.update", attrs={"present": True}))
 
-    monkeypatch.setattr(
-        proactivity.llm_engine,
-        "act",
-        lambda prompt, trace_id=None: '{"code": "hc", "text": "разминка?"}',
-    )
+    monkeypatch.setattr(proactivity, "add_suggestion", lambda text, code: 1)
 
     thread = core_events.fire_proactive_trigger("event", "health_check")
     thread.join(timeout=2)
 
-    assert sent == [("voice", "разминка?")]
+    assert sent == [
+        (
+            "voice",
+            "Вежливо напомни сделать разминку, размять глаза и выпить воды.\n",
+        )
+    ]
 
 def test_emotion_reacts_to_user_query(monkeypatch):
     core_events._subscribers.clear()
