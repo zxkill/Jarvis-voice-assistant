@@ -1,9 +1,13 @@
 """Тесты для модуля визуализации настроения."""
 
 from pathlib import Path
+import sys
 import threading
 
 import matplotlib.figure
+
+# Добавляем корневую директорию в ``sys.path``, чтобы корректно импортировать пакет ``analysis``
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import analysis.mood_visualizer as mv
 from analysis.mood_visualizer import plot_mood_history, watch_mood_history
@@ -64,6 +68,9 @@ def test_watch_mood_history(monkeypatch):
     dummy = DummyDB(data)
     monkeypatch.setattr("analysis.mood_visualizer.db", dummy)
 
+    # Переопределяем backend на интерактивный, чтобы использовался ``plt.pause``
+    monkeypatch.setattr(mv.matplotlib, "get_backend", lambda: "qt5agg")
+
     # Создаём событие, которое остановит цикл после первого обновления
     stop = threading.Event()
 
@@ -73,6 +80,46 @@ def test_watch_mood_history(monkeypatch):
     monkeypatch.setattr(mv.plt, "pause", fake_pause)
     monkeypatch.setattr(mv.plt, "show", lambda: None)
 
+    fig = watch_mood_history(limit=10, interval=0.01, stop_event=stop)
+    assert isinstance(fig, matplotlib.figure.Figure)
+
+
+def test_watch_mood_history_headless(monkeypatch):
+    """В backend Agg ``plt.pause`` не вызывается, используется ожидание события."""
+
+    data = [
+        {"ts": 1, "valence": 0.1, "arousal": 0.2},
+        {"ts": 2, "valence": -0.1, "arousal": -0.2},
+    ]
+    dummy = DummyDB(data)
+    monkeypatch.setattr(mv, "db", dummy)
+
+    # Форсируем использование безголового backend
+    monkeypatch.setattr(mv.matplotlib, "get_backend", lambda: "agg")
+
+    # Если ``plt.pause`` будет вызван, тест упадёт
+    def fail_pause(_):  # pragma: no cover - проверка на ошибку
+        raise AssertionError("pause should not be called in headless mode")
+
+    monkeypatch.setattr(mv.plt, "pause", fail_pause)
+
+    class Stopper:
+        """Объект события, завершающий цикл после первой итерации."""
+
+        def __init__(self) -> None:
+            self._set = False
+
+        def is_set(self) -> bool:
+            return self._set
+
+        def set(self) -> None:
+            self._set = True
+
+        def wait(self, _: float) -> bool:
+            self._set = True
+            return True
+
+    stop = Stopper()
     fig = watch_mood_history(limit=10, interval=0.01, stop_event=stop)
     assert isinstance(fig, matplotlib.figure.Figure)
 
