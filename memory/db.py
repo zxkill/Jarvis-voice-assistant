@@ -344,9 +344,10 @@ PRIORITIES_KEY = "reflection:priorities"
 
 
 def get_mood(trace_id: str | None = None) -> dict:
-    """Вернуть текущее настроение ``{valence, arousal, level}``.
+    """Вернуть текущее настроение ``{valence, arousal}``.
 
-    Если данные хранятся в старом формате, выполняется миграция.
+    При необходимости выполняется миграция со старого формата, где
+    использовалось поле ``level`` и отдельный ключ ``emotion:mood_state``.
     """
 
     start = time.time()
@@ -356,23 +357,22 @@ def get_mood(trace_id: str | None = None) -> dict:
             "SELECT value FROM context_items WHERE key=?", (MOOD_KEY,)
         ).fetchone()
 
-    mood: dict[str, float | int]
+    mood: dict[str, float]
     if row:
         try:
             data = json.loads(row["value"])
             if not isinstance(data, dict):
                 raise TypeError
         except (json.JSONDecodeError, TypeError):
-            # В старом формате под ключом хранится просто число уровня
+            # В старом формате под ключом хранилось число уровня
             data = {"level": int(row["value"]) if row["value"] else 0}
             migrated = True
         mood = {
             "valence": float(data.get("valence", 0.0)),
             "arousal": float(data.get("arousal", 0.0)),
-            "level": int(data.get("level", 0)),
         }
     else:
-        mood = {"valence": 0.0, "arousal": 0.0, "level": 0}
+        mood = {"valence": 0.0, "arousal": 0.0}
 
     if migrated or row is None or any(k not in data for k in ("valence", "arousal")):
         with get_connection() as conn:
@@ -404,7 +404,6 @@ def get_mood(trace_id: str | None = None) -> dict:
                 "duration_ms": duration,
                 "valence": mood["valence"],
                 "arousal": mood["arousal"],
-                "level": mood["level"],
                 "migrated": migrated,
             },
             ensure_ascii=False,
@@ -434,7 +433,6 @@ def set_mood(mood: dict, trace_id: str | None = None) -> None:
     normalized = {
         "valence": float(current.get("valence", 0.0)),
         "arousal": float(current.get("arousal", 0.0)),
-        "level": int(current.get("level", 0)),
     }
     _store_mood(normalized)
     with get_connection() as conn:
@@ -451,34 +449,10 @@ def set_mood(mood: dict, trace_id: str | None = None) -> None:
                 "duration_ms": duration,
                 "valence": normalized["valence"],
                 "arousal": normalized["arousal"],
-                "level": normalized["level"],
             },
             ensure_ascii=False,
         )
     )
-
-
-# Обратная совместимость ---------------------------------------------------
-
-def get_mood_level() -> int:  # pragma: no cover - простая обёртка
-    """Вернуть уровень настроения (устаревший интерфейс)."""
-    return int(get_mood()["level"])
-
-
-def set_mood_level(level: int) -> None:  # pragma: no cover - простая обёртка
-    """Сохранить уровень настроения (устаревший интерфейс)."""
-    set_mood({"level": level})
-
-
-def get_mood_state(trace_id: str | None = None) -> tuple[float, float]:
-    """Вернуть координаты настроения (устаревший интерфейс)."""
-    mood = get_mood(trace_id=trace_id)
-    return float(mood["valence"]), float(mood["arousal"])
-
-
-def set_mood_state(valence: float, arousal: float, trace_id: str | None = None) -> None:
-    """Сохранить координаты настроения (устаревший интерфейс)."""
-    set_mood({"valence": valence, "arousal": arousal}, trace_id=trace_id)
 
 def set_priorities(priorities: str) -> None:
     """Сохранить список приоритетов на следующий день."""

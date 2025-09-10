@@ -1,9 +1,15 @@
+"""Модуль управления текущей эмоцией и настроением."""
+
+from __future__ import annotations
+
+# Стандартные библиотеки
 import random
 import time
 from enum import Enum
 
+# Внутренние модули
 from core.logging_json import configure_logging
-from memory import db
+from emotion.mood import Mood
 
 
 class Emotion(Enum):
@@ -29,23 +35,13 @@ class Emotion(Enum):
 
 
 class EmotionState:
-    """
-    Управляет текущим состоянием эмоции и логикой переходов.
-    """
+    """Управляет текущей эмоцией и двухмерным настроением."""
 
-    #: Максимально возможный уровень настроения
-    _MAX_MOOD = 100
-    #: Минимально возможный уровень настроения
-    _MIN_MOOD = -100
-
-    def __init__(self):
+    def __init__(self) -> None:
         # Текущая «видимая» эмоция персонажа
         self.current = Emotion.NEUTRAL
-        # Числовой уровень настроения [-100;100]. При запуске
-        # восстанавливаем его из постоянного хранилища, чтобы Jarvis
-        # помнил предыдущее состояние между перезапусками.
-        # Загружаем числовой уровень настроения из единого хранилища
-        self.mood = db.get_mood()["level"]
+        # Объект ``Mood`` восстанавливается из БД и хранит valence/arousal
+        self.mood: Mood = Mood.load()
         # Инициализируем логгер для удобной отладки.
         self._log = configure_logging("emotion.state")
 
@@ -59,34 +55,54 @@ class EmotionState:
     # ------------------------------------------------------------------
 
     def _save_mood(self) -> None:
-        """Сохранить текущее значение настроения в БД."""
-        # Сохраняем только уровень, не затрагивая valence/arousal
-        db.set_mood({"level": self.mood})
+        """Сохранить текущее состояние ``Mood`` в БД."""
 
-    def raise_mood(self, delta: int = 10, reason: str = "") -> int:
-        """Повысить настроение на ``delta`` и вернуть новое значение.
+        # Используем встроенный метод ``save``, который записывает valence
+        # и arousal в хранилище. Дополнительные поля отсутствуют.
+        self.mood.save()
 
-        Значение всегда ограничивается диапазоном ``[-100; 100]``.
-        В лог выводится причина изменения, что помогает анализировать
-        реакцию ассистента на взаимодействие с пользователем.
+    def raise_mood(self, delta: int = 10, reason: str = "") -> tuple[float, float]:
+        """Повысить настроение и вернуть новые координаты.
+
+        Параметр ``delta`` задаётся в условных единицах и преобразуется в
+        изменение валентности/возбуждения по шкале [-1.0; 1.0].  Метод
+        вызывает :py:meth:`Mood.update`, затем сохраняет результат и
+        выводит подробный лог для удобной отладки.
         """
-        prev = self.mood
-        self.mood = min(self._MAX_MOOD, self.mood + delta)
+
+        step = delta / 100.0
+        before = self.mood.as_tuple()
+        self.mood.update(step, step)
         self._save_mood()
-        self._log.info("mood %s → %s (%s)", prev, self.mood, reason)
-        return self.mood
+        after = self.mood.as_tuple()
+        self._log.info(
+            "mood %s → %s (%s)",
+            before,
+            after,
+            reason,
+        )
+        return after
 
-    def drop_mood(self, delta: int = 10, reason: str = "") -> int:
-        """Понизить настроение на ``delta`` и вернуть новое значение.
+    def drop_mood(self, delta: int = 10, reason: str = "") -> tuple[float, float]:
+        """Понизить настроение и вернуть новые координаты.
 
-        Значение всегда ограничивается диапазоном ``[-100; 100]``.
-        Логирование аналогично ``raise_mood``.
+        Значение ``delta`` преобразуется в отрицательные дельты и передаётся
+        в :py:meth:`Mood.update`.  Это обеспечивает единый API управления
+        настроением.
         """
-        prev = self.mood
-        self.mood = max(self._MIN_MOOD, self.mood - delta)
+
+        step = delta / 100.0
+        before = self.mood.as_tuple()
+        self.mood.update(-step, -step)
         self._save_mood()
-        self._log.info("mood %s → %s (%s)", prev, self.mood, reason)
-        return self.mood
+        after = self.mood.as_tuple()
+        self._log.info(
+            "mood %s → %s (%s)",
+            before,
+            after,
+            reason,
+        )
+        return after
 
     def get_time_based_emotion(self, hour: int | None = None) -> Emotion:
         """Выбрать базовую эмоцию в зависимости от времени суток.

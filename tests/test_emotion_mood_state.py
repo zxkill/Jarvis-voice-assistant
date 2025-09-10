@@ -19,14 +19,14 @@ def test_mood_db_persistence(tmp_path, monkeypatch):
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
-    db.set_mood({"valence": 0.3, "arousal": -0.7, "level": 2}, trace_id="save")
+    db.set_mood({"valence": 0.3, "arousal": -0.7}, trace_id="save")
     mood = db.get_mood(trace_id="load")
 
-    assert mood == {"valence": 0.3, "arousal": -0.7, "level": 2}
+    assert mood == {"valence": 0.3, "arousal": -0.7}
 
 
 def test_mood_migration_and_legacy(tmp_path, monkeypatch):
-    """Миграция старого формата и работа устаревших обёрток."""
+    """Миграция со старых ключей и форматов значения настроения."""
     db_file = tmp_path / "memory.sqlite3"
     monkeypatch.setattr(db, "DB_PATH", db_file)
 
@@ -41,19 +41,10 @@ def test_mood_migration_and_legacy(tmp_path, monkeypatch):
             (db._LEGACY_MOOD_STATE_KEY, "{\"valence\":0.1,\"arousal\":-0.2}"),
         )
 
-    # Первый вызов должен мигрировать данные
+    # Первый вызов должен мигрировать данные и вернуть новую структуру
     mood = db.get_mood()
-    assert mood == {"valence": 0.1, "arousal": -0.2, "level": 5}
+    assert mood == {"valence": 0.1, "arousal": -0.2}
 
-    # Проверяем обёртки
-    assert db.get_mood_level() == 5
-    valence, arousal = db.get_mood_state()
-    assert valence == 0.1
-    assert arousal == -0.2
-
-    db.set_mood_level(7)
-    assert db.get_mood()["level"] == 7
-
-    db.set_mood_state(0.5, 0.6)
-    v, a = db.get_mood_state()
-    assert (v, a) == (0.5, 0.6)
+    # Повторный вызов не должен изменять данные
+    mood2 = db.get_mood()
+    assert mood2 == mood

@@ -5,7 +5,6 @@ from typing import Optional
 
 # Локальные модули системы эмоций
 from emotion.state import EmotionState, Emotion
-from emotion.mood import Mood
 from emotion import policy
 
 import config  # глобальные настройки приложения
@@ -38,9 +37,6 @@ class EmotionManager:
         self._state = EmotionState()
         self._prev_emotion = self._state.current
 
-        # Объект настроения (valence/arousal), восстанавливаемый из БД
-        self._mood = Mood.load()
-
         # Признак текущего присутствия пользователя перед камерой
         self._present = True
         # Активен ли сейчас обработчик пользовательского запроса
@@ -68,7 +64,7 @@ class EmotionManager:
         core_events.subscribe("presence.update", self._on_presence_update)
         core_events.subscribe("speech.synthesis_started", self._on_speech_started)
         core_events.subscribe("speech.synthesis_finished", self._on_speech_finished)
-        # Уровень настроения зависит от успешности диалога
+        # Настроение зависит от успешности диалога
         core_events.subscribe("dialog.success", self._on_dialog_success)
         core_events.subscribe("dialog.failure", self._on_dialog_failure)
         # Внешние факторы, влияющие на настроение (например, погода)
@@ -130,7 +126,6 @@ class EmotionManager:
     def _on_dialog_success(self, event: core_events.Event) -> None:
         """Реакция на успешный ответ пользователю."""
         # Поднимаем числовой уровень настроения для обратной совместимости
-        self._state.raise_mood(reason="dialog success")
         # Обновляем двухмерное настроение и выбираем новую эмоцию
         self._update_mood(1.0, 1.0, reason="dialog success")
         # Генерация и озвучивание «муд‑профиля» через LLM при разрешённой конфигурацией озвучке
@@ -141,7 +136,6 @@ class EmotionManager:
 
     def _on_dialog_failure(self, event: core_events.Event) -> None:
         """Реакция на ошибку или непонимание команды."""
-        self._state.drop_mood(reason="dialog failure")
         # Снижаем валентность сильнее, чем возбуждение, чтобы перейти в негативную зону
         self._update_mood(-2.0, 0.5, reason="dialog failure")
         # Озвучивание настроения выключаем, если параметр отключён в конфигурации
@@ -315,17 +309,18 @@ class EmotionManager:
         Вызывает политику выбора эмоций и сохраняет состояние в БД.
         ``reason`` используется для подробного логирования вклада события.
         """
-        self._mood.update(valence_delta, arousal_delta)
-        self._mood.save()
+        # Изменяем координаты настроения через объект ``Mood`` из ``EmotionState``
+        self._state.mood.update(valence_delta, arousal_delta)
+        self._state.mood.save()
         log.info(
             "mood update (%s) valence=%+.2f arousal=%+.2f → (%.2f, %.2f)",
             reason,
             valence_delta,
             arousal_delta,
-            self._mood.valence,
-            self._mood.arousal,
+            self._state.mood.valence,
+            self._state.mood.arousal,
         )
-        policy_res = policy.select(self._mood.valence, self._mood.arousal)
+        policy_res = policy.select(self._state.mood.valence, self._state.mood.arousal)
         emotion = self._policy_icon_to_emotion(policy_res.icon)
         self._switch_emotion(emotion, reason, policy_res)
 
@@ -351,7 +346,12 @@ class EmotionManager:
             profile = ""
 
         # Сохраняем текст и координаты настроения в отдельной таблице
-        db.add_mood_history(self._mood.valence, self._mood.arousal, source, profile)
+        db.add_mood_history(
+            self._state.mood.valence,
+            self._state.mood.arousal,
+            source,
+            profile,
+        )
 
         # Отправляем сообщение в TTS с учётом текущего пресета
         try:

@@ -46,20 +46,20 @@ Jarvis-Pi — русскоязычный офлайн голосовой асс�
 
 ## Настроение ассистента
 
-Эмоциональное состояние хранится в SQLite как структура `{"valence": float, "arousal": float, "level": int}`. Такой формат облегчает анализ и генерацию ответов.
+Эмоциональное состояние хранится в SQLite как структура `{"valence": float, "arousal": float}`. Такой формат облегчает анализ и генерацию ответов.
 
 ```python
 from memory import db
 
 # Чтение текущего настроения
 mood = db.get_mood()
-print(mood["valence"], mood["arousal"], mood["level"])
+print(mood["valence"], mood["arousal"])
 
 # Частичное обновление значений
-db.set_mood({"level": 10})
+db.set_mood({"valence": 0.5})
 ```
 
-Для обратной совместимости доступны функции `get_mood_level`, `set_mood_level`, `get_mood_state`, `set_mood_state`, однако внутри они используют новый универсальный API.
+Все операции выполняются через единый API `set_mood`/`get_mood`; устаревшие функции удалены после миграции.
 
 ### Сенсоры настроения
 
