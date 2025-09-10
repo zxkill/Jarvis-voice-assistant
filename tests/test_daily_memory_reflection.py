@@ -29,6 +29,9 @@ def test_daily_memory_transferred(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "working_tts", fake_tts)
 
     # Импортируем модули после подмен
+    # В других тестах модуль ``jarvis_skills`` может подменяться заглушкой.
+    # Удаляем его из ``sys.modules``, чтобы импортировать реальную реализацию.
+    sys.modules.pop("jarvis_skills", None)
     import jarvis_skills
     from app import command_processing, scheduler
     from context import daily_memory, long_term
@@ -92,5 +95,7 @@ def test_daily_memory_transferred(monkeypatch, tmp_path):
     scheduler._run_nightly_reflection()
 
     assert daily_memory.fetch_all() == []
-    assert len(saved_events) == 3
-    assert set(saved_events[-1][1]) == {"my_birthday", "drink_water"}
+    # В новой архитектуре запись в долгосрочную память происходит один раз
+    # при ночной рефлексии, когда все дневные события агрегируются.
+    assert len(saved_events) == 1
+    assert set(saved_events[0][1]) == {"my_birthday", "drink_water"}
