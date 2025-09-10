@@ -61,6 +61,25 @@ db.set_mood({"level": 10})
 
 Для обратной совместимости доступны функции `get_mood_level`, `set_mood_level`, `get_mood_state`, `set_mood_state`, однако внутри они используют новый универсальный API.
 
+### Сенсоры настроения
+
+Система поддерживает подключаемые **сенсоры настроения**, позволяющие
+изменять валентность и возбуждённость в зависимости от внешних факторов.
+Базовый класс `MoodSensor` упрощает интеграцию таких источников данных.
+
+```python
+from emotion.mood import Mood
+from emotion.sensors import TimeOfDayMoodSensor
+
+mood = Mood.load()
+sensor = TimeOfDayMoodSensor(mood)
+sensor.read_and_update()
+```
+
+В комплект входит `TimeOfDayMoodSensor`, повышающий настроение утром и
+снижающий вечером. Чтобы создать свой сенсор, унаследуйтесь от
+`MoodSensor` и реализуйте метод `measure`, возвращающий дельты настроения.
+
 ## Требования к оборудованию
 
 - Raspberry Pi 4 или новее
