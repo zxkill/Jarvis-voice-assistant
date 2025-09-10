@@ -52,7 +52,12 @@ class Policy:
         self._day: dt.date = dt.date.today()
         # Логгер с отдельным неймспейсом для удобства фильтрации.
         self.log = configure_logging("proactive.policy")
+        # Регистрируем счётчики отказов по ключевым причинам, чтобы
+        # в мониторинге сразу видеть, почему подсказки не отправляются
         set_metric("policy.voice_suppressed_night", 0)
+        set_metric("policy.daily_limit_reached", 0)
+        set_metric("policy.throttled", 0)
+        set_metric("policy.cancelled_keyword", 0)
 
     # ------------------------------------------------------------------
     def adapt_from_feedback(self, ratio: dict[str, float] | None = None) -> None:
@@ -172,6 +177,8 @@ class Policy:
                     self.log.info(
                         "cancelled by keyword", extra={"ctx": {"keyword": kw}}
                     )
+                    # Фиксируем отдельную метрику отмены подсказки по ключевому слову
+                    inc_metric("policy.cancelled_keyword")
                     return None
 
         # --- Дневной лимит отправок -----------------------------------
@@ -184,6 +191,8 @@ class Policy:
                     "daily limit reached",
                     extra={"ctx": {"limit": self.config.daily_limit}},
                 )
+                # Увеличиваем счётчик превышения дневного лимита
+                inc_metric("policy.daily_limit_reached")
                 return None
 
         # --- Троттлинг по времени последней отправки -------------------
@@ -198,6 +207,8 @@ class Policy:
                     "throttled",
                     extra={"ctx": {"since_last_sec": delta.total_seconds()}},
                 )
+                # Регистрируем, что подсказка была отклонена из-за троттлинга
+                inc_metric("policy.throttled")
                 return None
 
         # --- Правила выбора канала -------------------------------------
