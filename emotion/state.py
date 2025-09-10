@@ -10,6 +10,7 @@ from enum import Enum
 # Внутренние модули
 from core.logging_json import configure_logging
 from emotion.mood import Mood
+from memory import db
 
 
 class Emotion(Enum):
@@ -81,6 +82,10 @@ class EmotionState:
             after,
             reason,
         )
+        # Фиксируем изменение в истории настроения для последующей
+        # визуализации и анализа. Текстовое поле профиля пока
+        # оставляем пустым.
+        db.add_mood_history(self.mood.valence, self.mood.arousal, reason, "")
         return after
 
     def drop_mood(self, delta: int = 10, reason: str = "") -> tuple[float, float]:
@@ -102,6 +107,10 @@ class EmotionState:
             after,
             reason,
         )
+        # Записываем отрицательное изменение настроения в историю.
+        # Это позволяет отслеживать причины и строить графики
+        # динамики, даже если озвучивание профиля отключено.
+        db.add_mood_history(self.mood.valence, self.mood.arousal, reason, "")
         return after
 
     def get_time_based_emotion(self, hour: int | None = None) -> Emotion:

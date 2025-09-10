@@ -18,6 +18,7 @@ from typing import Tuple
 import yaml
 
 from memory import db
+from core import events as core_events
 
 
 @dataclass
@@ -102,6 +103,15 @@ class Mood:
         start = time.time()
         # Сохраняем valence и arousal через новый унифицированный интерфейс
         db.set_mood({"valence": self.valence, "arousal": self.arousal}, trace_id=trace_id)
+        # После фиксации настроения в БД публикуем событие ``mood.changed``.
+        # Менеджер эмоций подпишется на него и, в зависимости от координат,
+        # выберет подходящую эмоцию, которая влияет на глаза и звуки.
+        core_events.publish(
+            core_events.Event(
+                "mood.changed",
+                {"valence": self.valence, "arousal": self.arousal},
+            )
+        )
         duration = int((time.time() - start) * 1000)
         self._logger.info(
             json.dumps(

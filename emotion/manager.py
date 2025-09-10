@@ -69,6 +69,9 @@ class EmotionManager:
         core_events.subscribe("dialog.failure", self._on_dialog_failure)
         # Внешние факторы, влияющие на настроение (например, погода)
         core_events.subscribe("weather.update", self._on_weather_update)
+        # Любое сохранение настроения приводит к событию ``mood.changed``;
+        # используем его, чтобы конвертировать координаты в итоговую эмоцию.
+        core_events.subscribe("mood.changed", self._on_mood_changed)
         # Сигнал от планировщика о завершении ночной рефлексии
         core_events.subscribe("nightly_reflection.done", self._on_nightly_reflection)
 
@@ -293,6 +296,23 @@ class EmotionManager:
         if valence or arousal:
             self._update_mood(valence, arousal, reason="weather")
 
+    def _on_mood_changed(self, event: core_events.Event) -> None:
+        """Пересчитать эмоцию при изменении координат настроения.",
+
+        Событие ``mood.changed`` публикуется методом :py:meth:`Mood.save`
+        после любого обновления настроения. Здесь мы подбираем эмоцию,
+        TTS‑пресет и палитру звуков, чтобы глаза и звуки отражали
+        актуальное состояние ассистента.
+        """
+        valence = float(event.attrs.get("valence", 0.0))
+        arousal = float(event.attrs.get("arousal", 0.0))
+        log.debug(
+            "handle mood.changed valence=%.2f arousal=%.2f", valence, arousal
+        )
+        policy_res = policy.select(valence, arousal)
+        emotion = self._policy_icon_to_emotion(policy_res.icon)
+        self._switch_emotion(emotion, "mood changed", policy_res)
+
 
     # --------------------------------------- вспомогательные методы ---
 
@@ -304,12 +324,15 @@ class EmotionManager:
             return Emotion.NEUTRAL
 
     def _update_mood(self, valence_delta: float, arousal_delta: float, reason: str) -> None:
-        """Обновить настроение и опубликовать новую эмоцию.
+        """Обновить координаты настроения и зафиксировать событие.
 
-        Вызывает политику выбора эмоций и сохраняет состояние в БД.
-        ``reason`` используется для подробного логирования вклада события.
+        Метод только сохраняет новые значения ``valence`` и ``arousal``.
+        Эмоция будет выбрана отдельным обработчиком ``_on_mood_changed``,
+        реагирующим на событие ``mood.changed``, публикуемое в
+        :meth:`Mood.save`.  Это гарантирует единую точку конвертации
+        настроения в эмоцию для всех источников.
+        ``reason`` используется исключительно для логирования.
         """
-        # Изменяем координаты настроения через объект ``Mood`` из ``EmotionState``
         self._state.mood.update(valence_delta, arousal_delta)
         self._state.mood.save()
         log.info(
@@ -320,9 +343,6 @@ class EmotionManager:
             self._state.mood.valence,
             self._state.mood.arousal,
         )
-        policy_res = policy.select(self._state.mood.valence, self._state.mood.arousal)
-        emotion = self._policy_icon_to_emotion(policy_res.icon)
-        self._switch_emotion(emotion, reason, policy_res)
 
     def _switch_emotion(self, emotion: Emotion, reason: str, policy_res: Optional[policy.PolicyResult] = None) -> None:
         """Переключить эмоцию с логированием причины."""
