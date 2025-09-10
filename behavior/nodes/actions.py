@@ -14,6 +14,7 @@ from utils.noise import perlin
 import random
 
 from core.logging_json import configure_logging
+from display import get_driver, DisplayItem
 
 # Логгер модуля действий
 log = configure_logging("behavior.nodes.actions")
@@ -27,8 +28,16 @@ class Blink(py_trees.behaviour.Behaviour):
         self.blackboard = Blackboard()
 
     def update(self) -> Status:  # noqa: D401
+        # Фиксируем факт моргания на чёрной доске до обращения к внешним сервисам
         self.blackboard.set("blinked", True)
         log.info("выполняем моргание", extra={"attrs": {"blinked": True}})
+        try:
+            # Публикуем событие моргания на дисплей
+            driver = get_driver()
+            driver.draw(DisplayItem(kind="emotion", payload="blink"))
+        except Exception:  # pragma: no cover - непредвиденные ошибки отображения
+            log.exception("ошибка отображения моргания")
+            return Status.FAILURE
         return Status.SUCCESS
 
 
@@ -41,6 +50,7 @@ class Speak(py_trees.behaviour.Behaviour):
         self.blackboard = Blackboard()
 
     def update(self) -> Status:  # noqa: D401
+        # Сохраняем все сказанные фразы в истории Blackboard
         try:
             spoken = list(self.blackboard.get("spoken"))
         except KeyError:
@@ -48,6 +58,15 @@ class Speak(py_trees.behaviour.Behaviour):
         spoken.append(self.text)
         self.blackboard.set("spoken", spoken)
         log.info("произнесена фраза", extra={"attrs": {"text": self.text}})
+        try:
+            # Импортируем модуль голосовых уведомлений лениво,
+            # чтобы избежать тяжёлых зависимостей при старте.
+            from notifiers import voice
+
+            voice.send(self.text)
+        except Exception:  # pragma: no cover - внешние ошибки TTS
+            log.exception("ошибка отправки текста в TTS")
+            return Status.FAILURE
         return Status.SUCCESS
 
 
@@ -59,12 +78,20 @@ class Idle(py_trees.behaviour.Behaviour):
         self.blackboard = Blackboard()
 
     def update(self) -> Status:  # noqa: D401
+        # Увеличиваем счётчик периодов ожидания в Blackboard
         try:
             count = self.blackboard.get("idled") + 1
         except KeyError:
             count = 1
         self.blackboard.set("idled", count)
         log.info("ожидание бездействия", extra={"attrs": {"count": count}})
+        try:
+            # Отправляем на дисплей маркер режима ожидания
+            driver = get_driver()
+            driver.draw(DisplayItem(kind="emotion", payload="idle"))
+        except Exception:  # pragma: no cover - непредвиденные ошибки отображения
+            log.exception("ошибка отображения режима ожидания")
+            return Status.FAILURE
         return Status.SUCCESS
 
 
