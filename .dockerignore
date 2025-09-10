@@ -1,0 +1,12 @@
+# Исключаем из контекста сборки только вспомогательные файлы и каталоги,
+# которые не нужны внутри контейнера.
+.git
+.github
+analysis
+*.pyc
+__pycache__
+tests
+*.md
+.env
+promtail-config.yml
+docker-compose.yml
