@@ -171,6 +171,8 @@ async def main() -> None:
     from app.presence_session import setup_presence_session
     from app.gui import gui_loop
     from app.scheduler import start_background_tasks
+    # Реалтайм-визуализация истории настроения
+    from analysis.mood_visualizer import watch_mood_history
     import vosk
     import yaml
     from pvrecorder import PvRecorder
@@ -254,6 +256,13 @@ async def main() -> None:
 
     # Запускаем фоновые задачи анализа и плейбука
     start_background_tasks()
+
+    # При необходимости запускаем отдельный поток наблюдения за настроением,
+    # чтобы видеть динамику valence/arousal в реальном времени. Опция
+    # включается в ``config.ini`` в разделе [ANALYSIS].
+    if cfg.getboolean("ANALYSIS", "watch_mood", fallback=False):
+        threading.Thread(target=watch_mood_history, daemon=True).start()
+        log.info("Запущен монитор настроения")
 
     # ── Поведенческое дерево ─────────────────────────────────────
     # После инициализации подсистем формируем дерево и запускаем
