@@ -16,7 +16,6 @@ from memory import db
 from notifiers import voice
 from display import get_driver, DisplayItem
 from skills.holiday_ru import is_day_off
-from skills.holiday_ru import is_day_off
 
 log = configure_logging("emotion.manager")
 
@@ -221,10 +220,24 @@ class EmotionManager:
         if now < self._surprised_until:
             # Таймер удивления сам переключит эмоцию на нейтральную
             return
-        log.debug("user_query_ended → wait 1s")
-        time.sleep(1)
-        self._switch_emotion(self._prev_emotion, "user query ended")
-        self._reset_idle_timer()
+        # Используем отдельный таймер, чтобы не блокировать event loop
+        # и избежать резких переключений при серии быстрых команд.
+        log.debug(
+            "user_query_ended → schedule revert in 1s to avoid flicker",
+        )
+
+        def _delayed_revert() -> None:
+            """Вернуть предыдущую эмоцию после паузы.
+
+            Небольшая задержка позволяет обработать новые запросы,
+            не дёргая интерфейс, а также сохраняет отзывчивость
+            основного цикла событий.
+            """
+            log.debug("user_query_ended → reverting to %s", self._prev_emotion)
+            self._switch_emotion(self._prev_emotion, "user query ended")
+            self._reset_idle_timer()
+
+        Timer(1.0, _delayed_revert).start()
 
     def _publish_emotion(self, emotion: Emotion, policy_res: Optional[policy.PolicyResult] = None) -> None:
         """Публикует событие смены эмоции.
