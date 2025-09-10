@@ -18,13 +18,20 @@ from __future__ import annotations
 # Стандартные библиотеки
 import argparse
 import logging
+import os
 from pathlib import Path
+import threading
 
 # Сторонние библиотеки
 import matplotlib
 
-# Используем неблокирующий backend, чтобы модуль работал без дисплея
-matplotlib.use("Agg")  # type: ignore
+# Если переменная окружения DISPLAY отсутствует (например, на сервере без X11),
+# переключаемся на неблокирующий backend ``Agg``.  Это позволяет выполнять тесты
+# и строить графики в headless-окружении.  При наличии DISPLAY будет выбран
+# стандартный интерактивный backend, чтобы окна matplotlib открывались
+# автоматически.
+if os.environ.get("DISPLAY", "") == "":
+    matplotlib.use("Agg")  # type: ignore
 import matplotlib.pyplot as plt
 
 # Внутренние модули
@@ -79,6 +86,70 @@ def plot_mood_history(limit: int = 100, show: bool = False, outfile: Path | None
         # оставался совместимым с безголовыми окружениями.
         plt.show()
 
+    return fig
+
+
+def watch_mood_history(
+    limit: int = 100,
+    interval: float = 1.0,
+    stop_event: threading.Event | None = None,
+) -> matplotlib.figure.Figure:
+    """Отображать график настроения в реальном времени.
+
+    Функция запускается в отдельном потоке и периодически опрашивает БД,
+    обновляя кривые валентности и возбуждения.  В интерактивном окружении
+    окно matplotlib остаётся открытым до тех пор, пока не будет установлен
+    ``stop_event``.
+
+    :param limit: сколько последних точек истории отображать
+    :param interval: интервал обновления графика в секундах
+    :param stop_event: внешний флаг завершения работы; если ``None`` —
+        цикл выполняется бесконечно
+    :return: объект ``Figure`` для тестов и дополнительной обработки
+    """
+
+    # Подготовка окна и начальный набор данных
+    fig, ax = plt.subplots()
+    line_v, = ax.plot([], [], label="valence", color="tab:blue")
+    line_a, = ax.plot([], [], label="arousal", color="tab:orange")
+    ax.set_xlabel("timestamp")
+    ax.set_ylabel("value")
+    ax.set_title("История настроения Jarvis (реальное время)")
+    ax.set_ylim(-1, 1)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+
+    log.info(
+        "realtime mood watch started",
+        extra={"ctx": {"limit": limit, "interval": interval}},
+    )
+
+    def _refresh() -> None:
+        """Обновить линии графика свежими данными из БД."""
+        history = list(reversed(db.get_mood_history(limit)))
+        if not history:
+            return
+        ts = [item["ts"] for item in history]
+        valence = [item["valence"] for item in history]
+        arousal = [item["arousal"] for item in history]
+        line_v.set_data(ts, valence)
+        line_a.set_data(ts, arousal)
+        ax.relim()
+        ax.autoscale_view()
+        fig.canvas.draw_idle()
+
+    # Основной цикл: обновляем график и делаем паузу ``interval`` секунд.
+    while stop_event is None or not stop_event.is_set():
+        _refresh()
+        try:
+            plt.pause(interval)
+        except Exception:
+            # В headless-окружении ``pause`` может выбросить исключение;
+            # логируем его и завершаем цикл, чтобы не блокировать ассистента.
+            log.exception("matplotlib pause failed")
+            break
+
+    log.info("realtime mood watch stopped")
     return fig
 
 
