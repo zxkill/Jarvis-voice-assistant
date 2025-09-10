@@ -2,6 +2,8 @@ import datetime as dt
 from cryptography.fernet import Fernet
 
 import analysis.proactivity as proactivity
+import datetime as dt
+from cryptography.fernet import Fernet
 from core.events import Event
 from memory import events as user_events
 from memory import db as memory_db, writer
@@ -13,9 +15,9 @@ def test_event_greeting_skipped(monkeypatch, tmp_path):
     monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
     monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(
-        proactivity.llm_engine,
-        "act",
-        lambda *a, **k: '{"code": "bday", "text": "С днём рождения!"}',
+        proactivity,
+        "load_playbook",
+        lambda: {"context_hint": {"prompt": "С днём рождения!"}},
     )
     monkeypatch.setattr(user_events, "load_event_date", lambda k: dt.date(1988, 5, 7))
     monkeypatch.setattr(user_events, "_today", lambda: dt.date(2024, 1, 1))
@@ -38,9 +40,9 @@ def test_event_greeting_allowed(monkeypatch, tmp_path):
     monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
     monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
     monkeypatch.setattr(
-        proactivity.llm_engine,
-        "act",
-        lambda *a, **k: '{"code": "bday", "text": "С днём рождения!"}',
+        proactivity,
+        "load_playbook",
+        lambda: {"context_hint": {"prompt": "С днём рождения!"}},
     )
     monkeypatch.setattr(user_events, "load_event_date", lambda k: dt.date(1988, 5, 7))
     monkeypatch.setattr(user_events, "_today", lambda: dt.date(2024, 5, 5))
@@ -73,13 +75,11 @@ def test_trigger_dedup_by_code(monkeypatch, tmp_path):
     monkeypatch.setattr(memory_db, "DB_PATH", tmp_path / "memory.sqlite3")
     monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
 
-    responses = iter(
-        [
-            '{"code": "ctx", "text": "Первый"}',
-            '{"code": "ctx", "text": "Второй"}',
-        ]
+    monkeypatch.setattr(
+        proactivity,
+        "load_playbook",
+        lambda: {"context_hint": {"prompt": "Первый", "code": "ctx"}},
     )
-    monkeypatch.setattr(proactivity.llm_engine, "act", lambda *a, **k: next(responses))
     events: list[Event] = []
     monkeypatch.setattr(proactivity, "publish", lambda e: events.append(e))
 

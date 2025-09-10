@@ -162,3 +162,36 @@ def test_exit_conversation(monkeypatch):
 
     assert is_awaiting_response() is False
 
+
+def test_va_respond_unknown(monkeypatch):
+    """Неизвестная команда должна возвращать вежливый запрос повтора."""
+
+    cp = _load_cp(monkeypatch)
+
+    spoken: list[str] = []
+
+    async def fake_speak(text: str, *a, **k) -> None:
+        spoken.append(text)
+
+    monkeypatch.setattr(cp, "speak_async", fake_speak)
+    async def fake_recognize(text: str) -> dict:
+        return {"cmd": "", "percent": 0}
+    monkeypatch.setattr(cp, "recognize_cmd", fake_recognize)
+
+    short_items: list[dict] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "context.short_term",
+        SimpleNamespace(add=lambda item: short_items.append(item)),
+    )
+    memory_items: list[dict] = []
+    monkeypatch.setattr(cp, "daily_memory", SimpleNamespace(add=lambda item: memory_items.append(item)))
+
+    async def run() -> None:
+        assert await cp.va_respond("джарвис непонятно") is True
+
+    asyncio.run(run())
+    assert spoken[-1] == "можете повторить?"
+    assert short_items and short_items[-1]["reply"] == "можете повторить?"
+    assert memory_items and "Ассистент" in memory_items[-1]["text"]
+

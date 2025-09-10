@@ -23,7 +23,6 @@ import uuid  # для генерации trace_id уникальных запр�
 from rapidfuzz import fuzz   # уже есть в requirements.txt
 from core.logging_json import configure_logging
 from core.nlp import normalize
-from core import llm_engine  # LLM для генерации кратких резюме
 from context import daily_memory  # Дневная память для событий дня
 from context import current_date  # Хранение актуальной календарной даты
 
@@ -202,11 +201,12 @@ def handle_utterance(text: str) -> bool:
                 # ночной рефлексии собрать важные события дня и
                 # сохранить их в долговременном контексте.
                 try:
-                    summary = llm_engine.summarise(
-                        f"Пользователь: {text}\nАссистент: {reply}",
-                        labels=[best_func.__module__],
+                    daily_memory.add(
+                        {
+                            "label": best_func.__module__,
+                            "text": f"Пользователь: {text}\nАссистент: {reply}",
+                        }
                     )
-                    daily_memory.add({"label": best_func.__module__, "text": summary})
                     log.debug(
                         "daily memory updated",
                         extra={"trace_id": trace_id, "label": best_func.__module__},
