@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+from logging import FileHandler
 import uuid
 from contextvars import ContextVar
 import os
@@ -88,40 +88,28 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_entry, ensure_ascii=False)
 
 
-class SafeRotatingFileHandler(RotatingFileHandler):
-    """Хендлер, устойчивый к `PermissionError` при ротации файла.
+class SafeFileHandler(FileHandler):
+    """Простой файловый хендлер с обработкой `PermissionError`.
 
-    На Windows файл логов может быть заблокирован другим процессом
-    (например, если его просматривают в редакторе). Стандартный
-    ``RotatingFileHandler`` в этом случае выбрасывает исключение и
-    останавливает работу приложения. Данный класс перехватывает
-    ``PermissionError`` и создаёт копию файла с временной меткой,
-    после чего продолжает запись в новый файл без прерывания
-    основного процесса.
+    В Windows файл логов может быть временно заблокирован другим
+    процессом (например, при просмотре в редакторе). Стандартный
+    ``FileHandler`` выбрасывает исключение и останавливает работу.
+    Данный класс перехватывает ``PermissionError`` при открытии или
+    записи и выводит предупреждение, после чего пытается продолжить
+    работу. Полная ротация не используется — лог-файл растёт без
+    ограничений, поэтому его следует чистить вручную при необходимости.
     """
 
-    def doRollover(self) -> None:  # noqa: D401
-        """Переименовать текущий лог-файл, игнорируя `PermissionError`."""
+    def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
+        """Записать событие в файл, игнорируя `PermissionError`."""
 
         try:
-            super().doRollover()
+            super().emit(record)
         except PermissionError as exc:
-            # Выводим предупреждение в stderr, чтобы не потерять информацию
             print(
-                f"Не удалось ротировать лог-файл {self.baseFilename}: {exc}",
+                f"Не удалось записать лог-файл {self.baseFilename}: {exc}",
                 file=sys.stderr,
             )
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            alt_name = f"{self.baseFilename}.{timestamp}"
-            try:
-                os.replace(self.baseFilename, alt_name)
-            except OSError as err:
-                print(
-                    f"Повторное переименование {self.baseFilename} не удалось: {err}",
-                    file=sys.stderr,
-                )
-            # Открываем новый пустой лог-файл и продолжаем запись
-            self.stream = self._open()
 
 
 def configure_logging(component: str = "", level: int = logging.INFO) -> logging.Logger:
@@ -137,11 +125,10 @@ def configure_logging(component: str = "", level: int = logging.INFO) -> logging
     log_file = os.getenv("LOG_FILE", os.path.join("logs", "jarvis.log"))
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
-    # Ротация файла предотвращает переполнение диска: храним до пяти файлов
-    # по ~1 МБ каждый.
-    file_handler = SafeRotatingFileHandler(
-        log_file, maxBytes=1_000_000, backupCount=5, encoding="utf-8"
-    )
+    # Простая запись в файл без ротации: лог растёт бесконечно.
+    # Очистку файла нужно выполнять вручную, чтобы контролировать
+    # занимаемое место на диске.
+    file_handler = SafeFileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(JsonFormatter())
     file_handler.addFilter(ContextFilter())
 
@@ -150,6 +137,10 @@ def configure_logging(component: str = "", level: int = logging.INFO) -> logging
     logger.addHandler(stream_handler)
     logger.addHandler(file_handler)
     logger.propagate = False  # не передавать записи в родительские логгеры
+    # Отладочное сообщение помогает понять, куда пишутся логи.
+    logger.info(
+        "логирование инициализировано", extra={"attrs": {"log_file": log_file}}
+    )
     return logger
 
 
