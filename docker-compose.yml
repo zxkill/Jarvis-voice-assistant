@@ -1,0 +1,64 @@
+version: "3.9"
+
+# ───────────────────────── СЕРВИСЫ ДОКЕР-КОМПОУЗ ─────────────────────────
+# Данный файл поднимает полный стек: самого ассистента, Loki для хранения логов,
+# Promtail для их доставки и Grafana для визуализации.
+services:
+  jarvis:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    container_name: jarvis
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-UTC} # часовой пояс для логов
+    volumes:
+      - .:/app # подмонтируем исходники, чтобы не пересобирать образ при правках
+      - /tmp/.X11-unix:/tmp/.X11-unix # проброс X11 для отображения окна камеры
+    restart: unless-stopped
+    devices:
+      - /dev/video0:/dev/video0 # подключаем камеру
+      - /dev/snd:/dev/snd # и аудиоустройства для микрофона/колонок
+    group_add:
+      - audio
+      - video
+    # Помечаем контейнер меткой, чтобы Promtail мог фильтровать логи по типам
+    labels:
+      - "service=jarvis"
+    depends_on:
+      - loki
+
+  loki:
+    image: grafana/loki:2.9.1
+    container_name: loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:2.9.1
+    container_name: promtail
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail-config.yml:/etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:10.1.2
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - loki
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+# ───────────────────────── ЛОКАЛЬНЫЕ ТОМЫ ─────────────────────────
+volumes:
+  loki-data:
+  grafana-data:

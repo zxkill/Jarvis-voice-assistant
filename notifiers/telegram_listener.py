@@ -163,7 +163,11 @@ def listen(
                     finally:
                         reset_request_source(token)
                 except Exception:  # pragma: no cover - на всякий случай логируем
-                    log.exception("va_respond failed")
+                    # Добавляем текст команды в ``attrs``, чтобы понимать, что именно
+                    # привело к исключению внутри обработчика.
+                    log.exception(
+                        "va_respond failed", extra={"attrs": {"text": text}}
+                    )
         except (requests.RequestException, ValueError) as exc:
             # Сетевые ошибки или некорректный JSON.  Логируем и пробуем
             # повторить запрос после небольшой паузы.

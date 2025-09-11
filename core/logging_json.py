@@ -6,8 +6,10 @@ import json
 import logging
 import uuid
 from contextvars import ContextVar
-from datetime import datetime
+import os
 import re
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
@@ -38,9 +40,30 @@ class JsonFormatter(logging.Formatter):
                 return [_mask(v) for v in obj]
             return obj
 
+        # Определяем часовой пояс для метки времени. Он берётся из
+        # переменной окружения ``TZ``. Допустимы как названия зон из
+        # базы IANA (``Europe/Moscow``), так и числовые смещения вида
+        # ``+05:00``. Если значение некорректно, используется ``UTC``.
+        def _resolve_tz() -> timezone:
+            tz_name = os.getenv("TZ", "UTC")
+            if tz_name.upper() == "UTC":
+                return timezone.utc
+            # Поддержка формата "+HH:MM" или "-HH" для простых смещений.
+            if re.fullmatch(r"[+-]\d{1,2}(:\d{2})?", tz_name):
+                sign = 1 if tz_name.startswith("+") else -1
+                hours, _, minutes = tz_name[1:].partition(":")
+                delta = timedelta(
+                    hours=int(hours or 0), minutes=int(minutes or 0)
+                )
+                return timezone(sign * delta)
+            try:
+                return ZoneInfo(tz_name)
+            except Exception:
+                return timezone.utc
+
         log_entry = {
-            # Метка времени события в формате ISO 8601
-            "ts": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
+            # Метка времени события в формате ISO 8601 с учётом часового пояса
+            "ts": datetime.fromtimestamp(record.created, _resolve_tz()).isoformat(),
             # Уровень логирования (INFO, ERROR и т.д.)
             "level": record.levelname,
             # Имя компонента, либо logger.name, если не передано через extra
@@ -54,6 +77,11 @@ class JsonFormatter(logging.Formatter):
             # Основное сообщение лога без персональных данных
             "message": _mask(record.getMessage()),
         }
+        # Если передан traceback, добавляем его в поле ``exc``. Это помогает
+        # быстро диагностировать ошибки, так как стек вызовов виден прямо в
+        # JSON-логе.
+        if record.exc_info:
+            log_entry["exc"] = self.formatException(record.exc_info)
         # ensure_ascii=False — чтобы корректно выводить кириллицу
         return json.dumps(log_entry, ensure_ascii=False)
 
