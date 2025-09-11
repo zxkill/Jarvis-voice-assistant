@@ -8,9 +8,14 @@ Loki. Такие тесты позволяют быстро отлавливат
 
 from __future__ import annotations
 
+import logging
 import pathlib
 
 import yaml
+
+logging.basicConfig(level=logging.INFO)
+# Логгер для отладки тестов. Если что-то пойдёт не так, логи помогут быстрее понять причину.
+LOGGER = logging.getLogger(__name__)
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -20,6 +25,7 @@ def test_compose_services_present() -> None:
     compose_file = ROOT / "docker-compose.yml"
     data = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
     services = data.get("services", {})
+    LOGGER.info("Найденные сервисы: %s", list(services))
     assert {"jarvis", "loki", "promtail", "grafana"} <= set(services)
 
 
@@ -28,4 +34,20 @@ def test_promtail_loki_url() -> None:
     promtail_cfg = ROOT / "promtail-config.yml"
     data = yaml.safe_load(promtail_cfg.read_text(encoding="utf-8"))
     urls = [client["url"] for client in data.get("clients", [])]
+    LOGGER.info("Пути отправки логов: %s", urls)
     assert "http://loki:3100/loki/api/v1/push" in urls
+
+
+def test_dockerfile_no_source_copy() -> None:
+    """Dockerfile не должен копировать исходники, чтобы избежать пересборки образа."""
+    dockerfile_text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    LOGGER.debug("Содержимое Dockerfile:\n%s", dockerfile_text)
+    assert "COPY . ." not in dockerfile_text
+
+
+def test_dockerignore_minimal_context() -> None:
+    """Проверяем, что .dockerignore исключает все файлы кроме зависимостей."""
+    dockerignore_lines = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    LOGGER.debug("Содержимое .dockerignore: %s", dockerignore_lines)
+    assert "*" in dockerignore_lines
+    assert "!requirements.txt" in dockerignore_lines

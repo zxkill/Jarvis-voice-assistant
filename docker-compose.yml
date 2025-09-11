@@ -12,7 +12,7 @@ services:
     env_file: 
       - .env
     volumes:
-      - .:/app
+      - .:/app # подмонтируем исходники, чтобы не пересобирать образ при правках
     restart: unless-stopped
     # Помечаем контейнер меткой, чтобы Promtail мог фильтровать логи по типам
     labels:
