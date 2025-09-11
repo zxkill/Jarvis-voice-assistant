@@ -41,3 +41,15 @@ def test_timestamp_respects_timezone(monkeypatch) -> None:
     data = json.loads(stream.getvalue())
     # ``isoformat`` добавляет смещение в конце строки.
     assert data["ts"].endswith("+05:00")
+
+
+def test_logging_written_to_file(tmp_path, monkeypatch) -> None:
+    """Логгер должен записывать события в указанный файл."""
+    log_file = tmp_path / "jarvis.log"
+    monkeypatch.setenv("LOG_FILE", str(log_file))
+    logger = configure_logging("file.logger")
+    logger.info("file")
+    for handler in logger.handlers:
+        handler.flush()
+    data = json.loads(log_file.read_text(encoding="utf-8"))
+    assert data["message"] == "file"

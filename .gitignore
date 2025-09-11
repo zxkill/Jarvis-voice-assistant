@@ -16,6 +16,7 @@ __pypackages__/
 htmlcov/
 coverage.xml
 *.log
+logs/
 
 # IDE / редакторы
 .vscode/
