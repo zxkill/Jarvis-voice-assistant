@@ -11,6 +11,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import sys
 
 
 TRACE_ID: ContextVar[str] = ContextVar("trace_id", default="")
@@ -87,6 +88,42 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_entry, ensure_ascii=False)
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """Хендлер, устойчивый к `PermissionError` при ротации файла.
+
+    На Windows файл логов может быть заблокирован другим процессом
+    (например, если его просматривают в редакторе). Стандартный
+    ``RotatingFileHandler`` в этом случае выбрасывает исключение и
+    останавливает работу приложения. Данный класс перехватывает
+    ``PermissionError`` и создаёт копию файла с временной меткой,
+    после чего продолжает запись в новый файл без прерывания
+    основного процесса.
+    """
+
+    def doRollover(self) -> None:  # noqa: D401
+        """Переименовать текущий лог-файл, игнорируя `PermissionError`."""
+
+        try:
+            super().doRollover()
+        except PermissionError as exc:
+            # Выводим предупреждение в stderr, чтобы не потерять информацию
+            print(
+                f"Не удалось ротировать лог-файл {self.baseFilename}: {exc}",
+                file=sys.stderr,
+            )
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            alt_name = f"{self.baseFilename}.{timestamp}"
+            try:
+                os.replace(self.baseFilename, alt_name)
+            except OSError as err:
+                print(
+                    f"Повторное переименование {self.baseFilename} не удалось: {err}",
+                    file=sys.stderr,
+                )
+            # Открываем новый пустой лог-файл и продолжаем запись
+            self.stream = self._open()
+
+
 def configure_logging(component: str = "", level: int = logging.INFO) -> logging.Logger:
     """Настраивает root‑логгер на вывод JSON и возвращает логгер *component*."""
 
@@ -102,7 +139,7 @@ def configure_logging(component: str = "", level: int = logging.INFO) -> logging
 
     # Ротация файла предотвращает переполнение диска: храним до пяти файлов
     # по ~1 МБ каждый.
-    file_handler = RotatingFileHandler(
+    file_handler = SafeRotatingFileHandler(
         log_file, maxBytes=1_000_000, backupCount=5, encoding="utf-8"
     )
     file_handler.setFormatter(JsonFormatter())

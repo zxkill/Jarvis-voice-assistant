@@ -10,7 +10,7 @@ import io
 import json
 import logging
 
-from core.logging_json import JsonFormatter, configure_logging
+from core.logging_json import JsonFormatter, SafeRotatingFileHandler, configure_logging
 
 
 def test_exception_field_present() -> None:
@@ -53,3 +53,31 @@ def test_logging_written_to_file(tmp_path, monkeypatch) -> None:
         handler.flush()
     data = json.loads(log_file.read_text(encoding="utf-8"))
     assert data["message"] == "file"
+
+
+def test_rotation_handles_permission_error(tmp_path, monkeypatch) -> None:
+    """Ротация логов не должна падать при `PermissionError`."""
+    log_file = tmp_path / "jarvis.log"
+    monkeypatch.setenv("LOG_FILE", str(log_file))
+    logger = configure_logging("rotate.logger")
+    handler = next(
+        h for h in logger.handlers if isinstance(h, SafeRotatingFileHandler)
+    )
+    # Пишем первую строку, чтобы файл появился на диске.
+    logger.info("before")
+    handler.flush()
+
+    # Имитируем ошибку переименования файла на Windows.
+    def fake_rename(src, dst):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(logging.handlers.os, "rename", fake_rename)
+
+    # Вызов ротации не должен приводить к исключению.
+    handler.doRollover()
+
+    # После ротации логгер должен продолжать писать в новый файл.
+    logger.info("after")
+    handler.flush()
+    data = json.loads(log_file.read_text(encoding="utf-8"))
+    assert data["message"] == "after"
