@@ -21,12 +21,13 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def test_compose_services_present() -> None:
-    """Убеждаемся, что в docker-compose описаны все необходимые сервисы."""
+    """Проверяем, что docker-compose поднимает только стек логирования."""
     compose_file = ROOT / "docker-compose.yml"
     data = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
     services = data.get("services", {})
     LOGGER.info("Найденные сервисы: %s", list(services))
-    assert {"jarvis", "loki", "promtail", "grafana"} <= set(services)
+    assert {"loki", "promtail", "grafana"} <= set(services)
+    assert "jarvis" not in services
 
 
 def test_promtail_loki_url() -> None:
@@ -53,22 +54,21 @@ def test_dockerignore_minimal_context() -> None:
     assert "!requirements.txt" in dockerignore_lines
 
 
-def test_jarvis_devices_mounted() -> None:
-    """Проверяем, что в docker-compose проброшены камера и аудио устройства."""
+def test_promtail_mounts_logs_dir() -> None:
+    """Убеждаемся, что Promtail видит файлы логов Jarvis."""
     compose_file = ROOT / "docker-compose.yml"
     data = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
-    jarvis = data["services"]["jarvis"]
-    LOGGER.info("Конфигурация устройств: %s", jarvis.get("devices"))
-    devices = jarvis.get("devices", [])
-    assert "/dev/video0:/dev/video0" in devices
-    assert "/dev/snd:/dev/snd" in devices
+    promtail = data["services"]["promtail"]
+    LOGGER.info("Тома Promtail: %s", promtail.get("volumes"))
+    volumes = promtail.get("volumes", [])
+    assert "./logs:/var/log/jarvis" in volumes
 
 
-def test_timezone_env_present() -> None:
-    """Убеждаемся, что сервис Jarvis поддерживает установку часового пояса."""
-    compose_file = ROOT / "docker-compose.yml"
-    data = yaml.safe_load(compose_file.read_text(encoding="utf-8"))
-    jarvis = data["services"]["jarvis"]
-    env_list = jarvis.get("environment", [])
-    LOGGER.info("Переменные окружения Jarvis: %s", env_list)
-    assert any(str(item).startswith("TZ=") for item in env_list)
+def test_promtail_scrapes_files() -> None:
+    """Проверяем, что Promtail настроен на чтение файлов из /var/log/jarvis."""
+    promtail_cfg = ROOT / "promtail-config.yml"
+    data = yaml.safe_load(promtail_cfg.read_text(encoding="utf-8"))
+    scrape = data.get("scrape_configs", [])[0]
+    path = scrape["static_configs"][0]["labels"]["__path__"]
+    LOGGER.info("Promtail читает из: %s", path)
+    assert path == "/var/log/jarvis/*.log"

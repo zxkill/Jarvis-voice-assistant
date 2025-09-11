@@ -1,19 +1,18 @@
-# Конфигурация Promtail для сбора логов из Docker и отправки их в Loki.
+# Конфигурация Promtail для чтения локальных файлов логов Jarvis и отправки их в Loki.
 server:
   http_listen_port: 9080  # HTTP-порт для проверки состояния Promtail
   grpc_listen_port: 0     # gRPC отключен, чтобы не занимать лишний порт
 
 positions:
-  filename: /tmp/positions.yaml  # файл, где Promtail хранит прогресс чтения логов
+  filename: /tmp/positions.yaml  # файл с прогрессом чтения логов
 
 clients:
-  - url: http://loki:3100/loki/api/v1/push  # адрес сервиса Loki внутри docker-compose
+  - url: http://loki:3100/loki/api/v1/push  # адрес Loki внутри docker-compose
 
 scrape_configs:
-  - job_name: docker-logs  # произвольное имя задания
-    docker_sd_configs:
-      - host: unix:///var/run/docker.sock  # подключаемся к Docker через сокет
-    relabel_configs:
-      # Переименовываем встроенную метку в более читаемую
-      - source_labels: [__meta_docker_container_name]
-        target_label: container
+  - job_name: jarvis  # произвольное имя задания
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: jarvis
+          __path__: /var/log/jarvis/*.log  # путь до файлов логов ассистента

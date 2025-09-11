@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import uuid
 from contextvars import ContextVar
 import os
@@ -89,12 +90,28 @@ class JsonFormatter(logging.Formatter):
 def configure_logging(component: str = "", level: int = logging.INFO) -> logging.Logger:
     """Настраивает root‑логгер на вывод JSON и возвращает логгер *component*."""
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(JsonFormatter())
-    handler.addFilter(ContextFilter())
+    # Потоковый хендлер выводит логи в stdout, чтобы их было видно в консоли.
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(JsonFormatter())
+    stream_handler.addFilter(ContextFilter())
+
+    # Определяем файл для записи логов. Путь можно переопределить
+    # переменной окружения ``LOG_FILE``. По умолчанию пишем в ``logs/jarvis.log``.
+    log_file = os.getenv("LOG_FILE", os.path.join("logs", "jarvis.log"))
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    # Ротация файла предотвращает переполнение диска: храним до пяти файлов
+    # по ~1 МБ каждый.
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=1_000_000, backupCount=5, encoding="utf-8"
+    )
+    file_handler.setFormatter(JsonFormatter())
+    file_handler.addFilter(ContextFilter())
+
     logger = logging.getLogger(component or __name__)
     logger.setLevel(level)
-    logger.addHandler(handler)
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
     logger.propagate = False  # не передавать записи в родительские логгеры
     return logger
 
