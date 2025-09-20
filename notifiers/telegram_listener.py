@@ -22,7 +22,7 @@ from core.logging_json import configure_logging, TRACE_ID, new_trace_id
 from core.metrics import inc_metric, set_metric
 from core.request_source import set_request_source, reset_request_source
 from core import events as core_events
-from memory.dialogs import fetch_history
+from memory.dialog_log import get_dialog_history, record_dialog_message
 
 # ────────────────────────── ИНИЦИАЛИЗАЦИЯ ──────────────────────────
 
@@ -30,6 +30,31 @@ from memory.dialogs import fetch_history
 log = configure_logging("notifiers.telegram_listener")
 # Публикуем метрику количества входящих сообщений.
 set_metric("telegram.incoming", 0)
+
+
+def _log_control_dialog(
+    text: str,
+    *,
+    direction: str,
+    status: str,
+    command: str,
+) -> None:
+    """Записать сообщение служебной команды в журнал диалогов."""
+
+    try:
+        record_dialog_message(
+            text,
+            direction=direction,
+            channel="telegram",
+            user_id=_USER_ID,
+            status=status,
+            metadata={"kind": "control", "command": command},
+        )
+    except Exception:
+        log.exception(
+            "failed to log control dialog",
+            extra={"ctx": {"direction": direction, "command": command}},
+        )
 
 
 def _validate_config(cfg: Any) -> None:
@@ -112,7 +137,7 @@ def _format_uptime(seconds: float) -> str:
 def _render_history(limit: int) -> str:
     """Формируем текст с последними сообщениями диалога."""
 
-    history = fetch_history(limit=limit, channel="telegram", ascending=False)
+    history = get_dialog_history(limit=limit, channel="telegram", ascending=False)
     if not history:
         return "История пуста — пока не о чем рассказывать."
 
@@ -120,9 +145,9 @@ def _render_history(limit: int) -> str:
     # Записи уже отсортированы по убыванию времени; разворачиваем, чтобы
     # выводить в естественном порядке от старых к новым.
     for item in reversed(history):
-        direction = "→" if item["direction"] == "outgoing" else "←"
-        timestamp = datetime.fromtimestamp(item["ts"]).strftime("%H:%M:%S")
-        text = item["text"].strip() or "(пусто)"
+        direction = "→" if item.direction == "outgoing" else "←"
+        timestamp = datetime.fromtimestamp(item.ts).strftime("%H:%M:%S")
+        text = item.text.strip() or "(пусто)"
         lines.append(f"{timestamp} {direction} {text}")
     return "\n".join(lines)
 
@@ -139,6 +164,7 @@ def _handle_control_command(text: str) -> bool:
     log.debug("control command received: %s args=%s", name, args)
 
     if name in {"/start", "/help"}:
+        _log_control_dialog(clean, direction="incoming", status="received", command=name)
         help_text = (
             "Привет! Доступные команды:\n"
             "• /help — подсказка по возможностям\n"
@@ -147,9 +173,11 @@ def _handle_control_command(text: str) -> bool:
             "Просто напиши сообщение, и я выполню команду или отвечу."
         )
         _send_telegram_message(help_text)
+        _log_control_dialog(help_text, direction="outgoing", status="delivered", command=name)
         return True
 
     if name == "/status":
+        _log_control_dialog(clean, direction="incoming", status="received", command=name)
         uptime = _format_uptime(time.time() - _STARTED_AT)
         status = (
             "Ассистент активен.\n"
@@ -158,19 +186,29 @@ def _handle_control_command(text: str) -> bool:
             f"Очередь long polling: {'активна' if _RUNNING else 'остановлена'}"
         )
         _send_telegram_message(status)
+        _log_control_dialog(status, direction="outgoing", status="delivered", command=name)
         return True
 
     if name == "/history":
+        _log_control_dialog(clean, direction="incoming", status="received", command=name)
         default_limit = 10
         limit = default_limit
         if args:
             try:
                 limit = max(1, min(50, int(args[0])))
             except ValueError:
-                _send_telegram_message("Нужно указать число от 1 до 50.")
+                error = "Нужно указать число от 1 до 50."
+                _send_telegram_message(error)
+                _log_control_dialog(error, direction="outgoing", status="failed", command=name)
                 return True
         history_text = _render_history(limit)
         _send_telegram_message(history_text)
+        _log_control_dialog(
+            history_text,
+            direction="outgoing",
+            status="delivered",
+            command=name,
+        )
         return True
 
     log.debug("unknown control command: %s", name)

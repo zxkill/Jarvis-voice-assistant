@@ -199,6 +199,38 @@ export JARVIS_DB_KEY=$(python -c "from cryptography.fernet import Fernet;print(F
 python -m memory.dialogs --limit 50 --channel telegram
 ```
 
+Для программного доступа используйте сервис `memory.dialog_log`. Он
+гарантирует генерацию `trace_id` и автоматически обогащает метаданные
+каналом, пользователем и статусом доставки. Унифицированный API
+облегчает отладку и построение аналитики.
+
+```python
+from memory.dialog_log import record_dialog_message, get_dialog_history
+
+trace = "support-1"
+record_dialog_message(
+    "Принял задачу",
+    direction="incoming",
+    channel="telegram",
+    user_id=12345,
+    trace_id=trace,
+    metadata={"ticket": "OPS-42"},
+)
+
+history = get_dialog_history(trace_id=trace)
+for item in history:
+    print(item.ts, item.direction, item.meta["status"], item.text)
+```
+
+### Локальное тестирование
+
+```bash
+pytest tests/memory -q
+```
+
+Набор тестов проверяет запись, выборку и обогащение метаданными,
+обеспечивая воспроизводимый аудит истории диалогов.
+
 Утилита выводит канал (`voice` или `telegram`), направление (`incoming` или
 `outgoing`) и `trace_id`, что позволяет быстро находить связанные события в
 логах. Доступны фильтры по `trace_id`, каналу и сортировка (`--asc`), поэтому
