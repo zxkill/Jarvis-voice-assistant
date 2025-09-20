@@ -47,6 +47,51 @@ Jarvis-Pi — русскоязычный офлайн голосовой асс�
 - Шифрование чувствительных данных и анонимизация логов
 - Устойчивость к блокировкам лог‑файла на Windows: запись ведётся без ротации, файл растёт бесконечно
 
+## Журнал диалогов и мониторинг
+
+Централизованный журнал диалогов фиксирует каждую реплику ассистента и пользователя, позволяя быстро восстанавливать историю переписки Telegram и голосовых каналов, отслеживать trace_id и расследовать инциденты. Раздел помогает быстрее находить узкие места и одновременно повышает доверие к ассистенту.
+
+### Как включить журнал
+
+1. Убедитесь, что файл конфигурации `config/logging.yaml` присутствует и содержит секцию `handlers.journal`. При развёртывании Docker используйте монтирование `./config/logging.yaml:/app/config/logging.yaml`.
+2. Проверьте, что в `config.ini` активирован блок `[logging]` с параметром `journal_enabled = true`.
+3. Установите переменные окружения:
+   - `JARVIS_LOG_DIR` — путь к каталогу журнала, например `/var/log/jarvis`;
+   - `JARVIS_LOG_LEVEL` — уровень логирования (например, `INFO` или `DEBUG`).
+4. Перезапустите ассистента командой `docker compose restart jarvis` или перезапуском системного сервиса.
+
+### Полезные команды и SQL‑запросы
+
+```bash
+# просмотр последних 50 событий по trace_id
+sqlite3 memory/jarvis.db "SELECT timestamp, channel, direction, content FROM messages WHERE trace_id = 'abc-123' ORDER BY timestamp DESC LIMIT 50;"
+
+# фильтрация по исходящим сообщениям Telegram
+sqlite3 memory/jarvis.db "SELECT timestamp, content FROM messages WHERE channel = 'telegram' AND direction = 'outbound' ORDER BY timestamp DESC LIMIT 20;"
+
+# анализ нагрузки на журнал
+journalctl -u jarvis --since "-1h" | grep "journal" | tail
+
+# ротация файлового журнала
+logrotate -f /etc/logrotate.d/jarvis
+```
+
+Дополнительно доступен CLI для экспорта в CSV:
+
+```bash
+python -m analysis.export_messages --output history.csv --channel voice --limit 500
+```
+
+### Пути конфигурации и мониторинг
+
+- Основной конфиг логирования: `config/logging.yaml`.
+- Настройки журнала в INI: `config.ini` → `[logging]`.
+- Дополнительный системный конфиг: `/etc/jarvis/logging.d/*.yaml` (поддерживает переопределения при развёртывании).
+- Promtail для централизованного сбора: `promtail-config.yml`.
+- Шаблон Grafana Dashboard рекомендуется хранить в репозитории (например, `docs/observability/`), чтобы облегчить совместное сопровождение.
+
+Для мониторинга используйте связку Promtail + Loki + Grafana, настройте алерты на увеличение количества ошибок и отсутствие новых событий более 5 минут. Рекомендуется включить метрики состояния очереди в Prometheus и добавить heartbeat‑записи каждые 60 секунд, чтобы контролировать здоровье пайплайна.
+
 ## Хранилище сообщений и аудит диалогов
 
 Jarvis-Pi использует SQLite для надёжного аудита всех входящих и исходящих
