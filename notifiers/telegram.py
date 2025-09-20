@@ -12,7 +12,7 @@ from core.logging_json import configure_logging, TRACE_ID
 from core.metrics import inc_metric, set_metric
 from core.config import load_config
 from utils.reply import extract_reply
-from memory.dialogs import log_message
+from memory.dialog_log import record_dialog_message
 
 log = configure_logging("notifiers.telegram")
 # Счётчик неудачных попыток отправки сообщений.
@@ -57,17 +57,37 @@ class TelegramNotifier:
             if resp.status_code != 200 or not data.get("ok", False):
                 log.warning("telegram api error: %s %s", resp.status_code, resp.text)
                 inc_metric("telegram.failures")
-            else:
-                log_message(
+                record_dialog_message(
                     clean,
                     direction="outgoing",
                     channel="telegram",
                     trace_id=TRACE_ID.get(),
+                    user_id=_cfg.user.telegram_user_id,
+                    status="failed",
+                    metadata={"reason": data.get("description", "api_error")},
+                )
+            else:
+                record_dialog_message(
+                    clean,
+                    direction="outgoing",
+                    channel="telegram",
+                    trace_id=TRACE_ID.get(),
+                    user_id=_cfg.user.telegram_user_id,
+                    status="delivered",
                 )
         except (requests.RequestException, ValueError) as exc:
             # Сеть недоступна или получен некорректный JSON.
             log.warning("telegram request failed: %s", exc)
             inc_metric("telegram.failures")
+            record_dialog_message(
+                clean,
+                direction="outgoing",
+                channel="telegram",
+                trace_id=TRACE_ID.get(),
+                user_id=_cfg.user.telegram_user_id,
+                status="failed",
+                metadata={"reason": "exception", "error": str(exc)},
+            )
 
     def send_action(self, action: str = "typing") -> None:
         """Отправить пользователю индикатор действия.

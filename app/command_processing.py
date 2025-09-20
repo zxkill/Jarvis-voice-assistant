@@ -25,7 +25,7 @@ from core import events as core_events
 from core.request_source import get_request_source
 from memory.writer import add_suggestion_feedback
 from memory.db import get_connection
-from memory.dialogs import log_message
+from memory.dialog_log import record_dialog_message
 from proactive.engine import (
     is_awaiting_response,
     pop_awaiting,
@@ -36,6 +36,31 @@ from context import daily_memory  # Дневная память для конс�
 
 # Инициализируем модульный логгер, чтобы отслеживать процесс разбора команд.
 log = configure_logging("app.command_processing")
+
+_TELEGRAM_USER_ID: str | int | None = None
+
+
+def _resolve_default_user(channel: str) -> str | int:
+    """Определить идентификатор пользователя по каналу."""
+
+    global _TELEGRAM_USER_ID
+    if channel == "voice":
+        return "voice-user"
+    if channel == "telegram":
+        if _TELEGRAM_USER_ID is None:
+            try:
+                from core.config import load_config
+
+                cfg = load_config()
+                _TELEGRAM_USER_ID = getattr(cfg.user, "telegram_user_id", "telegram-user")
+                log.debug(
+                    "resolved telegram user id", extra={"ctx": {"user_id": _TELEGRAM_USER_ID}}
+                )
+            except Exception:
+                _TELEGRAM_USER_ID = "telegram-user"
+                log.exception("failed to resolve telegram user id")
+        return _TELEGRAM_USER_ID
+    return f"{channel}-user"
 
 
 def _ensure_trace_id() -> tuple[str, Token | None]:
@@ -50,23 +75,46 @@ def _ensure_trace_id() -> tuple[str, Token | None]:
     return trace, token
 
 
-def _log_dialog(direction: str, text: str, channel: str, trace_id: str, meta: dict[str, Any] | None = None) -> None:
-    """Безопасно записать сообщение в журнал диалогов."""
+def _log_dialog(
+    direction: str,
+    text: str,
+    channel: str,
+    trace_id: str,
+    meta: dict[str, Any] | None = None,
+    user_id: str | int | None = None,
+    status: str | None = None,
+) -> None:
+    """Безопасно записать сообщение в журнал диалогов через сервис."""
 
     if not text:
         return
+    metadata = dict(meta or {})
+    if user_id is None and "user_id" in metadata:
+        user_id = metadata.pop("user_id")
+    if status is None and "status" in metadata:
+        status = metadata.pop("status")
     try:
-        log_message(
+        record_dialog_message(
             text,
             direction=direction,
             channel=channel,
             trace_id=trace_id,
-            metadata=meta,
+            user_id=user_id or _resolve_default_user(channel),
+            status=status,
+            metadata=metadata,
         )
     except Exception:
         log.exception(
             "failed to log dialog message",
-            extra={"ctx": {"direction": direction, "channel": channel, "trace_id": trace_id}},
+            extra={
+                "ctx": {
+                    "direction": direction,
+                    "channel": channel,
+                    "trace_id": trace_id,
+                    "user_id": user_id,
+                    "status": status,
+                }
+            },
         )
 
 # ────────────────────────── КОНСТАНТЫ ──────────────────────────────

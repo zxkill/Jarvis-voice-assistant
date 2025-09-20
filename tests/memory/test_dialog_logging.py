@@ -3,22 +3,7 @@ import asyncio
 from pathlib import Path
 import sys
 
-from cryptography.fernet import Fernet
-
-import pytest
-
 sys.path.append(str(Path(__file__).resolve().parents[2]))
-
-from memory import db as memory_db
-
-
-@pytest.fixture()
-def dialog_db(monkeypatch, tmp_path):
-    monkeypatch.setenv("JARVIS_DB_KEY", Fernet.generate_key().decode())
-    db_file = tmp_path / "memory.sqlite3"
-    monkeypatch.setattr(memory_db, "DB_PATH", db_file)
-    return db_file
-
 
 def test_log_and_fetch_history(dialog_db):
     from memory import dialogs
