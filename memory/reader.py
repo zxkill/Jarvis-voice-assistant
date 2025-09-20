@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 def get_event_counts(start_ts: int, end_ts: int, bucket_seconds: int = 3600) -> list[tuple[int, int]]:
     """Вернуть количество событий, сгруппированных по окнам времени.
 
-    *bucket_seconds* — размер окна агрегации (по умолчанию час).
+    *bucket_seconds* - размер окна агрегации (по умолчанию час).
     Результат: список пар ``(начало_окна, количество)``.
     """
     with get_connection() as conn:
