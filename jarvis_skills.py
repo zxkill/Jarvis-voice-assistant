@@ -17,11 +17,12 @@ import importlib
 import importlib.util
 import threading
 import asyncio
+from contextvars import Token
 from pathlib import Path
 import uuid  # для генерации trace_id уникальных запросов
 
 from rapidfuzz import fuzz   # уже есть в requirements.txt
-from core.logging_json import configure_logging
+from core.logging_json import configure_logging, TRACE_ID
 from core.nlp import normalize
 from context import daily_memory  # Дневная память для событий дня
 from context import current_date  # Хранение актуальной календарной даты
@@ -134,20 +135,25 @@ def handle_utterance(text: str) -> bool:
     text_low = normalize(text).lower()
     best_func, best_score = None, 0
 
-    for patterns, func in _loaded:
-        for p in patterns:
-            p_low = p.lower()
-            score = max(
-                fuzz.ratio(text_low, p_low),           # полная строка
-                fuzz.token_set_ratio(text_low, p_low)  # порядок слов не важен
-            )
-            if score > best_score:
-                best_score, best_func = score, func
-
-    if best_score >= THRESHOLD and best_func:
-        # Генерируем trace_id для связывания логов одного запроса
+    trace_id = TRACE_ID.get()
+    token: Token | None = None
+    if not trace_id:
         trace_id = uuid.uuid4().hex
-        try:
+        token = TRACE_ID.set(trace_id)
+        log.debug("skill trace created", extra={"ctx": {"trace_id": trace_id}})
+
+    try:
+        for patterns, func in _loaded:
+            for p in patterns:
+                p_low = p.lower()
+                score = max(
+                    fuzz.ratio(text_low, p_low),           # полная строка
+                    fuzz.token_set_ratio(text_low, p_low)  # порядок слов не важен
+                )
+                if score > best_score:
+                    best_score, best_func = score, func
+
+        if best_score >= THRESHOLD and best_func:
             try:
                 # Пытаемся передать trace_id скиллу, если он его принимает
                 reply = best_func(text, trace_id=trace_id)
@@ -217,15 +223,17 @@ def handle_utterance(text: str) -> bool:
                     )
 
                 return True
-        except Exception as e:
-            # Используем имя фактически вызванного скилла для корректной диагностики
-            log.exception(
-                "Ошибка в скилле %s: %s",
-                best_func.__module__ if best_func else "<unknown>",
-                e,
-                extra={"trace_id": trace_id},
-            )
-
+    except Exception as e:
+        # Используем имя фактически вызванного скилла для корректной диагностики
+        log.exception(
+            "Ошибка в скилле %s: %s",
+            best_func.__module__ if best_func else "<unknown>",
+            e,
+            extra={"trace_id": trace_id},
+        )
+    finally:
+        if token:
+            TRACE_ID.reset(token)
     return False
 
 def _schedule_autoupdate(mod):

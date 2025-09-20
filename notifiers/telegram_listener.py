@@ -17,7 +17,7 @@ from typing import Any
 import requests
 
 from core.config import load_config
-from core.logging_json import configure_logging
+from core.logging_json import configure_logging, TRACE_ID, new_trace_id
 from core.metrics import inc_metric, set_metric
 from core.request_source import set_request_source, reset_request_source
 from core import events as core_events
@@ -144,6 +144,7 @@ def listen(
                     handler = va_respond
                     if handler is None:  # импортируем по требованию
                         from app.command_processing import va_respond as handler
+                    trace_token = TRACE_ID.set(new_trace_id())
                     token = set_request_source("telegram")
                     try:
                         # При отсутствии внешнего ``loop`` каждое сообщение
@@ -162,6 +163,7 @@ def listen(
                             log.debug("handler executed in main loop")
                     finally:
                         reset_request_source(token)
+                        TRACE_ID.reset(trace_token)
                 except Exception:  # pragma: no cover - на всякий случай логируем
                     # Добавляем текст команды в ``attrs``, чтобы понимать, что именно
                     # привело к исключению внутри обработчика.

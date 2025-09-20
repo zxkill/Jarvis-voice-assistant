@@ -27,6 +27,25 @@ SCHEMA = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS dialog_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        direction TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        trace_id TEXT,
+        message TEXT NOT NULL,
+        meta TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_dialog_messages_ts
+        ON dialog_messages(ts)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_dialog_messages_trace
+        ON dialog_messages(trace_id)
+    """,
+    """
     CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)
     """,
     """
