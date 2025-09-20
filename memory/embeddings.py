@@ -60,7 +60,7 @@ def _hash_embedding(text: str, *, size: int = VECTOR_SIZE) -> List[float]:
     """
 
     vec = np.zeros(size, dtype=float)
-    logger.debug("Хеш‑эмбеддинг для текста: %r", text)
+    logger.debug("Хеш-эмбеддинг для текста: %r", text)
     for word in text.lower().split():
         digest = hashlib.sha256(word.encode("utf-8")).digest()
         idx = int.from_bytes(digest[:4], "little") % size

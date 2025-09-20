@@ -38,7 +38,7 @@ def _safe_encrypt(value: str | None) -> str | None:
         )
         return value
     except Exception:
-        # Неожиданная ошибка при шифровании — логируем стек, но не
+        # Неожиданная ошибка при шифровании - логируем стек, но не
         # мешаем основному сценарию, чтобы диалог всё равно сохранился.
         log.exception("failed to encrypt dialog payload")
         return value
