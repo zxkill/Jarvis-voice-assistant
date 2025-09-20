@@ -10,7 +10,7 @@ Jarvis: разбор фраз, поиск совпадений с именем �
 from typing import Any, Dict, List
 
 import asyncio
-import uuid
+from contextvars import Token
 from rapidfuzz import fuzz
 
 import jarvis_skills
@@ -20,11 +20,12 @@ from core.nlp import normalize
 # частичной подмене в тестах.
 import working_tts as _working_tts
 speak_async = _working_tts.speak_async  # удобный псевдоним для вызова
-from core.logging_json import configure_logging
+from core.logging_json import configure_logging, TRACE_ID, new_trace_id
 from core import events as core_events
 from core.request_source import get_request_source
 from memory.writer import add_suggestion_feedback
 from memory.db import get_connection
+from memory.dialogs import log_message
 from proactive.engine import (
     is_awaiting_response,
     pop_awaiting,
@@ -35,6 +36,38 @@ from context import daily_memory  # Дневная память для конс�
 
 # Инициализируем модульный логгер, чтобы отслеживать процесс разбора команд.
 log = configure_logging("app.command_processing")
+
+
+def _ensure_trace_id() -> tuple[str, Token | None]:
+    """Создать ``trace_id`` при отсутствии и вернуть его вместе с токеном."""
+
+    trace = TRACE_ID.get()
+    token: Token | None = None
+    if not trace:
+        trace = new_trace_id()
+        token = TRACE_ID.set(trace)
+        log.debug("generated trace id for command", extra={"ctx": {"trace_id": trace}})
+    return trace, token
+
+
+def _log_dialog(direction: str, text: str, channel: str, trace_id: str, meta: dict[str, Any] | None = None) -> None:
+    """Безопасно записать сообщение в журнал диалогов."""
+
+    if not text:
+        return
+    try:
+        log_message(
+            text,
+            direction=direction,
+            channel=channel,
+            trace_id=trace_id,
+            metadata=meta,
+        )
+    except Exception:
+        log.exception(
+            "failed to log dialog message",
+            extra={"ctx": {"direction": direction, "channel": channel, "trace_id": trace_id}},
+        )
 
 # ────────────────────────── КОНСТАНТЫ ──────────────────────────────
 # Слова, которыми пользователь обращается к ассистенту.
@@ -72,7 +105,10 @@ def process_suggestion_answer(text: str) -> None:
         log.debug("нет ожидания подсказки, пропускаем ответ: %r", text)
         return
     suggestion_id = awaiting.get("id")
-    trace_id = awaiting.get("trace_id")
+    trace_id = awaiting.get("trace_id") or TRACE_ID.get() or new_trace_id()
+    token: Token | None = None
+    if trace_id:
+        token = TRACE_ID.set(trace_id)
     log.info(
         "processing suggestion answer",
         extra={"ctx": {"suggestion_id": suggestion_id, "text": text, "trace_id": trace_id}},
@@ -138,6 +174,13 @@ def process_suggestion_answer(text: str) -> None:
         if channel == "voice":
             # Планируем асинхронное озвучивание, чтобы не блокировать поток
             asyncio.create_task(speak_async(reply_text))
+            _log_dialog(
+                "outgoing",
+                reply_text,
+                channel,
+                trace_id,
+                {"suggestion_id": suggestion_id, "accepted": accepted},
+            )
         else:
             from notifiers import telegram as notifier
 
@@ -182,6 +225,9 @@ def process_suggestion_answer(text: str) -> None:
             "failed to store suggestion summary",
             extra={"ctx": {"suggestion_id": suggestion_id, "trace_id": trace_id}},
         )
+    finally:
+        if token:
+            TRACE_ID.reset(token)
 
 
 async def execute_cmd(cmd: str, voice: str) -> bool:
@@ -191,13 +237,37 @@ async def execute_cmd(cmd: str, voice: str) -> bool:
     """
     if cmd == "thanks":
         # Вежливый ответ на благодарность
-        await speak_async("Пожалуйста", preset="happy")
+        reply_text = "Пожалуйста"
+        await speak_async(reply_text, preset="happy")
+        _log_dialog(
+            "outgoing",
+            reply_text,
+            get_request_source(),
+            TRACE_ID.get() or new_trace_id(),
+            {"preset": "happy", "cmd": cmd},
+        )
     elif cmd == "stupid":
         # Эмоциональная реакция на оскорбление
-        await speak_async("Мне неприятно это слышать", preset="sad")
+        reply_text = "Мне неприятно это слышать"
+        await speak_async(reply_text, preset="sad")
+        _log_dialog(
+            "outgoing",
+            reply_text,
+            get_request_source(),
+            TRACE_ID.get() or new_trace_id(),
+            {"preset": "sad", "cmd": cmd},
+        )
     elif cmd == "offf":
         # Перевод ассистента в режим ожидания
-        await speak_async("Переходим в спящий режим", preset="neutral")
+        reply_text = "Переходим в спящий режим"
+        await speak_async(reply_text, preset="neutral")
+        _log_dialog(
+            "outgoing",
+            reply_text,
+            get_request_source(),
+            TRACE_ID.get() or new_trace_id(),
+            {"preset": "neutral", "cmd": cmd},
+        )
     else:
         return False
     return True
@@ -287,57 +357,63 @@ def is_exit_phrase(text: str) -> bool:
 
 
 async def va_respond(voice: str) -> bool:
-    """Главная реакция ассистента на распознанный текст.
+    """Главная реакция ассистента на распознанный текст."""
 
-    1. Отделяем команду от слова активации.
-    2. Пробуем передать команду в систему навыков ``jarvis_skills``.
-    3. Если ни один навык не сработал — пытаемся сопоставить её с
-       набором встроенных команд.
-    Возвращает ``True``, если что‑то было выполнено.
-    """
-    # Сначала проверяем, не ждёт ли система ответа на подсказку.
-    if is_awaiting_response():
-        text = voice.strip()
-        if is_exit_phrase(text):
-            pop_awaiting()
-            await speak_async("Режим общения завершён", preset="neutral")
+    trace_id, token = _ensure_trace_id()
+    channel = get_request_source()
+    text = voice.strip()
+    _log_dialog("incoming", text, channel, trace_id, {"raw": voice})
+
+    try:
+        if is_awaiting_response():
+            if is_exit_phrase(text):
+                pop_awaiting()
+                await speak_async("Режим общения завершён", preset="neutral")
+                _log_dialog(
+                    "outgoing",
+                    "Режим общения завершён",
+                    channel,
+                    trace_id,
+                    {"preset": "neutral"},
+                )
+                return True
+            process_suggestion_answer(text)
             return True
-        process_suggestion_answer(text)
-        return True
 
-    cmd = extract_cmd(voice)
-    if not cmd:
-        return False
-    # Сохраняем текущий event loop, чтобы jarvis_skills мог
-    # безопасно отправлять ответы из побочного потока.
-    getattr(jarvis_skills, "set_main_loop", lambda loop: None)(
-        asyncio.get_running_loop()
-    )
-    # handle_utterance может блокировать, поэтому вызываем в отдельном потоке
-    if await asyncio.to_thread(handle_utterance, cmd):
-        return True
-    raw = await filter_cmd(cmd)
-    raw_norm = normalize(raw)
-    cmd_info = await recognize_cmd(raw_norm)
-    if not cmd_info["cmd"] or cmd_info["percent"] < CMD_CONFIDENCE_THRESHOLD:
-        reply = "можете повторить?"
-        await speak_async(reply)
-        trace_id = uuid.uuid4().hex
-        log.info(
-            "fallback reply",
-            extra={"ctx": {"text": cmd, "trace_id": trace_id}},
+        cmd = extract_cmd(voice)
+        if not cmd:
+            return False
+
+        getattr(jarvis_skills, "set_main_loop", lambda loop: None)(
+            asyncio.get_running_loop()
         )
-        try:
-            from context.short_term import add as ctx_add
-
-            ctx_add({"trace_id": trace_id, "user": cmd, "reply": reply})
-            daily_memory.add(
-                {
-                    "label": "fallback",
-                    "text": f"Пользователь: {cmd}\nАссистент: {reply}",
-                }
+        if await asyncio.to_thread(handle_utterance, cmd):
+            return True
+        raw = await filter_cmd(cmd)
+        raw_norm = normalize(raw)
+        cmd_info = await recognize_cmd(raw_norm)
+        if not cmd_info["cmd"] or cmd_info["percent"] < CMD_CONFIDENCE_THRESHOLD:
+            reply = "можете повторить?"
+            await speak_async(reply)
+            log.info(
+                "fallback reply",
+                extra={"ctx": {"text": cmd, "trace_id": trace_id}},
             )
-        except Exception:
-            pass
-        return True
-    return await execute_cmd(cmd_info["cmd"], voice)
+            _log_dialog("outgoing", reply, channel, trace_id, {"kind": "fallback"})
+            try:
+                from context.short_term import add as ctx_add
+
+                ctx_add({"trace_id": trace_id, "user": cmd, "reply": reply})
+                daily_memory.add(
+                    {
+                        "label": "fallback",
+                        "text": f"Пользователь: {cmd}\nАссистент: {reply}",
+                    }
+                )
+            except Exception:
+                pass
+            return True
+        return await execute_cmd(cmd_info["cmd"], voice)
+    finally:
+        if token:
+            TRACE_ID.reset(token)

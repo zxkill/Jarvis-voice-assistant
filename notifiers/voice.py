@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import asyncio
-from core.logging_json import configure_logging
+from core.logging_json import configure_logging, TRACE_ID
 from core.metrics import inc_metric, set_metric
 from core.request_source import get_request_source
 from working_tts import speak_async
 from utils.reply import extract_reply
+from memory.dialogs import log_message
 
 log = configure_logging("notifiers.voice")
 
@@ -101,6 +102,14 @@ def say(text: str, *, pitch: float | None = None, speed: float | None = None, em
         source,
     )
     set_metric("tts.queue_len", _queue.qsize())
+    if source == "voice":
+        log_message(
+            clean,
+            direction="outgoing",
+            channel="voice",
+            trace_id=TRACE_ID.get(),
+            metadata={"emotion": emotion, "pitch": pitch, "speed": speed},
+        )
 
 
 def send(
