@@ -9,10 +9,14 @@ import struct
 import pytest
 import websockets
 
-from audio.robot_stream import RobotAudioStream, RobotStreamClosed, downmix_to_mono
+from audio.robot_stream import (
+    RobotAudioStream,
+    RobotStreamClosed,
+    downmix_to_mono,
+    _FLAG_TTS_FRAME,
+)
 
 _HEADER = struct.Struct("<2sBBIQIIHHIfffff")
-_TTS_HEADER = struct.Struct("<2sBBIQIHHIIff")
 
 
 def _build_payload(sequence: int = 1, frame_samples: int = 4) -> bytes:
@@ -115,7 +119,7 @@ def test_websocket_server_sends_tts_to_robot() -> None:
     payload, pcm_len = asyncio.run(_runner())
 
     assert isinstance(payload, (bytes, bytearray))
-    header = _TTS_HEADER.unpack_from(payload)
+    header = _HEADER.unpack_from(payload)
     (
         magic,
         version,
@@ -123,21 +127,28 @@ def test_websocket_server_sends_tts_to_robot() -> None:
         sequence,
         timestamp_us,
         sample_rate,
+        frame_samples,
         channels,
         sample_bits,
         pcm_bytes,
-        meta_bytes,
-        rms,
-        duration_ms,
+        rms_left,
+        rms_right,
+        spacing,
+        direction,
+        confidence,
     ) = header
-    assert magic == b"TF"
+    assert magic == b"AF"
     assert version == 1
+    assert flags & _FLAG_TTS_FRAME
     assert flags & RobotAudioStream._FLAG_FINAL_CHUNK
     assert sample_rate == 16_000
+    assert frame_samples == pcm_len // 2
     assert channels == 1
     assert sample_bits == 16
     assert pcm_bytes == pcm_len
-    meta_raw = payload[_TTS_HEADER.size + pcm_bytes : _TTS_HEADER.size + pcm_bytes + meta_bytes]
-    meta = json.loads(meta_raw)
-    assert meta["text"] == "привет"
-    assert meta["chunk_index"] == 1
+    pcm = payload[_HEADER.size : _HEADER.size + pcm_bytes]
+    assert pcm == struct.pack("<hh", 1200, -1200)
+    assert abs(rms_left - rms_right) < 1e-6
+    assert spacing == 0.0
+    assert direction == 0.0
+    assert confidence == 0.0

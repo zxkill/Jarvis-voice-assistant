@@ -20,9 +20,10 @@ from websockets.legacy.server import Serve, WebSocketServerProtocol, serve
 from core.logging_json import configure_logging
 
 _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
-# Структура исходящего чанка озвучки. Метаданные с текстом передаются
-# отдельным блоком сразу после PCM, поэтому в заголовке храним длину JSON.
-_TTS_HEADER_STRUCT = struct.Struct("<2sBBIQIHHIIff")
+# Флаг, который робот использует для пометки кадра локализации, занят бит 0x01.
+# Мы берём свободный старший бит для служебной информации об исходящем TTS,
+# чтобы формат оставался совместимым с приёмником ESP32.
+_FLAG_TTS_FRAME = 0x80
 
 
 @dataclasses.dataclass(slots=True)
@@ -53,7 +54,7 @@ class RobotAudioStream:
     """WebSocket-сервер, принимающий аудио от ESP32."""
 
     _SENTINEL = object()
-    _FLAG_FINAL_CHUNK = 0x01
+    _FLAG_FINAL_CHUNK = 0x40
 
     def __init__(
         self,
@@ -73,7 +74,9 @@ class RobotAudioStream:
         if self._parsed.scheme not in {"ws", "wss"}:
             raise ValueError("endpoint должен начинаться с ws:// или wss://")
         self._host = self._parsed.hostname or "0.0.0.0"
-        self._port = self._parsed.port or 8765
+        # Порт ``0`` используется тестами и означает «выбрать свободный автоматически»,
+        # поэтому обрабатываем ``None`` отдельно, не полагаясь на truthy-логику.
+        self._port = self._parsed.port if self._parsed.port is not None else 8765
         self._path = self._parsed.path or "/"
         self._subprotocol = subprotocol
         self._authorization = authorization
@@ -298,49 +301,67 @@ class RobotAudioStream:
 
         samples = array("h")
         samples.frombytes(pcm)
-        if samples:
-            squares = sum(val * val for val in samples)
-            rms = math.sqrt(squares / len(samples)) / 32768.0
-            peak = max(abs(val) for val in samples) / 32768.0
-        else:
-            rms = 0.0
-            peak = 0.0
-        per_channel = len(samples) // max(1, channels)
+
+        if channels <= 0:
+            self.log.error(
+                "Некорректное число каналов при отправке TTS", extra={"attrs": {"channels": channels}}
+            )
+            return
+
+        if len(pcm) % (2 * channels) != 0:
+            self.log.error(
+                "Размер PCM не делится на количество каналов", extra={"attrs": {"pcm_bytes": len(pcm), "channels": channels}}
+            )
+            return
+
+        total_samples = len(samples)
+        per_channel = total_samples // channels
         duration_ms = (
             (per_channel / sample_rate) * 1000.0 if sample_rate > 0 and per_channel else 0.0
         )
 
-        flags = 0
+        def _channel_rms(channel_index: int) -> float:
+            """Возвращает RMS конкретного канала для мониторинга."""
+
+            if per_channel == 0:
+                return 0.0
+            squares = 0
+            for idx in range(channel_index, total_samples, channels):
+                val = samples[idx]
+                squares += val * val
+            rms_val = math.sqrt(squares / per_channel) / 32768.0
+            return rms_val
+
+        peak = max((abs(val) for val in samples), default=0) / 32768.0
+
+        rms_left = _channel_rms(0)
+        rms_right = _channel_rms(1) if channels > 1 else rms_left
+
+        # Флаг 0x80 помечает кадр как TTS, а 0x40 сообщает о завершении фразы —
+        # такой подход не ломает тракт ESP32, который уже умеет работать с
+        # остальными битами локализации.
+        flags = _FLAG_TTS_FRAME
         if chunks_total and chunk_index >= chunks_total:
             flags |= self._FLAG_FINAL_CHUNK
 
-        meta = json.dumps(
-            {
-                "text": text,
-                "preset": preset,
-                "chunk_index": chunk_index,
-                "chunks_total": chunks_total,
-                "volume": volume,
-                "peak": peak,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-        header = _TTS_HEADER_STRUCT.pack(
-            b"TF",
+        header = _HEADER_STRUCT.pack(
+            b"AF",
             1,
             flags,
             self._next_tts_sequence(),
             time.time_ns() // 1000,
             sample_rate,
+            per_channel,
             channels,
             16,
             len(pcm),
-            len(meta),
-            rms,
-            duration_ms,
+            rms_left,
+            rms_right,
+            0.0,
+            0.0,
+            0.0,
         )
-        payload = header + pcm + meta
+        payload = header + pcm
 
         def _enqueue() -> None:
             if not self._send_queues:
@@ -369,6 +390,8 @@ class RobotAudioStream:
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
                     "pcm_bytes": len(pcm),
+                    "duration_ms": round(duration_ms, 2),
+                    "peak": round(peak, 3),
                 }
             },
         )

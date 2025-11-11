@@ -79,75 +79,65 @@ Jarvis-Pi — русскоязычный офлайн голосовой асс�
 
 ### Обратная передача синтезированной речи на робота
 
-Jarvis теперь транслирует синтезированную речь Piper обратно на ESP32 по тому
-же WebSocket‑соединению. Как только начинается озвучка, каждый чанк PCM16
-отправляется бинарным фреймом с заголовком `"TF"` и JSON‑метаданными.
+Jarvis транслирует синтезированную речь Piper обратно на ESP32 по тому же
+WebSocket‑каналу и **использует абсолютно такой же бинарный формат, как и для
+приёма звука**. Это упрощает прошивку робота: можно переиспользовать существующий
+парсер `AudioFrame` без дополнительных структур и JSON.
 
-#### Формат бинарного кадра TTS
+#### Формат исходящего кадра озвучки
 
-| Смещение | Тип     | Поле          | Описание |
-|---------:|---------|---------------|----------|
-| 0        | char[2] | `"TF"`        | Магические байты (TTS Frame). |
-| 2        | uint8   | `version`     | Текущая версия протокола (`1`). |
-| 3        | uint8   | `flags`       | Бит `0x01` — последний чанк фразы. |
-| 4        | uint32  | `sequence`    | Номер кадра (увеличивается монотонно). |
-| 8        | uint64  | `timestampUs` | Момент генерации кадра (микросекунды). |
-| 16       | uint32  | `sampleRate`  | Частота воспроизведения (учитывает `speed`). |
-| 20       | uint16  | `channels`    | Число каналов (`1`). |
-| 22       | uint16  | `sampleBits`  | Глубина (`16`). |
-| 24       | uint32  | `pcmBytes`    | Размер PCM‑данных. |
-| 28       | uint32  | `metaBytes`   | Длина JSON‑метаданных. |
-| 32       | float   | `rms`         | Нормированный RMS текущего чанка. |
-| 36       | float   | `durationMs`  | Длительность чанка в миллисекундах. |
+| Смещение | Тип     | Поле                 | Описание |
+|---------:|---------|----------------------|----------|
+| 0        | char[2] | `"AF"`               | Магические байты (Audio Frame). |
+| 2        | uint8   | `version`            | Версия (`1`). |
+| 3        | uint8   | `flags`              | Старший бит `0x80` означает, что кадр пришёл от синтезатора; бит `0x40` — последний чанк фразы; остальные биты сохраняют исходное значение протокола. |
+| 4        | uint32  | `sequence`           | Номер кадра TTS (монотонно растёт). |
+| 8        | uint64  | `timestampUs`        | Время генерации чанка в микросекундах. |
+| 16       | uint32  | `sampleRate`         | Частота воспроизведения (учитывает выбранный пресет Piper). |
+| 20       | uint32  | `frameSamples`       | Количество сэмплов на канал. |
+| 24       | uint16  | `channels`           | Число каналов (`1` для моно). |
+| 26       | uint16  | `sampleBits`         | Глубина (`16`). |
+| 28       | uint32  | `pcmBytes`           | Размер полезной нагрузки PCM. |
+| 32       | float   | `rmsLeft`            | Нормированный RMS исходящего канала (для мониторинга громкости). |
+| 36       | float   | `rmsRight`           | Для моно совпадает с левым каналом. |
+| 40       | float   | `microphoneSpacing`  | Всегда `0.0` (поле зарезервировано). |
+| 44       | float   | `directionDeg`       | Всегда `0.0` для исходящего аудио. |
+| 48       | float   | `confidence`         | Резерв (`0.0`). |
 
-После заголовка следуют `pcmBytes` байт моно PCM (`int16_le`), затем `metaBytes`
-символов UTF‑8. Метаданные выглядят так:
+После заголовка сразу идут `pcmBytes` байт PCM16 (`int16_le`). Роботу достаточно
+проверить флаг `0x80`, чтобы отличить TTS от входящего микрофона, и отправить
+данные в I2S‑драйвер. Когда Jarvis отправляет последний чанк фразы, он выставляет
+дополнительный бит `0x40`, поэтому прошивка может завершить воспроизведение без
+таймеров и эвристик.
 
-```json
-{
-  "text": "привет",
-  "preset": "neutral",
-  "chunk_index": 1,
-  "chunks_total": 2,
-  "volume": 1.0,
-  "peak": 0.42
-}
-```
-
-На ESP32 достаточно распарсить заголовок, воспроизвести PCM c указанной
-частотой и использовать JSON для логирования или выбора режима акустики.
-
-#### Минимальный пример приёмника TTS на Python
+#### Минимальный пример приёмника TTS
 
 ```python
 import asyncio
-import json
 import struct
 import websockets
 
-HEADER = struct.Struct('<2sBBIQIHHIIff')
+HEADER = struct.Struct('<2sBBIQIIHHIfffff')
 
 async def listen_tts():
     async with websockets.connect('ws://jarvis:8765/robot') as ws:
         while True:
             payload = await ws.recv()
             if isinstance(payload, str):
-                continue  # это ACK на исходящий микрофон
-            header = HEADER.unpack_from(payload)
-            magic, version, flags, seq, ts, sr, ch, bits, pcm_len, meta_len, rms, dur_ms = header
-            assert magic == b'TF'
+                continue  # текстовые сообщения — ACK входящих микрофонных кадров
+            magic, version, flags, seq, ts, sr, frame_samples, ch, bits, pcm_len, rms_l, rms_r, *_ = HEADER.unpack_from(payload)
+            assert magic == b'AF'
+            if not (flags & 0x80):
+                continue  # это входящий звук робота, а не TTS
             pcm = payload[HEADER.size:HEADER.size + pcm_len]
-            meta_raw = payload[HEADER.size + pcm_len:HEADER.size + pcm_len + meta_len]
-            meta = json.loads(meta_raw)
-            # Здесь можно передать PCM на I2S и залогировать метаданные
-            print(f"Play seq={seq} sr={sr} text={meta['text']}")
+            print(f"Play seq={seq} sr={sr} samples={frame_samples}")
 
 asyncio.run(listen_tts())
 ```
 
-Если робот уже использует бинарный протокол XiaoZhi, приёмник легко адаптировать:
-достаточно заменить Opus‑декодер на чтение PCM16 и обрабатывать новое поле
-`metaBytes`.
+Если прошивка основана на xiaozhi-esp32, достаточно добавить проверку флага
+`0x80` и передавать декодированный PCM напрямую в I2S — остальной код можно
+оставить без изменений.
 
 ## Журнал диалогов и мониторинг
 
