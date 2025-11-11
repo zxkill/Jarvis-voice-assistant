@@ -8,7 +8,6 @@ from __future__ import annotations
 ``jarvis_skills``, ``emotion`` и др.
 """
 
-import array
 import asyncio
 import configparser
 import json
@@ -22,7 +21,6 @@ from display import DisplayItem, init_driver, DisplayDriver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
 from emotion import sounds
-from notifiers.telegram_listener import launch as launch_telegram_listener
 from behavior.tree import create_behavior_tree
 from py_trees.trees import BehaviourTree
 
@@ -175,7 +173,7 @@ async def main() -> None:
     from analysis.mood_visualizer import watch_mood_history
     import vosk
     import yaml
-    from pvrecorder import PvRecorder
+    from audio.robot_stream import RobotAudioStream, RobotStreamClosed
 
     EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
     EmotionSoundDriver()           # звуки при смене эмоций
@@ -188,7 +186,6 @@ async def main() -> None:
         k: [normalize(v) for v in variants]
         for k, variants in command_processing.VA_CMD_LIST.items()
     }
-    mic_idx = cfg.getint("MIC", "microphone_index")
     # Загружаем структуру конфигурации (``core.config``) для передачи
     # параметров в отдельные подсистемы.
     app_cfg = load_config()
@@ -272,23 +269,48 @@ async def main() -> None:
     # --- Telegram listener -------------------------------------------------
     global tg_task
     if app_cfg.telegram.token:
+        from notifiers.telegram_listener import launch as launch_telegram_listener
+
         log.info("Запускаю Telegram-слушатель")
         tg_task = asyncio.create_task(
             launch_telegram_listener(stop_event=tg_stop_event)
         )
 
     # 2. Распознавание речи (Vosk)
+    expected_sample_rate = cfg.getint("AUDIO", "sample_rate", fallback=16000)
     model = vosk.Model('models/model_small')
-    kaldi = vosk.KaldiRecognizer(model, 16000)
-    recorder = PvRecorder(device_index=mic_idx, frame_length=512)
+    kaldi = vosk.KaldiRecognizer(model, expected_sample_rate)
+
+    robot_audio_endpoint = cfg.get("ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/")
+    if not robot_audio_endpoint:
+        raise RuntimeError("Не задан endpoint WebSocket для аудиопотока робота")
+    robot_subprotocol = cfg.get("ROBOT_AUDIO", "subprotocol", fallback="").strip() or None
+    robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
+    ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
+    ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
+
+    audio_stream = RobotAudioStream(
+        endpoint=robot_audio_endpoint,
+        queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
+        expected_sample_rate=expected_sample_rate,
+        expected_channels=2,
+        subprotocol=robot_subprotocol,
+        authorization=robot_auth,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+    )
+    await audio_stream.start()
+    stop_mgr.register(audio_stream.stop)
+    log.info(
+        "WebSocket-приёмник аудио готов",
+        extra={"attrs": {"endpoint": robot_audio_endpoint}},
+    )
 
     # Кольцевой буфер на ~1.5 секунды аудио.
-    # Храним последние PCM-кадры, чтобы при позднем обнаружении слова
-    # активации повторно передать их в распознаватель и не потерять
-    # начало команды.  Запас в 1.5 с позволяет уверенно захватывать
-    # длинное слово «джарвис» даже на шумном микрофоне.
-    buffer_size = int(1.5 * 16000 / recorder.frame_length)
-    pcm_buffer: deque[bytes] = deque(maxlen=buffer_size)
+    # Размер maxlen вычисляется после получения первого кадра, потому что
+    # длина frame_samples теоретически может отличаться от 512.
+    pcm_buffer: deque[bytes] = deque(maxlen=1)
+    buffer_limit_frames: int | None = None
     # Флаг, что слово активации уже было найдено и буфер «прокручен».
     # Позволяет избежать многократных повторных распознаваний, когда
     # ``PartialResult`` продолжает содержать «джарвис» несколько итераций подряд.
@@ -298,7 +320,6 @@ async def main() -> None:
     await asyncio.to_thread(sounds.play_effect, "WAKE")
     driver.draw(DisplayItem(kind="mode", payload="run"))
 
-    recorder.start()
     asyncio.create_task(gui_loop())
 
     log.info("Говорите команды, начиная с 'джарвис'")
@@ -327,10 +348,43 @@ async def main() -> None:
             publish(Event(kind="user_query_ended", attrs={"text": text, "trace_id": trace_id}))
 
     while True:
-        # Читаем с микрофона в отдельном потоке, чтобы не блокировать event loop
-        raw_data = await asyncio.to_thread(recorder.read)
-        pcm_arr = array.array('h', raw_data)
-        pcm = pcm_arr.tobytes()
+        try:
+            frame = await audio_stream.read()
+        except RobotStreamClosed:
+            log.error("Аудиопоток робота завершён, останавливаю распознавание")
+            break
+
+        pcm = frame.pcm_mono
+        if buffer_limit_frames is None:
+            buffer_limit_frames = max(
+                1,
+                int(round(1.5 * frame.sample_rate / frame.frame_samples)),
+            )
+            new_buffer: deque[bytes] = deque(maxlen=buffer_limit_frames)
+            new_buffer.extend(pcm_buffer)
+            pcm_buffer = new_buffer
+            buffer_seconds = buffer_limit_frames * frame.frame_samples / frame.sample_rate
+            log.info(
+                "Размер кольцевого буфера настроен",
+                extra={
+                    "attrs": {
+                        "frames": buffer_limit_frames,
+                        "seconds": round(buffer_seconds, 3),
+                        "frame_samples": frame.frame_samples,
+                    }
+                },
+            )
+
+        log.debug(
+            "Получен аудиокадр",
+            extra={
+                "attrs": {
+                    "sequence": frame.sequence,
+                    "timestamp_us": frame.timestamp_us,
+                    "buffer": len(pcm_buffer),
+                }
+            },
+        )
         if kaldi.AcceptWaveform(pcm):
             # Фраза завершена: собираем финальный текст.
             result = json.loads(kaldi.Result()).get('text', '')
