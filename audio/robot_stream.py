@@ -1,11 +1,14 @@
-"""Приём аудио от робота по WebSocket."""
+"""Приём и отправка аудио роботу по WebSocket."""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import json
+import math
 import struct
+import time
+from array import array
 from collections import deque
 from typing import Deque, Set
 from urllib.parse import urlparse
@@ -17,6 +20,9 @@ from websockets.legacy.server import Serve, WebSocketServerProtocol, serve
 from core.logging_json import configure_logging
 
 _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
+# Структура исходящего чанка озвучки. Метаданные с текстом передаются
+# отдельным блоком сразу после PCM, поэтому в заголовке храним длину JSON.
+_TTS_HEADER_STRUCT = struct.Struct("<2sBBIQIHHIIff")
 
 
 @dataclasses.dataclass(slots=True)
@@ -47,6 +53,7 @@ class RobotAudioStream:
     """WebSocket-сервер, принимающий аудио от ESP32."""
 
     _SENTINEL = object()
+    _FLAG_FINAL_CHUNK = 0x01
 
     def __init__(
         self,
@@ -81,9 +88,11 @@ class RobotAudioStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
+        self._send_queues: Set[asyncio.Queue[bytes]] = set()
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
+        self._tts_sequence = 0
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -173,6 +182,11 @@ class RobotAudioStream:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
+        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        sender_task = asyncio.create_task(
+            self._send_loop(websocket, send_queue, peer)
+        )
+        self._send_queues.add(send_queue)
         try:
             async for message in websocket:
                 if isinstance(message, str):
@@ -226,7 +240,165 @@ class RobotAudioStream:
         finally:
             if task is not None:
                 self._client_tasks.discard(task)
+            sender_task.cancel()
+            self._send_queues.discard(send_queue)
             self.log.info("Соединение с роботом завершено", extra={"attrs": {"peer": peer}})
+
+    async def _send_loop(
+        self,
+        websocket: WebSocketServerProtocol,
+        queue: asyncio.Queue[bytes],
+        peer: str,
+    ) -> None:
+        """Отправляет накопленные чанки озвучки на робота."""
+
+        self.log.debug(
+            "Запущен цикл отправки TTS", extra={"attrs": {"peer": peer}}
+        )
+        try:
+            while True:
+                payload = await queue.get()
+                await websocket.send(payload)
+                self.log.debug(
+                    "Отправлен TTS-чанк", extra={"attrs": {"peer": peer, "size": len(payload)}}
+                )
+        except asyncio.CancelledError:
+            self.log.debug("Цикл отправки TTS остановлен", extra={"attrs": {"peer": peer}})
+        except Exception:
+            self.log.exception(
+                "Ошибка отправки аудио роботу", extra={"attrs": {"peer": peer}}
+            )
+
+    def _next_tts_sequence(self) -> int:
+        """Генерирует последовательный номер TTS-кадра."""
+
+        self._tts_sequence = (self._tts_sequence + 1) & 0xFFFFFFFF
+        return self._tts_sequence
+
+    def send_tts(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        text: str,
+        preset: str,
+        chunk_index: int,
+        chunks_total: int,
+        volume: float,
+        channels: int = 1,
+    ) -> None:
+        """Отправляет подготовленный PCM на робота через WebSocket."""
+
+        if not pcm:
+            self.log.warning("Попытка отправить пустой PCM-чанк на робота")
+            return
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
+            return
+
+        samples = array("h")
+        samples.frombytes(pcm)
+        if samples:
+            squares = sum(val * val for val in samples)
+            rms = math.sqrt(squares / len(samples)) / 32768.0
+            peak = max(abs(val) for val in samples) / 32768.0
+        else:
+            rms = 0.0
+            peak = 0.0
+        per_channel = len(samples) // max(1, channels)
+        duration_ms = (
+            (per_channel / sample_rate) * 1000.0 if sample_rate > 0 and per_channel else 0.0
+        )
+
+        flags = 0
+        if chunks_total and chunk_index >= chunks_total:
+            flags |= self._FLAG_FINAL_CHUNK
+
+        meta = json.dumps(
+            {
+                "text": text,
+                "preset": preset,
+                "chunk_index": chunk_index,
+                "chunks_total": chunks_total,
+                "volume": volume,
+                "peak": peak,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        header = _TTS_HEADER_STRUCT.pack(
+            b"TF",
+            1,
+            flags,
+            self._next_tts_sequence(),
+            time.time_ns() // 1000,
+            sample_rate,
+            channels,
+            16,
+            len(pcm),
+            len(meta),
+            rms,
+            duration_ms,
+        )
+        payload = header + pcm + meta
+
+        def _enqueue() -> None:
+            if not self._send_queues:
+                self.log.warning("Нет активных подключений робота для отправки TTS")
+                return
+            for queue in list(self._send_queues):
+                if queue.full():
+                    try:
+                        dropped = queue.get_nowait()
+                        self.log.warning(
+                            "Очередь отправки TTS переполнена, удаляю старый кадр",
+                            extra={"attrs": {"dropped_size": len(dropped)}},
+                        )
+                    except asyncio.QueueEmpty:
+                        pass
+                queue.put_nowait(payload)
+
+        self._loop.call_soon_threadsafe(_enqueue)
+
+        self.log.debug(
+            "Сформирован TTS-кадр",
+            extra={
+                "attrs": {
+                    "text": text,
+                    "preset": preset,
+                    "chunk_index": chunk_index,
+                    "chunks_total": chunks_total,
+                    "pcm_bytes": len(pcm),
+                }
+            },
+        )
+
+    def forward_tts_chunk(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        text: str,
+        preset: str,
+        chunk_index: int,
+        chunks_total: int,
+        volume: float,
+    ) -> None:
+        """Совместимая с working_tts прослойка отправки TTS."""
+
+        try:
+            self.send_tts(
+                pcm,
+                sample_rate,
+                text=text,
+                preset=preset,
+                chunk_index=chunk_index,
+                chunks_total=chunks_total,
+                volume=volume,
+                channels=1,
+            )
+        except Exception:
+            self.log.exception("Не удалось передать чанк TTS роботу")
 
     def _decode_frame(self, payload: bytes) -> RobotAudioFrame | None:
         """Разбирает бинарный пакет и сводит стерео в моно."""

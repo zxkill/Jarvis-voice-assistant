@@ -12,6 +12,7 @@ import websockets
 from audio.robot_stream import RobotAudioStream, RobotStreamClosed, downmix_to_mono
 
 _HEADER = struct.Struct("<2sBBIQIIHHIfffff")
+_TTS_HEADER = struct.Struct("<2sBBIQIHHIIff")
 
 
 def _build_payload(sequence: int = 1, frame_samples: int = 4) -> bytes:
@@ -61,25 +62,82 @@ def test_decode_frame_fields() -> None:
     assert frame.localization_enabled is False
 
 
-@pytest.mark.asyncio
-async def test_websocket_server_receives_audio() -> None:
+def test_websocket_server_receives_audio() -> None:
     """Интеграционный тест: сервер принимает кадр и отправляет ack."""
 
-    stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
-    await stream.start()
-    assert stream._server is not None
-    port = stream._server.sockets[0].getsockname()[1]
-    payload = _build_payload(sequence=7)
+    async def _runner() -> None:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+        payload = _build_payload(sequence=7)
 
-    async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
-        await ws.send(payload)
-        ack = await asyncio.wait_for(ws.recv(), timeout=1.0)
-        assert json.loads(ack)["sequence"] == 7
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            await ws.send(payload)
+            ack = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            assert json.loads(ack)["sequence"] == 7
 
-    frame = await asyncio.wait_for(stream.read(), timeout=1.0)
-    assert frame.sequence == 7
-    # После остановки чтение должно вызвать исключение.
-    assert stream.stop() is True
-    await asyncio.sleep(0.05)
-    with pytest.raises(RobotStreamClosed):
-        await asyncio.wait_for(stream.read(), timeout=1.0)
+        frame = await asyncio.wait_for(stream.read(), timeout=1.0)
+        assert frame.sequence == 7
+        # После остановки чтение должно вызвать исключение.
+        assert stream.stop() is True
+        await asyncio.sleep(0.05)
+        with pytest.raises(RobotStreamClosed):
+            await asyncio.wait_for(stream.read(), timeout=1.0)
+
+    asyncio.run(_runner())
+
+
+def test_websocket_server_sends_tts_to_robot() -> None:
+    """Проверяем, что отправка озвучки формирует бинарный кадр."""
+
+    async def _runner() -> tuple[bytes, int]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            # PCM двух сэмплов для простоты проверки.
+            pcm = struct.pack("<hh", 1200, -1200)
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="привет",
+                preset="neutral",
+                chunk_index=1,
+                chunks_total=1,
+                volume=1.0,
+            )
+            payload = await asyncio.wait_for(ws.recv(), timeout=1.0)
+        return payload, len(pcm)
+
+    payload, pcm_len = asyncio.run(_runner())
+
+    assert isinstance(payload, (bytes, bytearray))
+    header = _TTS_HEADER.unpack_from(payload)
+    (
+        magic,
+        version,
+        flags,
+        sequence,
+        timestamp_us,
+        sample_rate,
+        channels,
+        sample_bits,
+        pcm_bytes,
+        meta_bytes,
+        rms,
+        duration_ms,
+    ) = header
+    assert magic == b"TF"
+    assert version == 1
+    assert flags & RobotAudioStream._FLAG_FINAL_CHUNK
+    assert sample_rate == 16_000
+    assert channels == 1
+    assert sample_bits == 16
+    assert pcm_bytes == pcm_len
+    meta_raw = payload[_TTS_HEADER.size + pcm_bytes : _TTS_HEADER.size + pcm_bytes + meta_bytes]
+    meta = json.loads(meta_raw)
+    assert meta["text"] == "привет"
+    assert meta["chunk_index"] == 1

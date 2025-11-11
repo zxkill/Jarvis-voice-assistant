@@ -77,6 +77,78 @@ Jarvis-Pi — русскоязычный офлайн голосовой асс�
 каждый кадр. Подробные JSON‑логи можно анализировать для оптимизации задержек
 и контроля качества аудиопотока.
 
+### Обратная передача синтезированной речи на робота
+
+Jarvis теперь транслирует синтезированную речь Piper обратно на ESP32 по тому
+же WebSocket‑соединению. Как только начинается озвучка, каждый чанк PCM16
+отправляется бинарным фреймом с заголовком `"TF"` и JSON‑метаданными.
+
+#### Формат бинарного кадра TTS
+
+| Смещение | Тип     | Поле          | Описание |
+|---------:|---------|---------------|----------|
+| 0        | char[2] | `"TF"`        | Магические байты (TTS Frame). |
+| 2        | uint8   | `version`     | Текущая версия протокола (`1`). |
+| 3        | uint8   | `flags`       | Бит `0x01` — последний чанк фразы. |
+| 4        | uint32  | `sequence`    | Номер кадра (увеличивается монотонно). |
+| 8        | uint64  | `timestampUs` | Момент генерации кадра (микросекунды). |
+| 16       | uint32  | `sampleRate`  | Частота воспроизведения (учитывает `speed`). |
+| 20       | uint16  | `channels`    | Число каналов (`1`). |
+| 22       | uint16  | `sampleBits`  | Глубина (`16`). |
+| 24       | uint32  | `pcmBytes`    | Размер PCM‑данных. |
+| 28       | uint32  | `metaBytes`   | Длина JSON‑метаданных. |
+| 32       | float   | `rms`         | Нормированный RMS текущего чанка. |
+| 36       | float   | `durationMs`  | Длительность чанка в миллисекундах. |
+
+После заголовка следуют `pcmBytes` байт моно PCM (`int16_le`), затем `metaBytes`
+символов UTF‑8. Метаданные выглядят так:
+
+```json
+{
+  "text": "привет",
+  "preset": "neutral",
+  "chunk_index": 1,
+  "chunks_total": 2,
+  "volume": 1.0,
+  "peak": 0.42
+}
+```
+
+На ESP32 достаточно распарсить заголовок, воспроизвести PCM c указанной
+частотой и использовать JSON для логирования или выбора режима акустики.
+
+#### Минимальный пример приёмника TTS на Python
+
+```python
+import asyncio
+import json
+import struct
+import websockets
+
+HEADER = struct.Struct('<2sBBIQIHHIIff')
+
+async def listen_tts():
+    async with websockets.connect('ws://jarvis:8765/robot') as ws:
+        while True:
+            payload = await ws.recv()
+            if isinstance(payload, str):
+                continue  # это ACK на исходящий микрофон
+            header = HEADER.unpack_from(payload)
+            magic, version, flags, seq, ts, sr, ch, bits, pcm_len, meta_len, rms, dur_ms = header
+            assert magic == b'TF'
+            pcm = payload[HEADER.size:HEADER.size + pcm_len]
+            meta_raw = payload[HEADER.size + pcm_len:HEADER.size + pcm_len + meta_len]
+            meta = json.loads(meta_raw)
+            # Здесь можно передать PCM на I2S и залогировать метаданные
+            print(f"Play seq={seq} sr={sr} text={meta['text']}")
+
+asyncio.run(listen_tts())
+```
+
+Если робот уже использует бинарный протокол XiaoZhi, приёмник легко адаптировать:
+достаточно заменить Opus‑декодер на чтение PCM16 и обрабатывать новое поле
+`metaBytes`.
+
 ## Журнал диалогов и мониторинг
 
 Централизованный журнал диалогов фиксирует каждую реплику ассистента и пользователя, позволяя быстро восстанавливать историю переписки Telegram и голосовых каналов, отслеживать trace_id и расследовать инциденты. Раздел помогает быстрее находить узкие места и одновременно повышает доверие к ассистенту.

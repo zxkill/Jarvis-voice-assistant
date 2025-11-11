@@ -301,6 +301,15 @@ async def main() -> None:
     )
     await audio_stream.start()
     stop_mgr.register(audio_stream.stop)
+    working_tts.register_stream_listener(audio_stream.forward_tts_chunk)
+
+    def _detach_tts() -> bool:
+        """Отвязывает поток TTS от робота при остановке приложения."""
+
+        working_tts.unregister_stream_listener(audio_stream.forward_tts_chunk)
+        return True
+
+    stop_mgr.register(_detach_tts)
     log.info(
         "WebSocket-приёмник аудио готов",
         extra={"attrs": {"endpoint": robot_audio_endpoint}},
