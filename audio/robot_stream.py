@@ -10,7 +10,7 @@ import struct
 import time
 from array import array
 from collections import deque
-from typing import Deque, Set
+from typing import Deque, Optional, Set
 from urllib.parse import urlparse
 
 import websockets
@@ -22,6 +22,17 @@ from core.logging_json import configure_logging
 _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
 # Заголовок исходящих кадров TTS, описанный в прошивке ESP32.
 _PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
+
+
+@dataclasses.dataclass(slots=True)
+class _OutgoingMessage:
+    """Описание сообщения, отправляемого роботу по WebSocket."""
+
+    payload: bytes | str
+    is_text: bool
+    purpose: str
+    sequence: Optional[int] = None
+    pcm_bytes: Optional[int] = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -88,19 +99,15 @@ class RobotAudioStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
-        self._send_queues: Set[asyncio.Queue[bytes]] = set()
+        self._send_queues: Set[asyncio.Queue[_OutgoingMessage]] = set()
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
-        # Ограничиваем размер исходящего WebSocket-сообщения, чтобы укладываться в
-        # реальные ограничения прошивки ESP32. Полевые испытания показали, что
-        # клиент обрывает соединение с кодом 1009 («Message Too Big»), если суммарный
-        # размер кадра превышает ~1 КБ. Закладываем лимит 1024 байта на всё сообщение
-        # (заголовок + PCM), чтобы гарантированно оставаться в пределах допустимого
-        # диапазона и не терять связь в момент озвучки.
-        self._max_ws_frame_bytes = max(1024, _PLAYBACK_HEADER_STRUCT.size + 2)
+        self._default_frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
         # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
         self._playback_sequence = 0
+        self._playback_sessions = 0
+        self._capture_paused = False
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -193,7 +200,7 @@ class RobotAudioStream:
         # Очередь исходящих кадров делаем достаточно широкой (200 сообщений), чтобы
         # роботу не приходилось сбрасывать озвучку при кратковременных всплесках
         # активности. Даже при чанках по ~30 мс этого хватит почти на 6 секунд буфера.
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
+        send_queue: asyncio.Queue[_OutgoingMessage] = asyncio.Queue(maxsize=200)
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -254,8 +261,10 @@ class RobotAudioStream:
                     "Диагностика размера кадра",
                     extra={
                         "attrs": {
-                            "max_ws_frame_bytes": self._max_ws_frame_bytes,
                             "frame_samples": self.frame_samples,
+                            "expected_payload_bytes": self.frame_samples
+                            * max(1, self._expected_channels)
+                            * 2,
                         }
                     },
                 )
@@ -275,7 +284,7 @@ class RobotAudioStream:
     async def _send_loop(
         self,
         websocket: WebSocketServerProtocol,
-        queue: asyncio.Queue[bytes],
+        queue: asyncio.Queue[_OutgoingMessage],
         peer: str,
     ) -> None:
         """Отправляет накопленные чанки озвучки на робота."""
@@ -285,34 +294,52 @@ class RobotAudioStream:
         )
         try:
             while True:
-                payload = await queue.get()
-                await websocket.send(payload)
-                try:
-                    (
-                        _magic,
-                        _ver,
-                        _flags,
-                        seq,
-                        _ts,
-                        _sr,
-                        _ch,
-                        _bits,
-                        _frame_samples,
-                        pcm_bytes,
-                        _volume,
-                        _reserved,
-                    ) = _PLAYBACK_HEADER_STRUCT.unpack_from(payload)
-                except struct.error:
-                    seq = -1
-                    pcm_bytes = len(payload)
+                message = await queue.get()
+                await websocket.send(message.payload)
+                if message.is_text:
+                    self.log.debug(
+                        "Отправлено текстовое сообщение роботу",
+                        extra={
+                            "attrs": {
+                                "peer": peer,
+                                "purpose": message.purpose,
+                                "payload": message.payload,
+                            }
+                        },
+                    )
+                    continue
+
+                seq = message.sequence if message.sequence is not None else -1
+                pcm_bytes = message.pcm_bytes if message.pcm_bytes is not None else 0
+                if seq == -1 or pcm_bytes == 0:
+                    try:
+                        (
+                            _magic,
+                            _ver,
+                            _flags,
+                            seq,
+                            _ts,
+                            _sr,
+                            _ch,
+                            _bits,
+                            _frame_samples,
+                            pcm_bytes,
+                            _volume,
+                            _reserved,
+                        ) = _PLAYBACK_HEADER_STRUCT.unpack_from(message.payload)
+                    except struct.error:
+                        seq = -1
+                        pcm_bytes = len(message.payload)
+
                 self.log.debug(
                     "Отправлен аудиокадр роботу",
                     extra={
                         "attrs": {
                             "peer": peer,
-                            "size": len(payload),
+                            "size": len(message.payload),
                             "sequence": seq,
                             "pcm_bytes": pcm_bytes,
+                            "purpose": message.purpose,
                         }
                     },
                 )
@@ -328,6 +355,73 @@ class RobotAudioStream:
 
         self._playback_sequence = (self._playback_sequence + 1) & 0xFFFFFFFF
         return self._playback_sequence
+
+    def _set_capture_paused(self, paused: bool, *, reason: str, direct: bool = False) -> None:
+        """Посылает роботу команду приостановить или возобновить передачу микрофона."""
+
+        if paused == self._capture_paused:
+            return
+
+        self._capture_paused = paused
+        command = f"capture:{'pause' if paused else 'resume'}:{reason}"
+        purpose = "capture-pause" if paused else "capture-resume"
+        self.log.info(
+            "Отправляю команду роботу о состоянии микрофона",
+            extra={
+                "attrs": {
+                    "paused": paused,
+                    "reason": reason,
+                    "active_sessions": self._playback_sessions,
+                }
+            },
+        )
+        self._broadcast_text(command, purpose=purpose, direct=direct)
+
+    def _start_playback_session(self, *, reason: str, metadata: dict[str, object]) -> None:
+        """Фиксирует старт новой сессии воспроизведения и управляет паузой микрофона."""
+
+        def _increment() -> None:
+            self._playback_sessions += 1
+            self.log.debug(
+                "Активирована сессия воспроизведения",
+                extra={
+                    "attrs": {
+                        "reason": reason,
+                        "active_sessions": self._playback_sessions,
+                        **metadata,
+                    }
+                },
+            )
+            if self._playback_sessions == 1:
+                self._set_capture_paused(True, reason=reason, direct=True)
+
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(_increment)
+
+    def _finish_playback_session(self, *, reason: str, metadata: dict[str, object]) -> None:
+        """Завершает сессию воспроизведения и при необходимости возобновляет микрофон."""
+
+        def _decrement() -> None:
+            if self._playback_sessions == 0:
+                return
+            self._playback_sessions -= 1
+            self.log.debug(
+                "Сессия воспроизведения завершена",
+                extra={
+                    "attrs": {
+                        "reason": reason,
+                        "active_sessions": self._playback_sessions,
+                        **metadata,
+                    }
+                },
+            )
+            if self._playback_sessions == 0:
+                self._set_capture_paused(False, reason=reason, direct=True)
+
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(_decrement)
 
     def _prepare_playback_payload(
         self,
@@ -434,29 +528,11 @@ class RobotAudioStream:
 
         safe_channels = max(1, channels)
         bytes_per_sample = safe_channels * 2
-        header_size = _PLAYBACK_HEADER_STRUCT.size
-        max_frame_bytes = max(self._max_ws_frame_bytes, header_size + bytes_per_sample)
-        safe_pcm_bytes = max(bytes_per_sample, max_frame_bytes - header_size)
-        safe_samples = max(1, safe_pcm_bytes // bytes_per_sample)
-        chunk_samples = max(1, min(self.frame_samples or safe_samples, safe_samples))
+        frame_samples = self.frame_samples or self._default_frame_samples
+        if frame_samples <= 0:
+            frame_samples = self._default_frame_samples
+        chunk_samples = max(1, frame_samples)
         frame_bytes = chunk_samples * bytes_per_sample
-
-        if frame_bytes + header_size > self._max_ws_frame_bytes:
-            # Защитный случай: округление вниз могло дать +1 сэмпл, превышающий лимит.
-            available_bytes = max(bytes_per_sample, self._max_ws_frame_bytes - header_size)
-            chunk_samples = max(1, available_bytes // bytes_per_sample)
-            frame_bytes = chunk_samples * bytes_per_sample
-            self.log.debug(
-                "Корректирую размер чанка под жёсткий лимит WebSocket",
-                extra={
-                    "attrs": {
-                        "header_size": header_size,
-                        "chunk_samples": chunk_samples,
-                        "frame_bytes": frame_bytes,
-                        "max_ws_frame_bytes": self._max_ws_frame_bytes,
-                    }
-                },
-            )
 
         chunks: list[bytes] = []
         for offset in range(0, len(pcm), frame_bytes):
@@ -465,20 +541,28 @@ class RobotAudioStream:
 
         if len(chunks) > 1:
             self.log.debug(
-                "PCM разбит на несколько кадров для надёжной доставки",
+                "PCM разбит на несколько кадров для повторного использования ESP32-параметров",
                 extra={
                     "attrs": {
                         "chunks": len(chunks),
                         "chunk_samples": chunk_samples,
                         "frame_bytes": frame_bytes,
                         "pcm_bytes": len(pcm),
+                        "expected_frame_samples": self.frame_samples,
                     }
                 },
             )
 
         return chunks
 
-    def _broadcast_payload(self, payload: bytes, *, purpose: str) -> None:
+    def _broadcast_payload(
+        self,
+        payload: bytes,
+        *,
+        purpose: str,
+        sequence: int | None = None,
+        pcm_bytes: int | None = None,
+    ) -> None:
         """Отправляет подготовленный пакет во все очереди клиентов."""
 
         if self._loop is None:
@@ -500,7 +584,11 @@ class RobotAudioStream:
                             "Очередь отправки переполнена, удаляю старый кадр",
                             extra={
                                 "attrs": {
-                                    "dropped_size": len(dropped),
+                                    "dropped_size": len(
+                                        dropped.payload
+                                        if isinstance(dropped.payload, (bytes, bytearray))
+                                        else str(dropped.payload).encode("utf-8")
+                                    ),
                                     "purpose": purpose,
                                     "queue_size": queue.qsize(),
                                 }
@@ -508,9 +596,56 @@ class RobotAudioStream:
                         )
                     except asyncio.QueueEmpty:
                         pass
-                queue.put_nowait(payload)
+                queue.put_nowait(
+                    _OutgoingMessage(
+                        payload=payload,
+                        is_text=False,
+                        purpose=purpose,
+                        sequence=sequence,
+                        pcm_bytes=pcm_bytes,
+                    )
+                )
 
         self._loop.call_soon_threadsafe(_enqueue)
+
+    def _broadcast_text(self, text: str, *, purpose: str, direct: bool = False) -> None:
+        """Передаёт текстовую команду всем подключённым роботам."""
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов, текст %s не отправлен", purpose)
+            return
+
+        def _enqueue() -> None:
+            if not self._send_queues:
+                self.log.debug(
+                    "Нет активных роботов для текстовой команды",
+                    extra={"attrs": {"purpose": purpose, "payload": text}},
+                )
+                return
+            for queue in list(self._send_queues):
+                if queue.full():
+                    try:
+                        dropped = queue.get_nowait()
+                        self.log.warning(
+                            "Очередь текстовых команд переполнена, удаляю старое сообщение",
+                            extra={
+                                "attrs": {
+                                    "purpose": dropped.purpose,
+                                    "payload": dropped.payload,
+                                    "queue_size": queue.qsize(),
+                                }
+                            },
+                        )
+                    except asyncio.QueueEmpty:
+                        continue
+                queue.put_nowait(
+                    _OutgoingMessage(payload=text, is_text=True, purpose=purpose)
+                )
+
+        if direct:
+            _enqueue()
+        else:
+            self._loop.call_soon_threadsafe(_enqueue)
 
     def send_tts(
         self,
@@ -534,6 +669,14 @@ class RobotAudioStream:
             self.log.warning("Получен пустой PCM для отправки TTS")
             return
 
+        session_metadata = {
+            "text": text,
+            "chunk_index": chunk_index,
+            "chunks_total": chunks_total,
+        }
+        if chunk_index <= 1:
+            self._start_playback_session(reason="tts", metadata=session_metadata)
+
         total_chunks = len(pcm_chunks)
         for playback_idx, pcm_chunk in enumerate(pcm_chunks, 1):
             prepared = self._prepare_playback_payload(
@@ -551,7 +694,12 @@ class RobotAudioStream:
                 "playback_total": total_chunks,
             })
 
-            self._broadcast_payload(payload, purpose="TTS")
+            self._broadcast_payload(
+                payload,
+                purpose="TTS",
+                sequence=stats.get("sequence"),
+                pcm_bytes=stats.get("pcm_bytes"),
+            )
 
             self.log.debug(
                 "Сформирован TTS-кадр",
@@ -565,6 +713,9 @@ class RobotAudioStream:
                     }
                 },
             )
+
+        if chunk_index >= chunks_total:
+            self._finish_playback_session(reason="tts", metadata=session_metadata)
 
     def send_effect(
         self,
@@ -589,6 +740,14 @@ class RobotAudioStream:
             self.log.warning("Получен пустой PCM для фонового эффекта", extra={"attrs": {"effect": name}})
             return
 
+        session_metadata = {
+            "effect": name,
+            "source_file": source_file,
+            "repeat_index": repeat_index,
+            "repeat_total": repeat_total,
+        }
+        self._start_playback_session(reason="effect", metadata=session_metadata)
+
         total_chunks = len(pcm_chunks)
         for playback_idx, pcm_chunk in enumerate(pcm_chunks, 1):
             prepared = self._prepare_playback_payload(
@@ -606,7 +765,12 @@ class RobotAudioStream:
             })
 
             purpose = f"эффекта {name}"
-            self._broadcast_payload(payload, purpose=purpose)
+            self._broadcast_payload(
+                payload,
+                purpose=purpose,
+                sequence=stats.get("sequence"),
+                pcm_bytes=stats.get("pcm_bytes"),
+            )
 
             self.log.debug(
                 "Сформирован аудиокадр фонового эффекта",
@@ -621,6 +785,8 @@ class RobotAudioStream:
                     }
                 },
             )
+
+        self._finish_playback_session(reason="effect", metadata=session_metadata)
 
     def forward_tts_chunk(
         self,
