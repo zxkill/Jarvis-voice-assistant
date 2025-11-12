@@ -49,6 +49,19 @@ def test_downmix_to_mono() -> None:
     assert mono == struct.pack("<hh", 0, 0)
 
 
+def test_prepare_payload_reports_extremes() -> None:
+    """Статистика кадра содержит минимум и максимум исходных сэмплов."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:8765/")
+    pcm = struct.pack("<hhhh", 100, -200, 300, -400)
+    prepared = stream._prepare_playback_payload(pcm, 16_000, channels=1, volume=1.0)
+    assert prepared is not None
+    payload, stats = prepared
+    assert payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + len(pcm)] == pcm
+    assert stats["sample_min"] == -400
+    assert stats["sample_max"] == 300
+
+
 def test_decode_frame_fields() -> None:
     """Распаковка заголовка возвращает ожидаемые значения."""
 

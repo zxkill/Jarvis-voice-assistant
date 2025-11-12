@@ -62,6 +62,7 @@ bool gDriverInstalled = false; ///< Флаг, позволяющий аккур�
 bool gIdleMuteEnabled = true;  ///< Признак, что перевод в тишину по таймауту включён конфигурацией.
 TickType_t gIdleTimeoutTicks = 0; ///< Сколько тиков ожидать до гашения тракта.
 TickType_t gQueuePollTicks = 0;   ///< Период опроса очереди, когда таймаут отключён.
+uint32_t gActiveSampleRate = 0;   ///< Текущая частота, уже установленная в I2S (0 означает «не задана»).
 #else
 std::mutex gStatsMutex;
 std::vector<Frame> gPendingFrames;
@@ -154,6 +155,7 @@ bool mute_output(const char* reason, bool countTransition) {
     Serial.printf("[PLAYBACK] предупреждение: i2s_stop вернул %d\n", stopRc);
   }
   dac_output_disable(DAC_CHANNEL_1);
+  gActiveSampleRate = 0;
   gOutputMuted = true;
   record_mute_state(true, countTransition);
   return true;
@@ -227,6 +229,16 @@ bool apply_sample_rate(uint32_t sampleRate) {
     sampleRate = 16000; // последний рубеж: не позволяем нулевой частоте свалить вывод.
   }
 
+  if (gActiveSampleRate == sampleRate) {
+    // Повторная установка той же частоты бессмысленна и приводит к лишним
+    // перезапускам PLL внутри I2S, что может давать щелчки.  Поэтому просто
+    // обновляем статистику и продолжаем воспроизведение текущим тактом.
+    lock_stats();
+    gStats.lastSampleRate = sampleRate;
+    unlock_stats();
+    return true;
+  }
+
   const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
   if (rc != ESP_OK) {
     Serial.printf("[PLAYBACK] ошибка установки частоты %u Гц: %d\n", static_cast<unsigned>(sampleRate), rc);
@@ -239,6 +251,7 @@ bool apply_sample_rate(uint32_t sampleRate) {
   lock_stats();
   gStats.lastSampleRate = sampleRate;
   unlock_stats();
+  gActiveSampleRate = sampleRate;
   return true;
 }
 
@@ -575,6 +588,7 @@ void shutdown() {
   dac_output_disable(DAC_CHANNEL_1);
   // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
   dac_output_disable(DAC_CHANNEL_2);
+  gActiveSampleRate = 0;
 #endif
   gOutputMuted = true;
   record_mute_state(true, false);

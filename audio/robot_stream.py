@@ -7,6 +7,7 @@ import dataclasses
 import json
 import math
 import struct
+import sys
 import time
 from array import array
 from collections import deque
@@ -519,6 +520,13 @@ class RobotAudioStream:
 
         samples = array("h")
         samples.frombytes(pcm)
+        if sys.byteorder != "little":
+            # На системах с big-endian порядок байтов в массиве отличается от того,
+            # что ожидает прошивка (все поля протокола определены как little-endian).
+            # Переводим сэмплы в little-endian, чтобы ESP32 получал корректное PCM.
+            samples.byteswap()
+        pcm = samples.tobytes()
+
         total_samples = len(samples)
         per_channel = total_samples // channels if channels else 0
         duration_ms = (
@@ -549,6 +557,11 @@ class RobotAudioStream:
             0.0,
         )
 
+        # Сохраняем крайние значения сигнала — это помогает из логов понять,
+        # появился ли в кадре живой звук или приходят почти нулевые сэмплы.
+        sample_min = min(samples) if samples else 0
+        sample_max = max(samples) if samples else 0
+
         return header + pcm, {
             "sequence": sequence,
             "duration_ms": round(duration_ms, 2),
@@ -556,6 +569,8 @@ class RobotAudioStream:
             "rms": round(rms_mono, 3),
             "pcm_bytes": len(pcm),
             "sample_rate": sample_rate,
+            "sample_min": int(sample_min),
+            "sample_max": int(sample_max),
         }
 
     def _iter_playback_chunks(self, pcm: bytes, channels: int) -> list[bytes]:
