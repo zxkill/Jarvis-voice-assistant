@@ -119,13 +119,12 @@ void configure_idle_timing_from_config() {
 bool prime_dma_with_silence(const char* context) {
   size_t samples = gConfig.frameSamplesHint == 0 ? 512 : gConfig.frameSamplesHint;
   samples = std::max<size_t>(samples, 256);
+  const bool mirror = gConfig.dacOutput == DacOutput::MirrorBoth;
+  const size_t wordsPerSample = mirror ? 2u : 1u;
 
-  std::vector<uint16_t> silence(samples * 2u); // Для стерео-режима заполняем пары L/R.
-  for (size_t i = 0; i < samples; ++i) {
-    // Каждую пару значений формируем явно, чтобы обеспечить центровку
-    // обоих каналов в 0 В (смещение 0x8000 = 128 << 8 для встроенного DAC).
-    silence[i * 2u] = 0x8000u;     // Левый канал (DAC1) – абсолютная тишина.
-    silence[i * 2u + 1u] = 0x8000u; // Правый канал (DAC2) также фиксируем в центре.
+  std::vector<uint16_t> silence(samples * wordsPerSample);
+  for (size_t i = 0; i < silence.size(); ++i) {
+    silence[i] = 0x8000u;
   }
   size_t bytesWritten = 0;
   const size_t bytesToWrite = silence.size() * sizeof(uint16_t);
@@ -246,7 +245,9 @@ bool apply_sample_rate(uint32_t sampleRate) {
     return true;
   }
 
-  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
+  const i2s_channel_t mode = (gConfig.dacOutput == DacOutput::MirrorBoth) ? I2S_CHANNEL_STEREO
+                                                                          : I2S_CHANNEL_MONO;
+  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, mode);
   if (rc != ESP_OK) {
     Serial.printf("[PLAYBACK] ошибка установки частоты %u Гц: %d\n", static_cast<unsigned>(sampleRate), rc);
     lock_stats();
@@ -276,6 +277,7 @@ std::vector<uint16_t> convert_to_dac_words(const Frame& frame) {
 
   std::vector<uint16_t> out = convert_pcm_to_dac_words(frame,
                                                        gConfig.defaultVolume,
+                                                       gConfig.dacOutput,
                                                        &inputMin,
                                                        &inputMax,
                                                        &clippedSamples,
@@ -376,12 +378,14 @@ void playback_task(void*) {
       gStats.lastSequence = frame.sequence;
       gStats.lastError.clear();
       unlock_stats();
-      const unsigned playedSamples = static_cast<unsigned>(dacWords.size() / 2u);
-      Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u, формат=L/R)\n",
+      const size_t wordsPerSample = (gConfig.dacOutput == DacOutput::MirrorBoth) ? 2u : 1u;
+      const unsigned playedSamples = static_cast<unsigned>(dacWords.size() / wordsPerSample);
+      Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u, раскладка=%u)\n",
                     static_cast<unsigned>(frame.sequence),
                     playedSamples,
                     static_cast<unsigned>(sampleRate),
-                    static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)));
+                    static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)),
+                    static_cast<unsigned>(gConfig.dacOutput));
     }
 
     delete holder;
@@ -492,7 +496,17 @@ bool init(const Config& cfg) {
   i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
   i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 16000 : cfg.defaultSampleRate;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT; // Аппаратный ЦАП ESP32 требует интерлив L/R.
+  switch (cfg.dacOutput) {
+    case DacOutput::LeftOnly:
+      i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+      break;
+    case DacOutput::RightOnly:
+      i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
+      break;
+    case DacOutput::MirrorBoth:
+      i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+      break;
+  }
   i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   // Используем восемь DMA-буферов по 512 сэмплов — это проверенная на железе
@@ -518,18 +532,33 @@ bool init(const Config& cfg) {
   gDriverInstalled = true; // Запоминаем успешный старт, чтобы грамотно гасить порт в shutdown().
 
   i2s_set_pin(I2S_PORT, nullptr);
-  // Встроенный DAC управляется непосредственно I2S-драйвером, поэтому достаточно
-  // активировать оба канала и не трогать dac_output_enable(): лишние ручные
-  // включения порождают фоновые щелчки.
-  i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
+  i2s_dac_mode_t dacMode = I2S_DAC_CHANNEL_LEFT_EN;
+  const char* channelInfo = "DAC1";
+  switch (cfg.dacOutput) {
+    case DacOutput::LeftOnly:
+      dacMode = I2S_DAC_CHANNEL_LEFT_EN;
+      channelInfo = "DAC1";
+      break;
+    case DacOutput::RightOnly:
+      dacMode = I2S_DAC_CHANNEL_RIGHT_EN;
+      channelInfo = "DAC2";
+      break;
+    case DacOutput::MirrorBoth:
+      dacMode = I2S_DAC_CHANNEL_BOTH_EN;
+      channelInfo = "DAC1+DAC2";
+      break;
+  }
+  i2s_set_dac_mode(dacMode);
 
   // Повторяем последовательность из рабочего эталона: сначала очищаем DMA и
   // выставляем базовую частоту, чтобы сразу после старта тракт был стабилен.
   i2s_zero_dma_buffer(I2S_PORT);
+  const i2s_channel_t initChannel = (cfg.dacOutput == DacOutput::MirrorBoth) ? I2S_CHANNEL_STEREO
+                                                                             : I2S_CHANNEL_MONO;
   const esp_err_t clkRc = i2s_set_clk(I2S_PORT,
                                       i2sConfig.sample_rate,
                                       I2S_BITS_PER_SAMPLE_16BIT,
-                                      I2S_CHANNEL_STEREO);
+                                      initChannel);
   if (clkRc != ESP_OK) {
     Serial.printf("[PLAYBACK] предупреждение: не удалось задать стартовую частоту %u Гц (rc=%d)\n",
                   static_cast<unsigned>(i2sConfig.sample_rate),
@@ -557,10 +586,11 @@ bool init(const Config& cfg) {
     return false;
   }
 
-  Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, режим=L/R\n",
+  Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=%s\n",
                 static_cast<int>(I2S_PORT),
                 static_cast<unsigned>(i2sConfig.sample_rate),
-                static_cast<unsigned>(cfg.queueCapacity));
+                static_cast<unsigned>(cfg.queueCapacity),
+                channelInfo);
 #else
   (void)ensure_queue_created;
 #endif

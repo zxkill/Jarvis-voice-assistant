@@ -235,6 +235,7 @@ void setup() {
   playbackCfg.frameSamplesHint = audioCfg.frameSamples;
   playbackCfg.queueCapacity = 6;
   playbackCfg.defaultVolume = 1.0f;
+  playbackCfg.dacOutput = AudioPlayback::DacOutput::LeftOnly; // Активируем только DAC1 (GPIO25), где распаян усилитель.
   if (AudioPlayback::init(playbackCfg)) {
     Serial.println("[PLAYBACK] ЦАП готов воспроизводить команды сервера через LM386");
   } else {

@@ -18,6 +18,20 @@ enum class OutputMode : uint8_t {
 };
 
 /**
+ * \brief Конфигурация раскладки ЦАП.
+ *
+ * Встроенный I2S-DAC ESP32 содержит два независимых выхода (DAC1=GPIO25,
+ * DAC2=GPIO26).  Робот использует только первый канал, однако в отладочных
+ * стендах нередко подключают усиливающий модуль ко второму.  Поэтому даём
+ * возможность выбрать явный канал либо задублировать сигнал на оба выхода.
+ */
+enum class DacOutput : uint8_t {
+  LeftOnly = 0,   ///< Выводим звук только на DAC1 (GPIO25) — штатная разводка робота.
+  RightOnly = 1,  ///< Выводим звук только на DAC2 (GPIO26) — полезно для лабораторных тестов.
+  MirrorBoth = 2, ///< Дублируем сигнал на оба выхода, чтобы прозвучал любой подключённый канал.
+};
+
+/**
  * \brief Конфигурация приёмника аудиопотока от сервера.
  */
 struct Config {
@@ -27,6 +41,7 @@ struct Config {
   size_t queueCapacity = 6;                  ///< Максимальное количество кадров в очереди.
   float defaultVolume = 1.0f;                ///< Усиление, применяемое при отсутствии указания в кадре.
   uint32_t idleMuteDelayMs = 250;            ///< Задержка (мс) без аудиокадров, после которой тракт переводится в режим тишины.
+  DacOutput dacOutput = DacOutput::LeftOnly; ///< Какой выход встроенного ЦАП активен.
 };
 
 /**
@@ -113,16 +128,16 @@ namespace detail {
  */
 inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
                                                       float defaultVolume,
+                                                      DacOutput layout,
                                                       int32_t* outMin = nullptr,
                                                       int32_t* outMax = nullptr,
                                                       uint32_t* clipped = nullptr,
                                                       float* appliedVolume = nullptr) {
   // Реализация копирует проверенный эталон, который разработчик приводил
   // в виде минимального Arduino-скетча: исходные PCM16 переводятся в
-  // «смещённый» 8-битный диапазон 0..255 простым сдвигом, после чего каждое
-  // значение разворачивается в стереопару. Левый канал (DAC1 = GPIO25)
-  // получает фактический уровень, правый (DAC2 = GPIO26) фиксируется в середине
-  // диапазона, чтобы не возбуждать шум при незадействованном выводе.
+  // «смещённый» 8-битный диапазон 0..255 простым сдвигом. Далее значение
+  // записывается либо в единственный активный канал, либо дублируется на оба
+  // вывода — в зависимости от настроек `dacOutput`.
   std::vector<uint16_t> out;
   if (frame.samples.empty()) {
     if (outMin) {
@@ -159,7 +174,8 @@ inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
   }
 
   constexpr uint16_t kDacMidWord = 0x8000u;
-  out.assign(samplesPerChannel * 2u, kDacMidWord);
+  const size_t wordsPerSample = layout == DacOutput::MirrorBoth ? 2u : 1u;
+  out.assign(samplesPerChannel * wordsPerSample, kDacMidWord);
 
   const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
                                     ? frame.volume
@@ -204,8 +220,19 @@ inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
     const uint8_t dacByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
     const uint16_t dacWord = static_cast<uint16_t>(static_cast<uint16_t>(dacByte) << 8);
 
-    out[i * 2u] = dacWord;       // Левый канал (DAC1) получает фактический сэмпл.
-    out[i * 2u + 1u] = kDacMidWord; // Правый канал (DAC2) удерживаем в середине.
+    switch (layout) {
+      case DacOutput::LeftOnly:
+      case DacOutput::RightOnly:
+        // Моно-раскладка: один 16-битный элемент на каждый исходный сэмпл.
+        out[i] = dacWord;
+        break;
+      case DacOutput::MirrorBoth:
+        // Дублируем значение в оба канала, чтобы звук прозвучал независимо от того,
+        // к какому выводу подключён усилитель.
+        out[i * 2u] = dacWord;
+        out[i * 2u + 1u] = dacWord;
+        break;
+    }
   }
 
   if (outMin) {
