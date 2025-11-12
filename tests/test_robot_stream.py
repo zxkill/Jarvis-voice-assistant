@@ -291,3 +291,43 @@ def test_effect_payload_chunking_matches_tts_strategy() -> None:
         restored.extend(payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + pcm_bytes])
 
     assert bytes(restored) == original_pcm
+
+
+def test_chunk_size_respects_ws_limit() -> None:
+    """Даже при искусственно малом лимите кадр не превышает порог WebSocket."""
+
+    async def _runner() -> list[bytes]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        stream._max_ws_frame_bytes = _PLAYBACK_HEADER.size + 40  # жёсткое ограничение ~40 байт PCM
+        stream.frame_samples = 320  # явно больше, чем позволяет лимит
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        pcm = struct.pack("<" + "h" * 120, *range(120))
+        received: list[bytes] = []
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="stress-test",
+                chunk_index=1,
+                chunks_total=1,
+                volume=0.8,
+            )
+            while True:
+                try:
+                    received.append(await asyncio.wait_for(ws.recv(), timeout=0.2))
+                except asyncio.TimeoutError:
+                    break
+
+        stream.stop()
+        await asyncio.sleep(0.05)
+        return received
+
+    payloads = asyncio.run(_runner())
+
+    assert payloads, "Ожидали хотя бы один кадр TTS"
+    for payload in payloads:
+        assert len(payload) <= _PLAYBACK_HEADER.size + 40

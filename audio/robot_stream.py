@@ -91,11 +91,13 @@ class RobotAudioStream:
         self._send_queues: Set[asyncio.Queue[bytes]] = set()
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
-        # Ограничиваем размер одного исходящего сообщения для защиты WebSocket ESP32.
-        # Клиентская библиотека на микроконтроллере обрывает соединение с кодом 1009,
-        # если кадр превышает несколько килобайт. Выдерживаем безопасный лимит 4 КБ,
-        # которого достаточно для 512 сэмплов моно PCM16 (≈32 мс речи).
-        self._max_playback_payload_bytes = 4 * 1024
+        # Ограничиваем размер исходящего WebSocket-сообщения, чтобы укладываться в
+        # реальные ограничения прошивки ESP32. Полевые испытания показали, что
+        # клиент обрывает соединение с кодом 1009 («Message Too Big»), если суммарный
+        # размер кадра превышает ~1 КБ. Закладываем лимит 1024 байта на всё сообщение
+        # (заголовок + PCM), чтобы гарантированно оставаться в пределах допустимого
+        # диапазона и не терять связь в момент озвучки.
+        self._max_ws_frame_bytes = max(1024, _PLAYBACK_HEADER_STRUCT.size + 2)
         self.log = configure_logging("audio.robot_stream")
         # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
         self._playback_sequence = 0
@@ -188,7 +190,10 @@ class RobotAudioStream:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Очередь исходящих кадров делаем достаточно широкой (200 сообщений), чтобы
+        # роботу не приходилось сбрасывать озвучку при кратковременных всплесках
+        # активности. Даже при чанках по ~30 мс этого хватит почти на 6 секунд буфера.
+        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=200)
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -240,10 +245,20 @@ class RobotAudioStream:
             log_level = self.log.warning
             message = "Соединение закрыто с ошибкой"
             if exc.code == 1009:
-                # Код 1009 означает «Message Too Big». Добавляем явное пояснение,
-                # чтобы оператор сразу проверил размеры отправляемых кадров.
+                # Код 1009 означает «Message Too Big». Добавляем явное пояснение и
+                # логику самодиагностики: при срабатывании лимита выводим текущие
+                # параметры буфера, чтобы быстрее найти источник переполнения.
                 log_level = self.log.error
-                message = "Соединение закрыто: сервер отправил слишком крупный кадр"
+                message = "Соединение закрыто: робот отклонил слишком крупный кадр"
+                self.log.error(
+                    "Диагностика размера кадра",
+                    extra={
+                        "attrs": {
+                            "max_ws_frame_bytes": self._max_ws_frame_bytes,
+                            "frame_samples": self.frame_samples,
+                        }
+                    },
+                )
             log_level(
                 message,
                 extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
@@ -419,9 +434,29 @@ class RobotAudioStream:
 
         safe_channels = max(1, channels)
         bytes_per_sample = safe_channels * 2
-        safe_samples = max(1, self._max_playback_payload_bytes // bytes_per_sample)
+        header_size = _PLAYBACK_HEADER_STRUCT.size
+        max_frame_bytes = max(self._max_ws_frame_bytes, header_size + bytes_per_sample)
+        safe_pcm_bytes = max(bytes_per_sample, max_frame_bytes - header_size)
+        safe_samples = max(1, safe_pcm_bytes // bytes_per_sample)
         chunk_samples = max(1, min(self.frame_samples or safe_samples, safe_samples))
         frame_bytes = chunk_samples * bytes_per_sample
+
+        if frame_bytes + header_size > self._max_ws_frame_bytes:
+            # Защитный случай: округление вниз могло дать +1 сэмпл, превышающий лимит.
+            available_bytes = max(bytes_per_sample, self._max_ws_frame_bytes - header_size)
+            chunk_samples = max(1, available_bytes // bytes_per_sample)
+            frame_bytes = chunk_samples * bytes_per_sample
+            self.log.debug(
+                "Корректирую размер чанка под жёсткий лимит WebSocket",
+                extra={
+                    "attrs": {
+                        "header_size": header_size,
+                        "chunk_samples": chunk_samples,
+                        "frame_bytes": frame_bytes,
+                        "max_ws_frame_bytes": self._max_ws_frame_bytes,
+                    }
+                },
+            )
 
         chunks: list[bytes] = []
         for offset in range(0, len(pcm), frame_bytes):
@@ -463,7 +498,13 @@ class RobotAudioStream:
                         dropped = queue.get_nowait()
                         self.log.warning(
                             "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={"attrs": {"dropped_size": len(dropped), "purpose": purpose}},
+                            extra={
+                                "attrs": {
+                                    "dropped_size": len(dropped),
+                                    "purpose": purpose,
+                                    "queue_size": queue.qsize(),
+                                }
+                            },
                         )
                     except asyncio.QueueEmpty:
                         pass
