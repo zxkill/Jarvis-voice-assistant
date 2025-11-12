@@ -27,11 +27,27 @@ from core.logging_json import configure_logging
 # Настройка базового логирования для всей работы модуля
 log = configure_logging("tts.piper")
 
+# Флаг, управляющий локальным воспроизведением через колонки ноутбука.
+# По умолчанию включён, но может быть отключён конфигурацией, если звук
+# нужно транслировать исключительно на робота.
+_LOCAL_PLAYBACK_ENABLED: bool = True
+
 # Список слушателей, которым нужно передавать синтезированный PCM для
 # дальнейшей ретрансляции (например, роботу по WebSocket).
 _STREAM_LISTENERS: List[Callable[..., None]] = []
 # Блокировка предотвращает гонки между регистрацией слушателей и отправкой.
 _STREAM_LOCK: Lock = Lock()
+
+
+def set_local_playback_enabled(enabled: bool) -> None:
+    """Включает или отключает локальное воспроизведение через ``sounddevice``."""
+
+    global _LOCAL_PLAYBACK_ENABLED
+    _LOCAL_PLAYBACK_ENABLED = bool(enabled)
+    log.info(
+        "Локальное воспроизведение %s",
+        "включено" if _LOCAL_PLAYBACK_ENABLED else "отключено",
+    )
 
 
 def register_stream_listener(listener: Callable[..., None]) -> None:
@@ -81,6 +97,39 @@ def _notify_stream_listeners(
             )
         except Exception:
             log.exception("Ошибка передачи PCM слушателю %s", listener)
+
+
+def _perform_playback(audio_f32: np.ndarray, playback_rate: int, duration: float) -> None:
+    """Проигрывает или имитирует проигрывание чанка речи."""
+
+    if playback_rate <= 0:
+        log.warning(
+            "Пропускаю локальное воспроизведение: неверная частота",
+            extra={"attrs": {"playback_rate": playback_rate}},
+        )
+        return
+
+    end_time = time.perf_counter() + max(duration, 0.0)
+    if _LOCAL_PLAYBACK_ENABLED:
+        log.debug(
+            "Воспроизводим чанк через локальные динамики",
+            extra={"attrs": {"duration": round(max(duration, 0.0), 3)}},
+        )
+        sd.play(audio_f32, playback_rate, blocking=False)
+        while time.perf_counter() < end_time:
+            if _STOP_EVENT.is_set():
+                break
+            time.sleep(0.05)
+        sd.stop()
+    else:
+        log.debug(
+            "Локальное воспроизведение отключено, ожидаю завершения длительности",
+            extra={"attrs": {"duration": round(max(duration, 0.0), 3)}},
+        )
+        while time.perf_counter() < end_time:
+            if _STOP_EVENT.is_set():
+                break
+            time.sleep(0.05)
 
 # ────────────────────────── 1. CONFIG ─────────────────────────────
 # Идентификатор голоса Piper (файл <VOICE_ID>.onnx должен существовать)
@@ -400,15 +449,9 @@ def working_tts(
         # и поэтому не даёт реагировать на слово «стоп».
         # Вместо этого ожидаем завершения в простом цикле с небольшим сном,
         # что даёт возможность другим потокам читать микрофон.
-        t1 = time.perf_counter()
         duration = audio_f32.size / playback_rate if playback_rate else 0.0
-        sd.play(audio_f32, playback_rate, blocking=False)
-        end_time = t1 + duration
-        while time.perf_counter() < end_time:
-            if _STOP_EVENT.is_set():
-                break
-            time.sleep(0.05)
-        sd.stop()
+        t1 = time.perf_counter()
+        _perform_playback(audio_f32, playback_rate, duration)
         t_play = time.perf_counter() - t1
 
         rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
@@ -427,7 +470,8 @@ def working_tts(
     is_playing = False
     core_events.publish(core_events.Event(kind="speech.synthesis_finished"))
     _STOP_EVENT.clear()
-    sd.stop()
+    if _LOCAL_PLAYBACK_ENABLED:
+        sd.stop()
 
 # ────────────────────────── 5. ASYNC WRAPPER ─────────────────────
 

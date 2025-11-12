@@ -281,6 +281,10 @@ async def main() -> None:
     model = vosk.Model('models/model_small')
     kaldi = vosk.KaldiRecognizer(model, expected_sample_rate)
 
+    working_tts.set_local_playback_enabled(
+        cfg.getboolean("ROBOT_AUDIO", "local_playback", fallback=False)
+    )
+
     robot_audio_endpoint = cfg.get("ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/")
     if not robot_audio_endpoint:
         raise RuntimeError("Не задан endpoint WebSocket для аудиопотока робота")
