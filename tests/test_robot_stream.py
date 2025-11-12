@@ -256,6 +256,59 @@ def test_tts_payload_chunking_prevents_ws_overflow() -> None:
     assert bytes(restored) == original_pcm
 
 
+def test_send_queue_backpressure_prevents_drops() -> None:
+    """Даже при минимальном размере очереди кадры доходят до робота без потерь."""
+
+    async def _runner() -> tuple[list[str], list[bytes]]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=1)
+        stream.frame_samples = 4
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        commands: list[str] = []
+        payloads: list[bytes] = []
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            async def _slow_reader() -> None:
+                try:
+                    while True:
+                        message = await ws.recv()
+                        if isinstance(message, str):
+                            commands.append(message)
+                        else:
+                            payloads.append(message)
+                        await asyncio.sleep(0.03)
+                except websockets.ConnectionClosed:
+                    return
+
+            reader_task = asyncio.create_task(_slow_reader())
+
+            pcm = struct.pack("<" + "h" * 80, *range(80))
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="stress-test",
+                chunk_index=1,
+                chunks_total=1,
+                volume=0.9,
+            )
+
+            await asyncio.sleep(0.6)
+            await ws.close()
+            await reader_task
+
+        stream.stop()
+        await asyncio.sleep(0.05)
+        return commands, payloads
+
+    commands, payloads = asyncio.run(_runner())
+
+    assert commands[0] == "capture:pause:tts"
+    assert commands[-1] == "capture:resume:tts"
+    assert len(payloads) == math.ceil((80 * 2) / (4 * 2))
+
+
 def test_effect_payload_chunking_matches_tts_strategy() -> None:
     """Фоновые эффекты используют тот же механизм дробления и паузы микрофона."""
 

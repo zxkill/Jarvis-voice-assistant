@@ -10,7 +10,7 @@ import struct
 import time
 from array import array
 from collections import deque
-from typing import Deque, Optional, Set
+from typing import Awaitable, Callable, Deque, Optional, Set
 from urllib.parse import urlparse
 
 import websockets
@@ -108,6 +108,51 @@ class RobotAudioStream:
         self._playback_sequence = 0
         self._playback_sessions = 0
         self._capture_paused = False
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы планирования задач и подготовки данных.
+    # ------------------------------------------------------------------
+
+    def _schedule_coroutine(
+        self,
+        factory: Callable[[], Awaitable[None]],
+        *,
+        direct: bool = False,
+    ) -> None:
+        """Запускает корутину в event loop с учётом текущего потока.
+
+        Если ``direct`` и код уже выполняется внутри рабочего цикла, корутина
+        стартует немедленно. В противном случае используем thread-safe вызов,
+        чтобы избежать гонок при обращении из фоновых потоков.
+        """
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов для планирования задачи")
+            return
+
+        def _create_task() -> None:
+            asyncio.create_task(factory())
+
+        if direct:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is self._loop:
+                _create_task()
+                return
+
+        self._loop.call_soon_threadsafe(_create_task)
+
+    @staticmethod
+    def _payload_preview(payload: bytes | str, limit: int = 32) -> str:
+        """Возвращает укороченное представление полезной нагрузки для логов."""
+
+        if isinstance(payload, str):
+            trimmed = payload if len(payload) <= limit else payload[: limit - 3] + "..."
+            return trimmed
+        preview = payload[: limit // 2]
+        return preview.hex() + ("..." if len(payload) > len(preview) else "")
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -569,44 +614,61 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, %s не отправлен", purpose)
             return
 
-        def _enqueue() -> None:
+        async def _enqueue_async() -> None:
+            """Помещает аудиопакет в очереди всех активных подключений."""
+
             if not self._send_queues:
                 self.log.warning(
                     "Нет активных подключений робота для отправки %s",
                     purpose,
                 )
                 return
-            for queue in list(self._send_queues):
-                if queue.full():
-                    try:
-                        dropped = queue.get_nowait()
-                        self.log.warning(
-                            "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={
-                                "attrs": {
-                                    "dropped_size": len(
-                                        dropped.payload
-                                        if isinstance(dropped.payload, (bytes, bytearray))
-                                        else str(dropped.payload).encode("utf-8")
-                                    ),
-                                    "purpose": purpose,
-                                    "queue_size": queue.qsize(),
-                                }
-                            },
-                        )
-                    except asyncio.QueueEmpty:
-                        pass
-                queue.put_nowait(
-                    _OutgoingMessage(
-                        payload=payload,
-                        is_text=False,
-                        purpose=purpose,
-                        sequence=sequence,
-                        pcm_bytes=pcm_bytes,
-                    )
-                )
 
-        self._loop.call_soon_threadsafe(_enqueue)
+            for queue in list(self._send_queues):
+                message = _OutgoingMessage(
+                    payload=payload,
+                    is_text=False,
+                    purpose=purpose,
+                    sequence=sequence,
+                    pcm_bytes=pcm_bytes,
+                )
+                start = self._loop.time()
+                try:
+                    await asyncio.wait_for(queue.put(message), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if queue not in self._send_queues:
+                        self.log.debug(
+                            "Пропускаю очередь отключившегося робота",
+                            extra={"attrs": {"purpose": purpose}},
+                        )
+                        continue
+                    self.log.warning(
+                        "Очередь отправки занята слишком долго",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "queue_size": queue.qsize(),
+                                "timeout_s": 2.0,
+                                "payload_bytes": len(payload),
+                            }
+                        },
+                    )
+                    await queue.put(message)
+                wait_ms = (self._loop.time() - start) * 1000.0
+                if wait_ms >= 5.0:
+                    self.log.debug(
+                        "Ожидал освобождения места в очереди отправки",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "wait_ms": round(wait_ms, 2),
+                                "queue_size": queue.qsize(),
+                                "payload_bytes": len(payload),
+                            }
+                        },
+                    )
+
+        self._schedule_coroutine(_enqueue_async)
 
     def _broadcast_text(self, text: str, *, purpose: str, direct: bool = False) -> None:
         """Передаёт текстовую команду всем подключённым роботам."""
@@ -615,37 +677,55 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, текст %s не отправлен", purpose)
             return
 
-        def _enqueue() -> None:
+        async def _enqueue_async() -> None:
+            """Добавляет текстовую команду в очереди без потери сообщений."""
+
             if not self._send_queues:
                 self.log.debug(
                     "Нет активных роботов для текстовой команды",
                     extra={"attrs": {"purpose": purpose, "payload": text}},
                 )
                 return
-            for queue in list(self._send_queues):
-                if queue.full():
-                    try:
-                        dropped = queue.get_nowait()
-                        self.log.warning(
-                            "Очередь текстовых команд переполнена, удаляю старое сообщение",
-                            extra={
-                                "attrs": {
-                                    "purpose": dropped.purpose,
-                                    "payload": dropped.payload,
-                                    "queue_size": queue.qsize(),
-                                }
-                            },
-                        )
-                    except asyncio.QueueEmpty:
-                        continue
-                queue.put_nowait(
-                    _OutgoingMessage(payload=text, is_text=True, purpose=purpose)
-                )
 
-        if direct:
-            _enqueue()
-        else:
-            self._loop.call_soon_threadsafe(_enqueue)
+            for queue in list(self._send_queues):
+                message = _OutgoingMessage(payload=text, is_text=True, purpose=purpose)
+                start = self._loop.time()
+                try:
+                    await asyncio.wait_for(queue.put(message), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if queue not in self._send_queues:
+                        self.log.debug(
+                            "Текстовая очередь принадлежит отключившемуся роботу",
+                            extra={"attrs": {"purpose": purpose}},
+                        )
+                        continue
+                    self.log.warning(
+                        "Очередь текстовых команд занята слишком долго",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "queue_size": queue.qsize(),
+                                "timeout_s": 2.0,
+                                "preview": self._payload_preview(text),
+                            }
+                        },
+                    )
+                    await queue.put(message)
+                wait_ms = (self._loop.time() - start) * 1000.0
+                if wait_ms >= 5.0:
+                    self.log.debug(
+                        "Ожидал освобождения места для текстовой команды",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "wait_ms": round(wait_ms, 2),
+                                "queue_size": queue.qsize(),
+                                "preview": self._payload_preview(text),
+                            }
+                        },
+                    )
+
+        self._schedule_coroutine(_enqueue_async, direct=direct)
 
     def send_tts(
         self,
