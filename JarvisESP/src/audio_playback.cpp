@@ -117,7 +117,13 @@ bool prime_dma_with_silence(const char* context) {
   size_t samples = gConfig.frameSamplesHint == 0 ? 512 : gConfig.frameSamplesHint;
   samples = std::max<size_t>(samples, 256);
 
-  std::vector<uint16_t> silence(samples, 0x8000u); // 0x8000 = половина диапазона, что соответствует 0 В.
+  std::vector<uint16_t> silence(samples * 2u); // Для стерео-режима заполняем пары L/R.
+  for (size_t i = 0; i < samples; ++i) {
+    // Каждую пару значений формируем явно, чтобы обеспечить центровку
+    // обоих каналов в 0 В (смещение 0x8000 = 128 << 8 для встроенного DAC).
+    silence[i * 2u] = 0x8000u;     // Левый канал (DAC1) – абсолютная тишина.
+    silence[i * 2u + 1u] = 0x8000u; // Правый канал (DAC2) также фиксируем в центре.
+  }
   size_t bytesWritten = 0;
   const size_t bytesToWrite = silence.size() * sizeof(uint16_t);
   const esp_err_t primeRc =
@@ -155,6 +161,7 @@ bool mute_output(const char* reason, bool countTransition) {
     Serial.printf("[PLAYBACK] предупреждение: i2s_stop вернул %d\n", stopRc);
   }
   dac_output_disable(DAC_CHANNEL_1);
+  dac_output_disable(DAC_CHANNEL_2);
   gActiveSampleRate = 0;
   gOutputMuted = true;
   record_mute_state(true, countTransition);
@@ -179,6 +186,7 @@ bool unmute_output(const char* reason) {
     return false;
   }
   dac_output_enable(DAC_CHANNEL_1);
+  dac_output_enable(DAC_CHANNEL_2);
   i2s_zero_dma_buffer(I2S_PORT);
   if (!prime_dma_with_silence("пробуждение")) {
     Serial.println(F("[PLAYBACK] ошибка: не удалось подать тишину при выходе из mute"));
@@ -239,7 +247,7 @@ bool apply_sample_rate(uint32_t sampleRate) {
     return true;
   }
 
-  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
   if (rc != ESP_OK) {
     Serial.printf("[PLAYBACK] ошибка установки частоты %u Гц: %d\n", static_cast<unsigned>(sampleRate), rc);
     lock_stats();
@@ -263,7 +271,9 @@ std::vector<uint16_t> convert_to_dac_words(const Frame& frame) {
 
   const uint16_t channels = frame.channels == 0 ? 1 : frame.channels;
   const size_t samplesPerChannel = frame.samples.size() / channels;
-  out.resize(samplesPerChannel);
+  // Работать будем в стереорежиме (L/R), поэтому буфер сразу подготавливаем
+  // под удвоенное количество 16-битных слов.
+  out.resize(samplesPerChannel * 2u);
 
   const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
                                     ? frame.volume
@@ -286,8 +296,14 @@ std::vector<uint16_t> convert_to_dac_words(const Frame& frame) {
     if (biased > 65535) {
       biased = 65535;
     }
-    const uint16_t dacValue = static_cast<uint16_t>((biased >> 8) << 8);
-    out[i] = dacValue;
+    const uint8_t dac8 = static_cast<uint8_t>(biased >> 8); // 0..255 – формат встроенного DAC ESP32.
+    const uint16_t leftWord = static_cast<uint16_t>(dac8) << 8; // Переносим в старший байт для I²S.
+
+    // В стерео-потоке ESP-IDF ожидает чередование L/R.  Правый канал фиксируем
+    // на середине диапазона (0x80 << 8), чтобы исключить паразитные шумы и
+    // сохранить электрический баланс.
+    out[i * 2u] = leftWord;
+    out[i * 2u + 1u] = 0x8000u;
   }
 
   lock_stats();
@@ -369,9 +385,10 @@ void playback_task(void*) {
       gStats.lastSequence = frame.sequence;
       gStats.lastError.clear();
       unlock_stats();
-      Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u)\n",
+      const unsigned playedSamples = static_cast<unsigned>(dacWords.size() / 2u);
+      Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u, формат=L/R)\n",
                     static_cast<unsigned>(frame.sequence),
-                    static_cast<unsigned>(dacWords.size()),
+                    playedSamples,
                     static_cast<unsigned>(sampleRate),
                     static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)));
     }
@@ -482,7 +499,7 @@ bool init(const Config& cfg) {
   i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
   i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 16000 : cfg.defaultSampleRate;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT; // Используем только левый моно-канал DAC1 (GPIO25).
+  i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT; // Аппаратный ЦАП ESP32 требует интерлив L/R.
   i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   i2sConfig.dma_buf_count = 6;
@@ -503,9 +520,11 @@ bool init(const Config& cfg) {
   gDriverInstalled = true; // Запоминаем успешный старт, чтобы грамотно гасить порт в shutdown().
 
   i2s_set_pin(I2S_PORT, nullptr);
-  // Включаем только DAC1 (GPIO25): LM386 работает с моно сигналом, поэтому второй канал не задействуем.
-  i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN);
+  // Активируем оба встроенных ЦАП: левый (DAC1/GPIO25) воспроизводит звук,
+  // правый (DAC2/GPIO26) удерживаем в центре диапазона для снижения шума.
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
   dac_output_enable(DAC_CHANNEL_1);
+  dac_output_enable(DAC_CHANNEL_2);
 
   const esp_err_t startRc = i2s_start(I2S_PORT);
   if (startRc != ESP_OK) {
@@ -531,7 +550,7 @@ bool init(const Config& cfg) {
     return false;
   }
 
-  Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=DAC1\n",
+  Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, режим=L/R\n",
                 static_cast<int>(I2S_PORT),
                 static_cast<unsigned>(i2sConfig.sample_rate),
                 static_cast<unsigned>(cfg.queueCapacity));
