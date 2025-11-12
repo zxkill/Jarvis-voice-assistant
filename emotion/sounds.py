@@ -15,7 +15,7 @@ import inspect
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Any, Callable, Dict, List, Optional
 from threading import Lock
 
 try:  # ``numpy`` может быть недоступен в некоторых средах
@@ -54,6 +54,17 @@ _CURRENT_PALETTE: str = ""
 # Глобальный лимитер частоты воспроизведения любых эффектов.
 _GLOBAL_LIMITER: RateLimiter | None = None
 
+# Флаг, позволяющий глобально отключать локальное воспроизведение через
+# ``sounddevice``.  Когда он сброшен, эффекты отправляются только роботу,
+# чтобы звук шел через его динамик.
+_LOCAL_PLAYBACK_ENABLED: bool = True
+
+# Подписчики, которым необходимо пересылать PCM-данные (например, поток
+# ``RobotAudioStream``).  Держим список и блокировку, чтобы безопасно
+# обновлять его из разных потоков.
+_STREAM_LISTENERS: List[Callable[..., None]] = []
+_STREAM_LOCK: Lock = Lock()
+
 
 # соответствие некоторых эмоций и строковых ключей записи в манифесте
 # Используем тип Any, чтобы словарь мог принимать как элементы Enum,
@@ -81,6 +92,68 @@ _idle_breath_last: float = 0.0
 # Общая блокировка позволяет атомарно проверять и обновлять значение
 # `_idle_breath_last` между потоками.
 _idle_breath_lock = Lock()
+
+
+def set_local_playback_enabled(enabled: bool) -> None:
+    """Включает или отключает вывод эффектов через локальные динамики."""
+
+    global _LOCAL_PLAYBACK_ENABLED
+    _LOCAL_PLAYBACK_ENABLED = bool(enabled)
+    log.info(
+        "Локальное воспроизведение звуковых эффектов %s",
+        "включено" if _LOCAL_PLAYBACK_ENABLED else "отключено",
+    )
+
+
+def register_stream_listener(listener: Callable[..., None]) -> None:
+    """Добавляет подписчика, которому нужно пересылать WAV-эффекты."""
+
+    with _STREAM_LOCK:
+        if listener not in _STREAM_LISTENERS:
+            _STREAM_LISTENERS.append(listener)
+    log.info("Добавлен слушатель потокового вывода эффектов: %s", listener)
+
+
+def unregister_stream_listener(listener: Callable[..., None]) -> None:
+    """Удаляет ранее зарегистрированного подписчика PCM."""
+
+    with _STREAM_LOCK:
+        try:
+            _STREAM_LISTENERS.remove(listener)
+        except ValueError:
+            return
+    log.info("Удалён слушатель потокового вывода эффектов: %s", listener)
+
+
+def _notify_stream_listeners(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    name: str,
+    file: str,
+    repeat_index: int,
+    repeat_total: int,
+    volume: float,
+    channels: int = 1,
+) -> None:
+    """Публикует PCM всем подписчикам, добавляя подробные метаданные."""
+
+    with _STREAM_LOCK:
+        listeners = list(_STREAM_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(
+                pcm,
+                sample_rate,
+                name=name,
+                source_file=file,
+                repeat_index=repeat_index,
+                repeat_total=repeat_total,
+                volume=volume,
+                channels=channels,
+            )
+        except Exception:
+            log.exception("Ошибка уведомления слушателя эффектов %s", listener)
 
 @dataclass
 class _Effect:
@@ -159,6 +232,13 @@ def _read_wav(path: str) -> tuple[np.ndarray, int]:
         return data, wf.getframerate()
 
 
+def _float32_to_pcm16(samples: np.ndarray) -> bytes:
+    """Преобразует нормализованный массив ``float32`` в PCM16."""
+
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767.0).astype("<i2").tobytes()
+
+
 def _caller_name() -> str:
     """Определяет модуль и функцию, инициировавшие запуск звука.
 
@@ -206,9 +286,26 @@ def _resolve_effect(key: str) -> Optional[tuple[str, _Effect]]:
 def play_effect(name: str | Emotion) -> None:
     """Воспроизводит одиночный эффект по ключу из манифеста."""
 
-    if sd is None or is_quiet_now():
-        log.debug("skip effect %s: quiet=%s", name, is_quiet_now())
-        return  # звук недоступен или тихие часы
+    if is_quiet_now():
+        log.debug("skip effect %s: quiet hours", name)
+        return
+
+    with _STREAM_LOCK:
+        has_listeners = bool(_STREAM_LISTENERS)
+
+    local_available = _LOCAL_PLAYBACK_ENABLED and sd is not None
+    if not local_available and not has_listeners:
+        log.debug(
+            "skip effect %s: нет локального вывода и подписчиков",
+            name,
+        )
+        return
+
+    if not local_available:
+        log.debug(
+            "Локальные динамики недоступны, отправляем эффект только удалённо",
+            extra={"attrs": {"effect": str(name)}},
+        )
 
     # Разрешаем использовать псевдонимы; сначала преобразуем имя в верхний
     # регистр, затем пытаемся найти его в словаре ``_ALIASES``.
@@ -251,6 +348,9 @@ def play_effect(name: str | Emotion) -> None:
         try:
             data, rate = _read_wav(file)
             volume = 10 ** (effect.gain / 20)
+            scaled = np.clip(data * volume, -1.0, 1.0)
+            pcm_bytes = _float32_to_pcm16(scaled)
+            duration_sec = len(scaled) / rate if rate else 0.0
             effect.last_played = now
             if base_key == "IDLE_BREATH":
                 _idle_breath_last = now
@@ -258,7 +358,24 @@ def play_effect(name: str | Emotion) -> None:
             # окончания каждого проигрывания, чтобы они не накладывались.
             for i in range(effect.repeat):
                 log.debug("start %s → %s [%d/%d]", eff_key, file, i + 1, effect.repeat)
-                sd.play(data * volume, rate, blocking=effect.repeat > 1)
+                _notify_stream_listeners(
+                    pcm_bytes,
+                    rate,
+                    name=eff_key,
+                    file=file,
+                    repeat_index=i + 1,
+                    repeat_total=effect.repeat,
+                    volume=volume,
+                    channels=1,
+                )
+                need_block = effect.repeat > 1
+                if local_available and sd is not None:
+                    sd.play(scaled, rate, blocking=need_block)
+                elif need_block and duration_sec > 0:
+                    # При отключённом локальном воспроизведении поддерживаем
+                    # исходную длительность повтора, чтобы не нарушать логику
+                    # таймеров, ожидающих завершения предыдущего цикла.
+                    time.sleep(duration_sec)
                 log.debug("end %s [%d/%d]", eff_key, i + 1, effect.repeat)
         except Exception:  # pragma: no cover
             log.exception("sound playback failed")
@@ -347,9 +464,12 @@ class EmotionSoundDriver:
         self._schedule_idle_breath()
 
     def _on_emotion_changed(self, event: core_events.Event) -> None:
-        if sd is None:
-            return  # звук недоступен
-        sd.stop()  # оборвать звук предыдущей эмоции
+        with _STREAM_LOCK:
+            has_listeners = bool(_STREAM_LISTENERS)
+        if sd is None and not has_listeners:
+            return  # нет ни локального вывода, ни подписчиков
+        if sd is not None:
+            sd.stop()  # оборвать звук предыдущей эмоции
         emotion: Emotion = event.attrs["emotion"]
         self._current = emotion
         key = _ALIASES.get(emotion, emotion.name)

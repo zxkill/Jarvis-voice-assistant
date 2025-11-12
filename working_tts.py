@@ -8,7 +8,7 @@ import time
 import wave
 import hashlib
 from pathlib import Path
-from typing import Iterable, List
+from typing import Callable, Iterable, List
 from concurrent.futures import ThreadPoolExecutor
 
 import keyboard  # type: ignore — requires native build on Win
@@ -16,7 +16,7 @@ import numpy as np
 import sounddevice as sd  # type: ignore
 from piper import PiperVoice  # type: ignore — external lib
 from transliterate import translit  # type: ignore
-from threading import Event
+from threading import Event, Lock
 
 from core.nlp import normalize_tts_text
 from core import events as core_events
@@ -26,6 +26,110 @@ from core.logging_json import configure_logging
 
 # Настройка базового логирования для всей работы модуля
 log = configure_logging("tts.piper")
+
+# Флаг, управляющий локальным воспроизведением через колонки ноутбука.
+# По умолчанию включён, но может быть отключён конфигурацией, если звук
+# нужно транслировать исключительно на робота.
+_LOCAL_PLAYBACK_ENABLED: bool = True
+
+# Список слушателей, которым нужно передавать синтезированный PCM для
+# дальнейшей ретрансляции (например, роботу по WebSocket).
+_STREAM_LISTENERS: List[Callable[..., None]] = []
+# Блокировка предотвращает гонки между регистрацией слушателей и отправкой.
+_STREAM_LOCK: Lock = Lock()
+
+
+def set_local_playback_enabled(enabled: bool) -> None:
+    """Включает или отключает локальное воспроизведение через ``sounddevice``."""
+
+    global _LOCAL_PLAYBACK_ENABLED
+    _LOCAL_PLAYBACK_ENABLED = bool(enabled)
+    log.info(
+        "Локальное воспроизведение %s",
+        "включено" if _LOCAL_PLAYBACK_ENABLED else "отключено",
+    )
+
+
+def register_stream_listener(listener: Callable[..., None]) -> None:
+    """Добавляет внешний обработчик для передачи PCM роботам или сервисам."""
+
+    with _STREAM_LOCK:
+        if listener not in _STREAM_LISTENERS:
+            _STREAM_LISTENERS.append(listener)
+    log.info("Добавлен слушатель потоковой озвучки: %s", listener)
+
+
+def unregister_stream_listener(listener: Callable[..., None]) -> None:
+    """Удаляет ранее зарегистрированный обработчик потоковой озвучки."""
+
+    with _STREAM_LOCK:
+        try:
+            _STREAM_LISTENERS.remove(listener)
+        except ValueError:
+            return
+    log.info("Удалён слушатель потоковой озвучки: %s", listener)
+
+
+def _notify_stream_listeners(
+    pcm: bytes,
+    sample_rate: int,
+    *,
+    text: str,
+    preset: str,
+    chunk_index: int,
+    chunks_total: int,
+    volume: float,
+) -> None:
+    """Передаёт синтезированный PCM всем подписчикам с подробными метаданными."""
+
+    with _STREAM_LOCK:
+        listeners = list(_STREAM_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(
+                pcm,
+                sample_rate,
+                text=text,
+                preset=preset,
+                chunk_index=chunk_index,
+                chunks_total=chunks_total,
+                volume=volume,
+            )
+        except Exception:
+            log.exception("Ошибка передачи PCM слушателю %s", listener)
+
+
+def _perform_playback(audio_f32: np.ndarray, playback_rate: int, duration: float) -> None:
+    """Проигрывает или имитирует проигрывание чанка речи."""
+
+    if playback_rate <= 0:
+        log.warning(
+            "Пропускаю локальное воспроизведение: неверная частота",
+            extra={"attrs": {"playback_rate": playback_rate}},
+        )
+        return
+
+    end_time = time.perf_counter() + max(duration, 0.0)
+    if _LOCAL_PLAYBACK_ENABLED:
+        log.debug(
+            "Воспроизводим чанк через локальные динамики",
+            extra={"attrs": {"duration": round(max(duration, 0.0), 3)}},
+        )
+        sd.play(audio_f32, playback_rate, blocking=False)
+        while time.perf_counter() < end_time:
+            if _STOP_EVENT.is_set():
+                break
+            time.sleep(0.05)
+        sd.stop()
+    else:
+        log.debug(
+            "Локальное воспроизведение отключено, ожидаю завершения длительности",
+            extra={"attrs": {"duration": round(max(duration, 0.0), 3)}},
+        )
+        while time.perf_counter() < end_time:
+            if _STOP_EVENT.is_set():
+                break
+            time.sleep(0.05)
 
 # ────────────────────────── 1. CONFIG ─────────────────────────────
 # Идентификатор голоса Piper (файл <VOICE_ID>.onnx должен существовать)
@@ -274,8 +378,10 @@ def working_tts(
     _cleanup_cache(now)
 
     playback_parts: list[np.ndarray] = []
+    chunks = list(_split_by_sentences(norm, max_chars))
+    total_chunks = len(chunks)
 
-    for i, chunk in enumerate(_split_by_sentences(norm, max_chars), 1):
+    for i, chunk in enumerate(chunks, 1):
         if _STOP_EVENT.is_set():
             break
         now = time.time()
@@ -327,19 +433,25 @@ def working_tts(
         if vol != 1.0:
             audio_f32 = np.clip(audio_f32 * vol, -1.0, 1.0)
 
+        playback_rate = max(1, int(SAMPLE_RATE * speed))
+        pcm_bytes = np.clip(audio_f32 * 32767.0, -32768, 32767).astype(np.int16)
+        _notify_stream_listeners(
+            pcm_bytes.tobytes(),
+            playback_rate,
+            text=chunk,
+            preset=emotion or preset,
+            chunk_index=i,
+            chunks_total=total_chunks,
+            volume=vol,
+        )
+
         # Запускаем воспроизведение. ``sd.wait`` занимает GIL,
         # и поэтому не даёт реагировать на слово «стоп».
         # Вместо этого ожидаем завершения в простом цикле с небольшим сном,
         # что даёт возможность другим потокам читать микрофон.
+        duration = audio_f32.size / playback_rate if playback_rate else 0.0
         t1 = time.perf_counter()
-        duration = audio_f32.size / (SAMPLE_RATE * speed)
-        sd.play(audio_f32, int(SAMPLE_RATE * speed), blocking=False)
-        end_time = t1 + duration
-        while time.perf_counter() < end_time:
-            if _STOP_EVENT.is_set():
-                break
-            time.sleep(0.05)
-        sd.stop()
+        _perform_playback(audio_f32, playback_rate, duration)
         t_play = time.perf_counter() - t1
 
         rms = float(np.sqrt(np.mean(audio_f32 ** 2)))
@@ -358,7 +470,8 @@ def working_tts(
     is_playing = False
     core_events.publish(core_events.Event(kind="speech.synthesis_finished"))
     _STOP_EVENT.clear()
-    sd.stop()
+    if _LOCAL_PLAYBACK_ENABLED:
+        sd.stop()
 
 # ────────────────────────── 5. ASYNC WRAPPER ─────────────────────
 
