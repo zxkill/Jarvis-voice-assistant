@@ -117,6 +117,12 @@ inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
                                                       int32_t* outMax = nullptr,
                                                       uint32_t* clipped = nullptr,
                                                       float* appliedVolume = nullptr) {
+  // Реализация копирует проверенный эталон, который разработчик приводил
+  // в виде минимального Arduino-скетча: исходные PCM16 переводятся в
+  // «смещённый» 8-битный диапазон 0..255 простым сдвигом, после чего каждое
+  // значение разворачивается в стереопару. Левый канал (DAC1 = GPIO25)
+  // получает фактический уровень, правый (DAC2 = GPIO26) фиксируется в середине
+  // диапазона, чтобы не возбуждать шум при незадействованном выводе.
   std::vector<uint16_t> out;
   if (frame.samples.empty()) {
     if (outMin) {
@@ -194,8 +200,12 @@ inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
       clippedSamples++;
     }
 
-    const uint16_t dacWord = static_cast<uint16_t>(static_cast<uint32_t>(sample + 32768) & 0xFF00u);
-    out[i * 2u] = dacWord;
+    const int32_t shifted = sample + 32768; // переводим -32768..32767 в 0..65535
+    const uint8_t dacByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
+    const uint16_t dacWord = static_cast<uint16_t>(static_cast<uint16_t>(dacByte) << 8);
+
+    out[i * 2u] = dacWord;       // Левый канал (DAC1) получает фактический сэмпл.
+    out[i * 2u + 1u] = kDacMidWord; // Правый канал (DAC2) удерживаем в середине.
   }
 
   if (outMin) {

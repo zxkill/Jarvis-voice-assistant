@@ -1,5 +1,6 @@
 #include "audio_playback.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -148,8 +149,9 @@ void test_convert_silence_matches_reference() {
   assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
   const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame, cfg.defaultVolume);
   assert(words.size() == pcm.size() * 2u);
-  for (const auto value : words) {
-    assert(value == 0x8000u);
+  for (size_t i = 0; i < words.size(); i += 2) {
+    assert(words[i] == 0x8000u);
+    assert(words[i + 1] == 0x8000u);
   }
 
   AudioPlayback::shutdown();
@@ -169,7 +171,9 @@ void test_convert_extremes_and_volume() {
   auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame, cfg.defaultVolume);
   assert(words.size() == pcmSaturated.size() * 2u);
   assert(words[0] == 0xFF00u);
+  assert(words[1] == 0x8000u);
   assert(words[2] == 0x0000u);
+  assert(words[3] == 0x8000u);
 
   // А теперь проверяем уменьшение амплитуды при громкости 0.5.
   const std::vector<int16_t> pcmHalf = {16384, -16384};
@@ -179,7 +183,9 @@ void test_convert_extremes_and_volume() {
   words = AudioPlayback::detail::convert_pcm_to_dac_words(frameHalf, cfg.defaultVolume);
   assert(words.size() == pcmHalf.size() * 2u);
   assert(words[0] == 0xA000u);
+  assert(words[1] == 0x8000u);
   assert(words[2] == 0x6000u);
+  assert(words[3] == 0x8000u);
 
   AudioPlayback::shutdown();
 }
@@ -203,6 +209,30 @@ void test_convert_stereo_downmix_rounding() {
   AudioPlayback::shutdown();
 }
 
+void test_convert_matches_reference_sketch() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  assert(AudioPlayback::init(cfg));
+
+  const std::vector<int16_t> pcm = {0, 1024, -1024, 8192, -8192};
+  const auto raw = build_playback_frame_with_pcm(21, 0, 16000, 1, pcm.size(), 1.0f, pcm);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+  const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame, cfg.defaultVolume);
+  assert(words.size() == pcm.size() * 2u);
+
+  for (size_t i = 0; i < pcm.size(); ++i) {
+    const int32_t shifted = static_cast<int32_t>(pcm[i]) + 32768;
+    const uint8_t expectedByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
+    const uint16_t expectedWord = static_cast<uint16_t>(static_cast<uint16_t>(expectedByte) << 8);
+    assert(words[i * 2u] == expectedWord);
+    assert(words[i * 2u + 1u] == 0x8000u);
+  }
+
+  AudioPlayback::shutdown();
+}
+
 } // namespace
 
 int main() {
@@ -214,6 +244,7 @@ int main() {
   test_convert_silence_matches_reference();
   test_convert_extremes_and_volume();
   test_convert_stereo_downmix_rounding();
+  test_convert_matches_reference_sketch();
   return 0;
 }
 
