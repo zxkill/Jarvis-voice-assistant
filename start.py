@@ -284,6 +284,9 @@ async def main() -> None:
     working_tts.set_local_playback_enabled(
         cfg.getboolean("ROBOT_AUDIO", "local_playback", fallback=False)
     )
+    sounds.set_local_playback_enabled(
+        cfg.getboolean("ROBOT_AUDIO", "local_playback", fallback=False)
+    )
 
     robot_audio_endpoint = cfg.get("ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/")
     if not robot_audio_endpoint:
@@ -306,6 +309,7 @@ async def main() -> None:
     await audio_stream.start()
     stop_mgr.register(audio_stream.stop)
     working_tts.register_stream_listener(audio_stream.forward_tts_chunk)
+    sounds.register_stream_listener(audio_stream.forward_effect_chunk)
 
     def _detach_tts() -> bool:
         """Отвязывает поток TTS от робота при остановке приложения."""
@@ -314,6 +318,14 @@ async def main() -> None:
         return True
 
     stop_mgr.register(_detach_tts)
+
+    def _detach_effects() -> bool:
+        """Удаляет слушателя фоновых эффектов при остановке."""
+
+        sounds.unregister_stream_listener(audio_stream.forward_effect_chunk)
+        return True
+
+    stop_mgr.register(_detach_effects)
     log.info(
         "WebSocket-приёмник аудио готов",
         extra={"attrs": {"endpoint": robot_audio_endpoint}},

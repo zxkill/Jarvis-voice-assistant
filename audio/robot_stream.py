@@ -92,7 +92,8 @@ class RobotAudioStream:
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
-        self._tts_sequence = 0
+        # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
+        self._playback_sequence = 0
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -278,7 +279,7 @@ class RobotAudioStream:
                     seq = -1
                     pcm_bytes = len(payload)
                 self.log.debug(
-                    "Отправлен TTS-чанк",
+                    "Отправлен аудиокадр роботу",
                     extra={
                         "attrs": {
                             "peer": peer,
@@ -295,57 +296,56 @@ class RobotAudioStream:
                 "Ошибка отправки аудио роботу", extra={"attrs": {"peer": peer}}
             )
 
-    def _next_tts_sequence(self) -> int:
-        """Генерирует последовательный номер TTS-кадра."""
+    def _next_playback_sequence(self) -> int:
+        """Возвращает следующий номер кадра исходящего аудио."""
 
-        self._tts_sequence = (self._tts_sequence + 1) & 0xFFFFFFFF
-        return self._tts_sequence
+        self._playback_sequence = (self._playback_sequence + 1) & 0xFFFFFFFF
+        return self._playback_sequence
 
-    def send_tts(
+    def _prepare_playback_payload(
         self,
         pcm: bytes,
         sample_rate: int,
         *,
-        text: str,
-        preset: str,
-        chunk_index: int,
-        chunks_total: int,
+        channels: int,
         volume: float,
-        channels: int = 1,
-    ) -> None:
-        """Отправляет подготовленный PCM на робота через WebSocket."""
+    ) -> tuple[bytes, dict] | None:
+        """Готовит бинарный пакет ``AP`` и возвращает полезные метрики.
+
+        Возвращаем словарь со статистикой, чтобы логи TTS и фоновых эффектов
+        содержали одинаковые поля: длительность, пики и RMS.  В случае ошибки
+        (например, некорректного числа каналов) метод возвращает ``None`` и
+        соответствующий вызов прерывается.
+        """
 
         if not pcm:
             self.log.warning("Попытка отправить пустой PCM-чанк на робота")
-            return
-        if self._loop is None:
-            self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
-            return
+            return None
 
         if sample_rate <= 0:
             self.log.error(
-                "Некорректная частота дискретизации TTS",
+                "Некорректная частота дискретизации аудио",
                 extra={"attrs": {"sample_rate": sample_rate}},
             )
-            return
+            return None
 
         if channels <= 0:
             self.log.error(
-                "Некорректное число каналов при отправке TTS",
+                "Некорректное число каналов при отправке аудио",
                 extra={"attrs": {"channels": channels}},
             )
-            return
+            return None
 
         if len(pcm) % (2 * channels) != 0:
             self.log.error(
                 "Размер PCM не делится на количество каналов",
                 extra={"attrs": {"pcm_bytes": len(pcm), "channels": channels}},
             )
-            return
+            return None
 
         if channels != 1:
             self.log.debug(
-                "Конвертирую TTS в моно перед отправкой",
+                "Конвертирую аудио в моно перед отправкой",
                 extra={"attrs": {"input_channels": channels}},
             )
             pcm = downmix_to_mono(pcm, channels)
@@ -365,7 +365,7 @@ class RobotAudioStream:
         )
         peak = max((abs(val) for val in samples), default=0) / 32768.0
 
-        sequence = self._next_tts_sequence()
+        sequence = self._next_playback_sequence()
         timestamp_us = int(time.time() * 1_000_000) & 0xFFFFFFFF
 
         header = _PLAYBACK_HEADER_STRUCT.pack(
@@ -382,25 +382,73 @@ class RobotAudioStream:
             float(volume),
             0.0,
         )
-        payload = header + pcm
+
+        return header + pcm, {
+            "sequence": sequence,
+            "duration_ms": round(duration_ms, 2),
+            "peak": round(peak, 3),
+            "rms": round(rms_mono, 3),
+            "pcm_bytes": len(pcm),
+            "sample_rate": sample_rate,
+        }
+
+    def _broadcast_payload(self, payload: bytes, *, purpose: str) -> None:
+        """Отправляет подготовленный пакет во все очереди клиентов."""
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов, %s не отправлен", purpose)
+            return
 
         def _enqueue() -> None:
             if not self._send_queues:
-                self.log.warning("Нет активных подключений робота для отправки TTS")
+                self.log.warning(
+                    "Нет активных подключений робота для отправки %s",
+                    purpose,
+                )
                 return
             for queue in list(self._send_queues):
                 if queue.full():
                     try:
                         dropped = queue.get_nowait()
                         self.log.warning(
-                            "Очередь отправки TTS переполнена, удаляю старый кадр",
-                            extra={"attrs": {"dropped_size": len(dropped)}},
+                            "Очередь отправки переполнена, удаляю старый кадр",
+                            extra={"attrs": {"dropped_size": len(dropped), "purpose": purpose}},
                         )
                     except asyncio.QueueEmpty:
                         pass
                 queue.put_nowait(payload)
 
         self._loop.call_soon_threadsafe(_enqueue)
+
+    def send_tts(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        text: str,
+        preset: str,
+        chunk_index: int,
+        chunks_total: int,
+        volume: float,
+        channels: int = 1,
+    ) -> None:
+        """Отправляет подготовленный PCM на робота через WebSocket."""
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
+            return
+
+        prepared = self._prepare_playback_payload(
+            pcm,
+            sample_rate,
+            channels=channels,
+            volume=volume,
+        )
+        if prepared is None:
+            return
+        payload, stats = prepared
+
+        self._broadcast_payload(payload, purpose="TTS")
 
         self.log.debug(
             "Сформирован TTS-кадр",
@@ -410,11 +458,53 @@ class RobotAudioStream:
                     "preset": preset,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
-                    "pcm_bytes": len(pcm),
-                    "duration_ms": round(duration_ms, 2),
-                    "peak": round(peak, 3),
-                    "rms": round(rms_mono, 3),
-                    "sequence": sequence,
+                    "volume": round(volume, 3),
+                    **stats,
+                }
+            },
+        )
+
+    def send_effect(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        name: str,
+        source_file: str,
+        repeat_index: int,
+        repeat_total: int,
+        volume: float,
+        channels: int = 1,
+    ) -> None:
+        """Отправляет фоновый звуковой эффект на робота."""
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов, эффект не отправлен")
+            return
+
+        prepared = self._prepare_playback_payload(
+            pcm,
+            sample_rate,
+            channels=channels,
+            volume=volume,
+        )
+        if prepared is None:
+            return
+        payload, stats = prepared
+
+        purpose = f"эффекта {name}"
+        self._broadcast_payload(payload, purpose=purpose)
+
+        self.log.debug(
+            "Сформирован аудиокадр фонового эффекта",
+            extra={
+                "attrs": {
+                    "effect": name,
+                    "file": source_file,
+                    "repeat_index": repeat_index,
+                    "repeat_total": repeat_total,
+                    "volume": round(volume, 3),
+                    **stats,
                 }
             },
         )
@@ -445,6 +535,37 @@ class RobotAudioStream:
             )
         except Exception:
             self.log.exception("Не удалось передать чанк TTS роботу")
+
+    def forward_effect_chunk(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        name: str,
+        source_file: str,
+        repeat_index: int,
+        repeat_total: int,
+        volume: float,
+        channels: int = 1,
+    ) -> None:
+        """Проксирует звуковой эффект на робота в формате ``AP``."""
+
+        try:
+            self.send_effect(
+                pcm,
+                sample_rate,
+                name=name,
+                source_file=source_file,
+                repeat_index=repeat_index,
+                repeat_total=repeat_total,
+                volume=volume,
+                channels=channels,
+            )
+        except Exception:
+            self.log.exception(
+                "Не удалось передать звуковой эффект роботу",
+                extra={"attrs": {"effect": name, "file": source_file}},
+            )
 
     def _decode_frame(self, payload: bytes) -> RobotAudioFrame | None:
         """Разбирает бинарный пакет и сводит стерео в моно."""

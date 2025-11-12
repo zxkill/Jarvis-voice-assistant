@@ -142,3 +142,55 @@ def test_websocket_server_sends_tts_to_robot() -> None:
     assert pcm == struct.pack("<hh", 1200, -1200)
     assert volume == pytest.approx(1.0)
     assert reserved == pytest.approx(0.0)
+
+
+def test_websocket_server_sends_effect_to_robot() -> None:
+    """Эффекты эмоций тоже должны доходить до ESP32 через AP-заголовок."""
+
+    async def _runner() -> tuple[bytes, int]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            pcm = struct.pack("<hhhh", 500, -500, 1000, -1000)
+            stream.send_effect(
+                pcm,
+                22_050,
+                name="SIGH",
+                source_file="sigh.wav",
+                repeat_index=1,
+                repeat_total=1,
+                volume=0.75,
+            )
+            payload = await asyncio.wait_for(ws.recv(), timeout=1.0)
+        return payload, len(pcm)
+
+    payload, pcm_len = asyncio.run(_runner())
+
+    header = _PLAYBACK_HEADER.unpack_from(payload)
+    (
+        magic,
+        version,
+        flags,
+        sequence,
+        timestamp_us,
+        sample_rate,
+        channels,
+        sample_bits,
+        frame_samples,
+        pcm_bytes,
+        volume,
+        reserved,
+    ) = header
+    assert magic == b"AP"
+    assert version == 1
+    assert flags == 0
+    assert sample_rate == 22_050
+    assert channels == 1
+    assert sample_bits == 16
+    assert frame_samples == pcm_len // 2
+    assert pcm_bytes == pcm_len
+    assert volume == pytest.approx(0.75)
+    assert reserved == pytest.approx(0.0)
