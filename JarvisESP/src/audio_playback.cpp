@@ -3,18 +3,21 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <new>
+#ifndef ARDUINO
+#include <cstdio>
+#endif
 
 #ifdef ARDUINO
 #include <Arduino.h>
-#include <driver/dac.h>
 #include <driver/i2s.h>
 #else
 #include <mutex>
 #endif
 
 namespace AudioPlayback {
-namespace {
+namespace detail {
 
 constexpr char MAGIC[2] = {'A', 'P'}; ///< Сигнатура воспроизводимого кадра.
 constexpr uint8_t PROTOCOL_VERSION = 1; ///< Поддерживаемая версия протокола.
@@ -160,8 +163,6 @@ bool mute_output(const char* reason, bool countTransition) {
   if (stopRc != ESP_OK) {
     Serial.printf("[PLAYBACK] предупреждение: i2s_stop вернул %d\n", stopRc);
   }
-  dac_output_disable(DAC_CHANNEL_1);
-  dac_output_disable(DAC_CHANNEL_2);
   gActiveSampleRate = 0;
   gOutputMuted = true;
   record_mute_state(true, countTransition);
@@ -185,8 +186,6 @@ bool unmute_output(const char* reason) {
     unlock_stats();
     return false;
   }
-  dac_output_enable(DAC_CHANNEL_1);
-  dac_output_enable(DAC_CHANNEL_2);
   i2s_zero_dma_buffer(I2S_PORT);
   if (!prime_dma_with_silence("пробуждение")) {
     Serial.println(F("[PLAYBACK] ошибка: не удалось подать тишину при выходе из mute"));
@@ -263,51 +262,43 @@ bool apply_sample_rate(uint32_t sampleRate) {
   return true;
 }
 
+#if !defined(ARDUINO) && defined(__GNUC__)
+__attribute__((used))
+#endif
 std::vector<uint16_t> convert_to_dac_words(const Frame& frame) {
-  std::vector<uint16_t> out;
-  if (frame.samples.empty()) {
-    return out;
-  }
-
   const uint16_t channels = frame.channels == 0 ? 1 : frame.channels;
-  const size_t samplesPerChannel = frame.samples.size() / channels;
-  // Работать будем в стереорежиме (L/R), поэтому буфер сразу подготавливаем
-  // под удвоенное количество 16-битных слов.
-  out.resize(samplesPerChannel * 2u);
+  const size_t samplesPerChannel = channels ? frame.samples.size() / channels : 0;
 
-  const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
-                                    ? frame.volume
-                                    : gConfig.defaultVolume;
+  int32_t inputMin = std::numeric_limits<int32_t>::max();
+  int32_t inputMax = std::numeric_limits<int32_t>::min();
+  uint32_t clippedSamples = 0;
+  float appliedVolume = gConfig.defaultVolume;
 
-  for (size_t i = 0; i < samplesPerChannel; ++i) {
-    int32_t mixed = 0;
-    for (uint16_t ch = 0; ch < channels; ++ch) {
-      mixed += static_cast<int32_t>(frame.samples[i * channels + ch]);
-    }
-    mixed /= static_cast<int32_t>(channels);
+  std::vector<uint16_t> out = convert_pcm_to_dac_words(frame,
+                                                       gConfig.defaultVolume,
+                                                       &inputMin,
+                                                       &inputMax,
+                                                       &clippedSamples,
+                                                       &appliedVolume);
 
-    const float scaled = static_cast<float>(mixed) * requestedVolume;
-    int32_t sample = static_cast<int32_t>(std::lround(scaled));
-    sample = std::max(-32768, std::min(32767, sample));
-    int32_t biased = sample + 32768;
-    if (biased < 0) {
-      biased = 0;
-    }
-    if (biased > 65535) {
-      biased = 65535;
-    }
-    const uint8_t dac8 = static_cast<uint8_t>(biased >> 8); // 0..255 – формат встроенного DAC ESP32.
-    const uint16_t leftWord = static_cast<uint16_t>(dac8) << 8; // Переносим в старший байт для I²S.
-
-    // В стерео-потоке ESP-IDF ожидает чередование L/R.  Правый канал фиксируем
-    // на середине диапазона (0x80 << 8), чтобы исключить паразитные шумы и
-    // сохранить электрический баланс.
-    out[i * 2u] = leftWord;
-    out[i * 2u + 1u] = 0x8000u;
-  }
+#ifdef ARDUINO
+  Serial.printf("[PLAYBACK] конвертация PCM: вход=%u, min=%ld, max=%ld, clamp=%u, volume=%.3f\n",
+                static_cast<unsigned>(samplesPerChannel),
+                static_cast<long>(inputMin),
+                static_cast<long>(inputMax),
+                static_cast<unsigned>(clippedSamples),
+                appliedVolume);
+#else
+  std::printf("[PLAYBACK][HOST] конвертация PCM: вход=%u, min=%ld, max=%ld, clamp=%u, volume=%.3f\n",
+              static_cast<unsigned>(samplesPerChannel),
+              static_cast<long>(inputMin),
+              static_cast<long>(inputMax),
+              static_cast<unsigned>(clippedSamples),
+              static_cast<double>(appliedVolume));
+#endif
 
   lock_stats();
-  gStats.lastVolume = requestedVolume;
+  gStats.lastVolume = appliedVolume;
   unlock_stats();
 
   return out;
@@ -433,7 +424,9 @@ bool ensure_queue_created() {
   return true;
 }
 
-} // namespace
+} // namespace detail
+
+using namespace detail;
 
 bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std::string& error) {
   if (!payload || length < HEADER_SIZE) {
@@ -502,8 +495,13 @@ bool init(const Config& cfg) {
   i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT; // Аппаратный ЦАП ESP32 требует интерлив L/R.
   i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  i2sConfig.dma_buf_count = 6;
-  i2sConfig.dma_buf_len = cfg.frameSamplesHint == 0 ? 256 : cfg.frameSamplesHint;
+  // Используем восемь DMA-буферов по 512 сэмплов — это проверенная на железе
+  // конфигурация, которая полностью устраняет голодание ЦАПа. При необходимости
+  // разработчик может указать больший frameSamplesHint, но минимальное значение
+  // не опускаем ниже 256, чтобы не распылять прерываниями.
+  i2sConfig.dma_buf_count = 8;
+  const size_t dmaLenHint = cfg.frameSamplesHint == 0 ? 512 : cfg.frameSamplesHint;
+  i2sConfig.dma_buf_len = static_cast<int>(std::max<size_t>(dmaLenHint, 256));
   i2sConfig.use_apll = false;
   i2sConfig.tx_desc_auto_clear = true;
   i2sConfig.fixed_mclk = 0;
@@ -520,11 +518,23 @@ bool init(const Config& cfg) {
   gDriverInstalled = true; // Запоминаем успешный старт, чтобы грамотно гасить порт в shutdown().
 
   i2s_set_pin(I2S_PORT, nullptr);
-  // Активируем оба встроенных ЦАП: левый (DAC1/GPIO25) воспроизводит звук,
-  // правый (DAC2/GPIO26) удерживаем в центре диапазона для снижения шума.
+  // Встроенный DAC управляется непосредственно I2S-драйвером, поэтому достаточно
+  // активировать оба канала и не трогать dac_output_enable(): лишние ручные
+  // включения порождают фоновые щелчки.
   i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
-  dac_output_enable(DAC_CHANNEL_1);
-  dac_output_enable(DAC_CHANNEL_2);
+
+  // Повторяем последовательность из рабочего эталона: сначала очищаем DMA и
+  // выставляем базовую частоту, чтобы сразу после старта тракт был стабилен.
+  i2s_zero_dma_buffer(I2S_PORT);
+  const esp_err_t clkRc = i2s_set_clk(I2S_PORT,
+                                      i2sConfig.sample_rate,
+                                      I2S_BITS_PER_SAMPLE_16BIT,
+                                      I2S_CHANNEL_STEREO);
+  if (clkRc != ESP_OK) {
+    Serial.printf("[PLAYBACK] предупреждение: не удалось задать стартовую частоту %u Гц (rc=%d)\n",
+                  static_cast<unsigned>(i2sConfig.sample_rate),
+                  clkRc);
+  }
 
   const esp_err_t startRc = i2s_start(I2S_PORT);
   if (startRc != ESP_OK) {
@@ -535,7 +545,6 @@ bool init(const Config& cfg) {
     unlock_stats();
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
-    dac_output_disable(DAC_CHANNEL_1);
     return false;
   }
 
@@ -545,8 +554,6 @@ bool init(const Config& cfg) {
     unlock_stats();
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
-    dac_output_disable(DAC_CHANNEL_1);
-    dac_output_disable(DAC_CHANNEL_2);
     return false;
   }
 
@@ -604,9 +611,6 @@ void shutdown() {
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
   }
-  dac_output_disable(DAC_CHANNEL_1);
-  // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
-  dac_output_disable(DAC_CHANNEL_2);
   gActiveSampleRate = 0;
 #endif
   gOutputMuted = true;

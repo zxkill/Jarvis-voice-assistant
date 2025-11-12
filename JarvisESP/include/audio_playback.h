@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -96,6 +99,119 @@ bool handle_server_frame(const uint8_t* payload, size_t length);
  * \return true, если кадр успешно разобран.
  */
 bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std::string& error);
+
+namespace detail {
+
+/**
+ * \brief Конвертирует интерливированный PCM16 в стереопару DAC-слов ESP32.
+ *
+ * Функция вынесена в заголовок в inline-формате, чтобы модульные тесты на
+ * хосте могли гарантированно использовать ту же математику, что и прошивка.
+ * Возвращает готовый буфер с чередованием L/R (левый канал заполняется
+ * конвертированным значением, правый удерживается в центре диапазона).
+ * Дополнительно при необходимости заполняет диагностические параметры.
+ */
+inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
+                                                      float defaultVolume,
+                                                      int32_t* outMin = nullptr,
+                                                      int32_t* outMax = nullptr,
+                                                      uint32_t* clipped = nullptr,
+                                                      float* appliedVolume = nullptr) {
+  std::vector<uint16_t> out;
+  if (frame.samples.empty()) {
+    if (outMin) {
+      *outMin = std::numeric_limits<int32_t>::max();
+    }
+    if (outMax) {
+      *outMax = std::numeric_limits<int32_t>::min();
+    }
+    if (clipped) {
+      *clipped = 0;
+    }
+    if (appliedVolume) {
+      *appliedVolume = defaultVolume;
+    }
+    return out;
+  }
+
+  const uint16_t channels = frame.channels == 0 ? 1 : frame.channels;
+  const size_t samplesPerChannel = frame.samples.size() / channels;
+  if (samplesPerChannel == 0) {
+    if (outMin) {
+      *outMin = std::numeric_limits<int32_t>::max();
+    }
+    if (outMax) {
+      *outMax = std::numeric_limits<int32_t>::min();
+    }
+    if (clipped) {
+      *clipped = 0;
+    }
+    if (appliedVolume) {
+      *appliedVolume = defaultVolume;
+    }
+    return out;
+  }
+
+  constexpr uint16_t kDacMidWord = 0x8000u;
+  out.assign(samplesPerChannel * 2u, kDacMidWord);
+
+  const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
+                                    ? frame.volume
+                                    : defaultVolume;
+  const float clampedVolume = std::clamp(requestedVolume, 0.0f, 4.0f);
+  if (appliedVolume) {
+    *appliedVolume = clampedVolume;
+  }
+
+  int32_t inputMin = std::numeric_limits<int32_t>::max();
+  int32_t inputMax = std::numeric_limits<int32_t>::min();
+  uint32_t clippedSamples = 0;
+
+  for (size_t i = 0; i < samplesPerChannel; ++i) {
+    int32_t mixed = 0;
+    for (uint16_t ch = 0; ch < channels; ++ch) {
+      const int32_t value = static_cast<int32_t>(frame.samples[i * channels + ch]);
+      inputMin = std::min(inputMin, value);
+      inputMax = std::max(inputMax, value);
+      mixed += value;
+    }
+
+    if (channels > 1) {
+      if (mixed >= 0) {
+        mixed = (mixed + (channels / 2)) / static_cast<int32_t>(channels);
+      } else {
+        mixed = (mixed - (channels / 2)) / static_cast<int32_t>(channels);
+      }
+    }
+
+    const float scaled = static_cast<float>(mixed) * clampedVolume;
+    int32_t sample = static_cast<int32_t>(std::lrintf(scaled));
+    if (sample < -32768) {
+      sample = -32768;
+      clippedSamples++;
+    } else if (sample > 32767) {
+      sample = 32767;
+      clippedSamples++;
+    }
+
+    const uint16_t dacWord = static_cast<uint16_t>(static_cast<uint32_t>(sample + 32768) & 0xFF00u);
+    out[i * 2u] = dacWord;
+  }
+
+  if (outMin) {
+    *outMin = inputMin;
+  }
+  if (outMax) {
+    *outMax = inputMax;
+  }
+  if (clipped) {
+    *clipped = clippedSamples;
+  }
+
+  return out;
+}
+
+} // namespace detail
 
 } // namespace AudioPlayback
 
