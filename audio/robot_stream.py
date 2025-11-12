@@ -20,10 +20,8 @@ from websockets.legacy.server import Serve, WebSocketServerProtocol, serve
 from core.logging_json import configure_logging
 
 _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
-# Флаг, который робот использует для пометки кадра локализации, занят бит 0x01.
-# Мы берём свободный старший бит для служебной информации об исходящем TTS,
-# чтобы формат оставался совместимым с приёмником ESP32.
-_FLAG_TTS_FRAME = 0x80
+# Заголовок исходящих кадров TTS, описанный в прошивке ESP32.
+_PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
 
 
 @dataclasses.dataclass(slots=True)
@@ -54,7 +52,6 @@ class RobotAudioStream:
     """WebSocket-сервер, принимающий аудио от ESP32."""
 
     _SENTINEL = object()
-    _FLAG_FINAL_CHUNK = 0x40
 
     def __init__(
         self,
@@ -262,8 +259,34 @@ class RobotAudioStream:
             while True:
                 payload = await queue.get()
                 await websocket.send(payload)
+                try:
+                    (
+                        _magic,
+                        _ver,
+                        _flags,
+                        seq,
+                        _ts,
+                        _sr,
+                        _ch,
+                        _bits,
+                        _frame_samples,
+                        pcm_bytes,
+                        _volume,
+                        _reserved,
+                    ) = _PLAYBACK_HEADER_STRUCT.unpack_from(payload)
+                except struct.error:
+                    seq = -1
+                    pcm_bytes = len(payload)
                 self.log.debug(
-                    "Отправлен TTS-чанк", extra={"attrs": {"peer": peer, "size": len(payload)}}
+                    "Отправлен TTS-чанк",
+                    extra={
+                        "attrs": {
+                            "peer": peer,
+                            "size": len(payload),
+                            "sequence": seq,
+                            "pcm_bytes": pcm_bytes,
+                        }
+                    },
                 )
         except asyncio.CancelledError:
             self.log.debug("Цикл отправки TTS остановлен", extra={"attrs": {"peer": peer}})
@@ -299,66 +322,64 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
             return
 
-        samples = array("h")
-        samples.frombytes(pcm)
+        if sample_rate <= 0:
+            self.log.error(
+                "Некорректная частота дискретизации TTS",
+                extra={"attrs": {"sample_rate": sample_rate}},
+            )
+            return
 
         if channels <= 0:
             self.log.error(
-                "Некорректное число каналов при отправке TTS", extra={"attrs": {"channels": channels}}
+                "Некорректное число каналов при отправке TTS",
+                extra={"attrs": {"channels": channels}},
             )
             return
 
         if len(pcm) % (2 * channels) != 0:
             self.log.error(
-                "Размер PCM не делится на количество каналов", extra={"attrs": {"pcm_bytes": len(pcm), "channels": channels}}
+                "Размер PCM не делится на количество каналов",
+                extra={"attrs": {"pcm_bytes": len(pcm), "channels": channels}},
             )
             return
 
+        if channels != 1:
+            self.log.debug(
+                "Конвертирую TTS в моно перед отправкой",
+                extra={"attrs": {"input_channels": channels}},
+            )
+            pcm = downmix_to_mono(pcm, channels)
+            channels = 1
+
+        samples = array("h")
+        samples.frombytes(pcm)
         total_samples = len(samples)
-        per_channel = total_samples // channels
+        per_channel = total_samples // channels if channels else 0
         duration_ms = (
             (per_channel / sample_rate) * 1000.0 if sample_rate > 0 and per_channel else 0.0
         )
 
-        def _channel_rms(channel_index: int) -> float:
-            """Возвращает RMS конкретного канала для мониторинга."""
-
-            if per_channel == 0:
-                return 0.0
-            squares = 0
-            for idx in range(channel_index, total_samples, channels):
-                val = samples[idx]
-                squares += val * val
-            rms_val = math.sqrt(squares / per_channel) / 32768.0
-            return rms_val
-
+        squares_sum = sum(val * val for val in samples)
+        rms_mono = (
+            math.sqrt(squares_sum / total_samples) / 32768.0 if total_samples else 0.0
+        )
         peak = max((abs(val) for val in samples), default=0) / 32768.0
 
-        rms_left = _channel_rms(0)
-        rms_right = _channel_rms(1) if channels > 1 else rms_left
+        sequence = self._next_tts_sequence()
+        timestamp_us = int(time.time() * 1_000_000) & 0xFFFFFFFF
 
-        # Флаг 0x80 помечает кадр как TTS, а 0x40 сообщает о завершении фразы —
-        # такой подход не ломает тракт ESP32, который уже умеет работать с
-        # остальными битами локализации.
-        flags = _FLAG_TTS_FRAME
-        if chunks_total and chunk_index >= chunks_total:
-            flags |= self._FLAG_FINAL_CHUNK
-
-        header = _HEADER_STRUCT.pack(
-            b"AF",
+        header = _PLAYBACK_HEADER_STRUCT.pack(
+            b"AP",
             1,
-            flags,
-            self._next_tts_sequence(),
-            time.time_ns() // 1000,
+            0,
+            sequence,
+            timestamp_us,
             sample_rate,
-            per_channel,
             channels,
             16,
+            per_channel,
             len(pcm),
-            rms_left,
-            rms_right,
-            0.0,
-            0.0,
+            float(volume),
             0.0,
         )
         payload = header + pcm
@@ -392,6 +413,8 @@ class RobotAudioStream:
                     "pcm_bytes": len(pcm),
                     "duration_ms": round(duration_ms, 2),
                     "peak": round(peak, 3),
+                    "rms": round(rms_mono, 3),
+                    "sequence": sequence,
                 }
             },
         )

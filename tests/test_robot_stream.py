@@ -9,14 +9,10 @@ import struct
 import pytest
 import websockets
 
-from audio.robot_stream import (
-    RobotAudioStream,
-    RobotStreamClosed,
-    downmix_to_mono,
-    _FLAG_TTS_FRAME,
-)
+from audio.robot_stream import RobotAudioStream, RobotStreamClosed, downmix_to_mono
 
 _HEADER = struct.Struct("<2sBBIQIIHHIfffff")
+_PLAYBACK_HEADER = struct.Struct("<2sBBIIIHHIIff")
 
 
 def _build_payload(sequence: int = 1, frame_samples: int = 4) -> bytes:
@@ -119,7 +115,7 @@ def test_websocket_server_sends_tts_to_robot() -> None:
     payload, pcm_len = asyncio.run(_runner())
 
     assert isinstance(payload, (bytes, bytearray))
-    header = _HEADER.unpack_from(payload)
+    header = _PLAYBACK_HEADER.unpack_from(payload)
     (
         magic,
         version,
@@ -127,28 +123,22 @@ def test_websocket_server_sends_tts_to_robot() -> None:
         sequence,
         timestamp_us,
         sample_rate,
-        frame_samples,
         channels,
         sample_bits,
+        frame_samples,
         pcm_bytes,
-        rms_left,
-        rms_right,
-        spacing,
-        direction,
-        confidence,
+        volume,
+        reserved,
     ) = header
-    assert magic == b"AF"
+    assert magic == b"AP"
     assert version == 1
-    assert flags & _FLAG_TTS_FRAME
-    assert flags & RobotAudioStream._FLAG_FINAL_CHUNK
+    assert flags == 0
     assert sample_rate == 16_000
     assert frame_samples == pcm_len // 2
     assert channels == 1
     assert sample_bits == 16
     assert pcm_bytes == pcm_len
-    pcm = payload[_HEADER.size : _HEADER.size + pcm_bytes]
+    pcm = payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + pcm_bytes]
     assert pcm == struct.pack("<hh", 1200, -1200)
-    assert abs(rms_left - rms_right) < 1e-6
-    assert spacing == 0.0
-    assert direction == 0.0
-    assert confidence == 0.0
+    assert volume == pytest.approx(1.0)
+    assert reserved == pytest.approx(0.0)
