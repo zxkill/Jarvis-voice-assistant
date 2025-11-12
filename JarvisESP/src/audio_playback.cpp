@@ -119,13 +119,10 @@ void configure_idle_timing_from_config() {
 bool prime_dma_with_silence(const char* context) {
   size_t samples = gConfig.frameSamplesHint == 0 ? 512 : gConfig.frameSamplesHint;
   samples = std::max<size_t>(samples, 256);
-  const bool mirror = gConfig.dacOutput == DacOutput::MirrorBoth;
-  const size_t wordsPerSample = mirror ? 2u : 1u;
 
-  std::vector<uint16_t> silence(samples * wordsPerSample);
-  for (size_t i = 0; i < silence.size(); ++i) {
-    silence[i] = 0x8000u;
-  }
+  // Тракт всегда работает в стереорежиме RIGHT_LEFT, поэтому даже "тишину"
+  // отправляем как полноценную пару L/R со значением 0x8000 (центр диапазона).
+  std::vector<uint16_t> silence(samples * 2u, 0x8000u);
   size_t bytesWritten = 0;
   const size_t bytesToWrite = silence.size() * sizeof(uint16_t);
   const esp_err_t primeRc =
@@ -245,9 +242,10 @@ bool apply_sample_rate(uint32_t sampleRate) {
     return true;
   }
 
-  const i2s_channel_t mode = (gConfig.dacOutput == DacOutput::MirrorBoth) ? I2S_CHANNEL_STEREO
-                                                                          : I2S_CHANNEL_MONO;
-  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, mode);
+  // Независимо от конфигурации DAC удерживаем шину в стереорежиме — это повторяет
+  // рабочий эталон, где кадры передаются чередованием L/R.
+  const esp_err_t rc =
+      i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_STEREO);
   if (rc != ESP_OK) {
     Serial.printf("[PLAYBACK] ошибка установки частоты %u Гц: %d\n", static_cast<unsigned>(sampleRate), rc);
     lock_stats();
@@ -378,8 +376,7 @@ void playback_task(void*) {
       gStats.lastSequence = frame.sequence;
       gStats.lastError.clear();
       unlock_stats();
-      const size_t wordsPerSample = (gConfig.dacOutput == DacOutput::MirrorBoth) ? 2u : 1u;
-      const unsigned playedSamples = static_cast<unsigned>(dacWords.size() / wordsPerSample);
+        const unsigned playedSamples = static_cast<unsigned>(dacWords.size() / 2u);
       Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u, раскладка=%u)\n",
                     static_cast<unsigned>(frame.sequence),
                     playedSamples,
@@ -496,17 +493,10 @@ bool init(const Config& cfg) {
   i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
   i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 16000 : cfg.defaultSampleRate;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  switch (cfg.dacOutput) {
-    case DacOutput::LeftOnly:
-      i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-      break;
-    case DacOutput::RightOnly:
-      i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
-      break;
-    case DacOutput::MirrorBoth:
-      i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-      break;
-  }
+  // Независимо от активного канала выставляем формат RIGHT_LEFT, чтобы кадровая
+  // структура полностью совпадала с проверенным эталоном (левый семпл, затем
+  // правый). Нужный выход выбирается логикой convert_pcm_to_dac_words().
+  i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   // Используем восемь DMA-буферов по 512 сэмплов — это проверенная на железе
@@ -553,8 +543,7 @@ bool init(const Config& cfg) {
   // Повторяем последовательность из рабочего эталона: сначала очищаем DMA и
   // выставляем базовую частоту, чтобы сразу после старта тракт был стабилен.
   i2s_zero_dma_buffer(I2S_PORT);
-  const i2s_channel_t initChannel = (cfg.dacOutput == DacOutput::MirrorBoth) ? I2S_CHANNEL_STEREO
-                                                                             : I2S_CHANNEL_MONO;
+  const i2s_channel_t initChannel = I2S_CHANNEL_STEREO;
   const esp_err_t clkRc = i2s_set_clk(I2S_PORT,
                                       i2sConfig.sample_rate,
                                       I2S_BITS_PER_SAMPLE_16BIT,

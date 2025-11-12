@@ -26,9 +26,9 @@ enum class OutputMode : uint8_t {
  * возможность выбрать явный канал либо задублировать сигнал на оба выхода.
  */
 enum class DacOutput : uint8_t {
-  LeftOnly = 0,   ///< Выводим звук только на DAC1 (GPIO25) — штатная разводка робота.
-  RightOnly = 1,  ///< Выводим звук только на DAC2 (GPIO26) — полезно для лабораторных тестов.
-  MirrorBoth = 2, ///< Дублируем сигнал на оба выхода, чтобы прозвучал любой подключённый канал.
+  LeftOnly = 0,   ///< Выводим звук только на DAC1 (GPIO25), правый канал держим в точке 0x8000.
+  RightOnly = 1,  ///< Выводим звук только на DAC2 (GPIO26), левый остаётся тишиной.
+  MirrorBoth = 2, ///< Дублируем сигнал на оба выхода (левый и правый получают одинаковые значения).
 };
 
 /**
@@ -174,7 +174,11 @@ inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
   }
 
   constexpr uint16_t kDacMidWord = 0x8000u;
-  const size_t wordsPerSample = layout == DacOutput::MirrorBoth ? 2u : 1u;
+  // Независимо от выбранной раскладки всегда формируем стереопару L/R, как в
+  // проверенном пользователем эталонном скетче. Это гарантирует, что I2S,
+  // работающий в формате RIGHT_LEFT, получает полный набор слов и не "теряет"
+  // данные на стыке кадров.
+  constexpr size_t wordsPerSample = 2u;
   out.assign(samplesPerChannel * wordsPerSample, kDacMidWord);
 
   const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
@@ -220,17 +224,26 @@ inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
     const uint8_t dacByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
     const uint16_t dacWord = static_cast<uint16_t>(static_cast<uint16_t>(dacByte) << 8);
 
+    const size_t leftIndex = i * wordsPerSample;
+    const size_t rightIndex = leftIndex + 1u;
+
     switch (layout) {
       case DacOutput::LeftOnly:
+        // Стандартная разводка робота: подаём звук только на DAC1 (GPIO25),
+        // второй канал принудительно держим в центре диапазона (тишина).
+        out[leftIndex] = dacWord;
+        // правый канал уже заполнен значением kDacMidWord
+        break;
       case DacOutput::RightOnly:
-        // Моно-раскладка: один 16-битный элемент на каждый исходный сэмпл.
-        out[i] = dacWord;
+        // Лабораторный режим: звук отправляется на DAC2 (GPIO26), а левый канал
+        // затираем тишиной, чтобы в основной колонке не появлялся шум.
+        out[rightIndex] = dacWord;
         break;
       case DacOutput::MirrorBoth:
-        // Дублируем значение в оба канала, чтобы звук прозвучал независимо от того,
-        // к какому выводу подключён усилитель.
-        out[i * 2u] = dacWord;
-        out[i * 2u + 1u] = dacWord;
+        // Диагностический режим: дублируем сигнал на оба выхода, чтобы услышать
+        // звук независимо от подключённого канала.
+        out[leftIndex] = dacWord;
+        out[rightIndex] = dacWord;
         break;
     }
   }
