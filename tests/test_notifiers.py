@@ -31,7 +31,7 @@ def _load_telegram(monkeypatch):
 
 
 def _load_voice(monkeypatch):
-    async def dummy_speak_async(text: str, *, pitch=None, speed=None, emotion=None, loop=None):
+    async def dummy_speak_async(text: str, *, loop=None):
         pass
 
     dummy_module = SimpleNamespace(speak_async=dummy_speak_async)
@@ -136,7 +136,7 @@ def test_voice_send_processes_queue(monkeypatch):
     voice = _load_voice(monkeypatch)
     spoken = []
 
-    async def fake_speak_async(text, **kwargs):
+    async def fake_speak_async(text: str, *, loop=None):
         spoken.append(text)
 
     async def run_test():
@@ -173,7 +173,7 @@ def test_voice_no_telegram_when_listener_active(monkeypatch):
     sent = []
     metrics = []
 
-    async def fake_speak_async(text, **kwargs):
+    async def fake_speak_async(text: str, *, loop=None):
         pass
 
     async def run_test():
@@ -220,7 +220,7 @@ def test_voice_not_send_when_listener_inactive(monkeypatch):
     sent = []
     metrics = []
 
-    async def fake_speak_async(text, **kwargs):
+    async def fake_speak_async(text: str, *, loop=None):
         pass
 
     async def run_test():
@@ -267,7 +267,7 @@ def test_voice_logs_warning_on_telegram_error(monkeypatch):
     metrics = []
     warnings = []
 
-    async def fake_speak_async(text, **kwargs):
+    async def fake_speak_async(text: str, *, loop=None):
         pass
 
     async def run_test():
@@ -324,7 +324,7 @@ def test_voice_skips_tts_for_telegram_source(monkeypatch):
     sent = []
     spoken = []
 
-    async def fake_speak_async(text, **kwargs):
+    async def fake_speak_async(text: str, *, loop=None):
         spoken.append(text)
 
     async def run_test():
@@ -372,7 +372,7 @@ def test_voice_forwards_reply_json_to_telegram(monkeypatch):
     voice = _load_voice(monkeypatch)
     sent = []
 
-    async def fake_speak_async(text, **kwargs):
+    async def fake_speak_async(text: str, *, loop=None):
         raise AssertionError("TTS не должен вызываться")
 
     async def run_test():

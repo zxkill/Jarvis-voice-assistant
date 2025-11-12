@@ -426,7 +426,6 @@ class RobotAudioStream:
         sample_rate: int,
         *,
         text: str,
-        preset: str,
         chunk_index: int,
         chunks_total: int,
         volume: float,
@@ -455,7 +454,6 @@ class RobotAudioStream:
             extra={
                 "attrs": {
                     "text": text,
-                    "preset": preset,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
                     "volume": round(volume, 3),
@@ -515,7 +513,6 @@ class RobotAudioStream:
         sample_rate: int,
         *,
         text: str,
-        preset: str,
         chunk_index: int,
         chunks_total: int,
         volume: float,
@@ -527,7 +524,6 @@ class RobotAudioStream:
                 pcm,
                 sample_rate,
                 text=text,
-                preset=preset,
                 chunk_index=chunk_index,
                 chunks_total=chunks_total,
                 volume=volume,

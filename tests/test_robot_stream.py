@@ -104,7 +104,6 @@ def test_websocket_server_sends_tts_to_robot() -> None:
                 pcm,
                 16_000,
                 text="привет",
-                preset="neutral",
                 chunk_index=1,
                 chunks_total=1,
                 volume=1.0,

@@ -286,35 +286,35 @@ async def execute_cmd(cmd: str, voice: str) -> bool:
     if cmd == "thanks":
         # Вежливый ответ на благодарность
         reply_text = "Пожалуйста"
-        await speak_async(reply_text, preset="happy")
+        await speak_async(reply_text)
         _log_dialog(
             "outgoing",
             reply_text,
             get_request_source(),
             TRACE_ID.get() or new_trace_id(),
-            {"preset": "happy", "cmd": cmd},
+            {"intended_emotion": "happy", "cmd": cmd},
         )
     elif cmd == "stupid":
         # Эмоциональная реакция на оскорбление
         reply_text = "Мне неприятно это слышать"
-        await speak_async(reply_text, preset="sad")
+        await speak_async(reply_text)
         _log_dialog(
             "outgoing",
             reply_text,
             get_request_source(),
             TRACE_ID.get() or new_trace_id(),
-            {"preset": "sad", "cmd": cmd},
+            {"intended_emotion": "sad", "cmd": cmd},
         )
     elif cmd == "offf":
         # Перевод ассистента в режим ожидания
         reply_text = "Переходим в спящий режим"
-        await speak_async(reply_text, preset="neutral")
+        await speak_async(reply_text)
         _log_dialog(
             "outgoing",
             reply_text,
             get_request_source(),
             TRACE_ID.get() or new_trace_id(),
-            {"preset": "neutral", "cmd": cmd},
+            {"intended_emotion": "neutral", "cmd": cmd},
         )
     else:
         return False
@@ -416,7 +416,7 @@ async def va_respond(voice: str) -> bool:
         if is_awaiting_response():
             if is_exit_phrase(text):
                 pop_awaiting()
-                await speak_async("Режим общения завершён", preset="neutral")
+                await speak_async("Режим общения завершён")
                 _log_dialog(
                     "outgoing",
                     "Режим общения завершён",

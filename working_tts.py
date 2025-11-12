@@ -76,12 +76,17 @@ def _notify_stream_listeners(
     sample_rate: int,
     *,
     text: str,
-    preset: str,
     chunk_index: int,
     chunks_total: int,
     volume: float,
 ) -> None:
-    """Передаёт синтезированный PCM всем подписчикам с подробными метаданными."""
+    """Передаёт синтезированный PCM всем подписчикам с подробными метаданными.
+
+    Передаваемый набор метаданных минимален: текст чанка, порядковый номер,
+    общее количество частей и текущая громкость. Информация о пресете
+    намеренно исключена, потому что весь аудиопоток теперь воспроизводится
+    в нейтральном режиме с фиксированной частотой дискретизации.
+    """
 
     with _STREAM_LOCK:
         listeners = list(_STREAM_LISTENERS)
@@ -91,7 +96,6 @@ def _notify_stream_listeners(
                 pcm,
                 sample_rate,
                 text=text,
-                preset=preset,
                 chunk_index=chunk_index,
                 chunks_total=chunks_total,
                 volume=volume,
@@ -339,20 +343,13 @@ def working_tts(
     text: str,
     *,
     max_chars: int = MAX_CHARS,
-    save_wav: str | None = None,        # ← новый арг.
-    preset: str = "neutral",
-    pitch: float | None = None,
-    speed: float | None = None,
-    emotion: str | None = None,
+    save_wav: str | None = None,        # путь для отладочной записи результата
 ) -> None:
     """Озвучивает *text*; при *save_wav* пишет итоговый WAV-файл.
 
-    Дополнительные параметры позволяют управлять эмоциональной окраской
-    речи:
-
-    * ``pitch``  — коэффициент изменения высоты голоса (1.0 по умолчанию);
-    * ``speed``  — множитель скорости воспроизведения;
-    * ``emotion`` — название пресета из :data:`TTS_PRESETS`.
+    Управление эмоциями, тоном и скоростью речи временно отключено, чтобы
+    исключить любые скачки частоты дискретизации.  Сервер гарантированно
+    выдаёт строго 16 кГц моно-сигнал независимо от внешних настроек.
     """
     global is_playing
     is_playing = True
@@ -375,22 +372,6 @@ def working_tts(
         len(norm),
         TARGET_SAMPLE_RATE,
     )
-    if emotion or preset != "neutral":
-        log.warning(
-            "Предустановленные эмоции временно отключены; используется базовый пресет",
-            extra={"attrs": {"preset": preset, "emotion": emotion}},
-        )
-    if pitch not in (None, 1.0):
-        log.warning(
-            "Изменение высоты голоса отключено для соблюдения целевой частоты",
-            extra={"attrs": {"pitch": pitch}},
-        )
-    if speed not in (None, 1.0):
-        log.warning(
-            "Изменение скорости речи отключено для стабилизации аудиотракта",
-            extra={"attrs": {"speed": speed}},
-        )
-
     pause = TAIL_PAD_SEC
     vol = DEFAULT_VOLUME
 
@@ -447,7 +428,9 @@ def working_tts(
             pcm_i16_pad = np.concatenate([pcm_i16, tail])
             chunk_source_rate = VOICE_SAMPLE_RATE
 
-        # Применяем изменение высоты голоса согласно коэффициенту ``pitch``
+        # Применяем изменение высоты голоса согласно коэффициенту ``pitch``.
+        # Сейчас коэффициент жёстко равен 1.0, так как пресеты отключены;
+        # вызов оставлен для будущей обратной совместимости.
         pcm_i16_pad = _apply_pitch(pcm_i16_pad, 1.0)
 
         # Приводим аудиоданные к целевой частоте 16 кГц.  Эта операция
@@ -480,7 +463,6 @@ def working_tts(
             pcm_bytes.tobytes(),
             playback_rate,
             text=chunk,
-            preset="neutral",
             chunk_index=i,
             chunks_total=total_chunks,
             volume=vol,
@@ -519,10 +501,6 @@ def working_tts(
 async def speak_async(
     text: str,
     *,
-    preset: str = "neutral",
-    pitch: float | None = None,
-    speed: float | None = None,
-    emotion: str | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """Неблокирующая озвучка: `working_tts` выполняется в пуле потоков."""
@@ -551,7 +529,7 @@ async def speak_async(
     from functools import partial
 
     loop = loop or asyncio.get_running_loop()
-    func = partial(working_tts, clean, preset=preset, pitch=pitch, speed=speed, emotion=emotion)
+    func = partial(working_tts, clean)
     # Используем отдельный executor, чтобы не блокировать поток
     # чтения с микрофона, работающий через asyncio.to_thread
     await loop.run_in_executor(_EXECUTOR, func)

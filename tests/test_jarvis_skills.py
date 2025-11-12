@@ -21,7 +21,7 @@ def test_handle_utterance_uses_voice_notifier_for_telegram(monkeypatch):
     # зависимости TTS.  Функция send сохраняет текст и источник запроса.
     sent: list[tuple[str, str]] = []
 
-    def fake_send(text: str, *, pitch=None, speed=None, emotion=None):
+    def fake_send(text: str) -> None:
         sent.append((text, get_request_source()))
 
     fake_voice = types.SimpleNamespace(send=fake_send)
@@ -54,7 +54,7 @@ def test_handle_utterance_from_thread(monkeypatch):
 
     sent: list[str] = []
 
-    def fake_send(text: str, *, pitch=None, speed=None, emotion=None):
+    def fake_send(text: str) -> None:
         sent.append(text)
 
     fake_voice = types.SimpleNamespace(send=fake_send)

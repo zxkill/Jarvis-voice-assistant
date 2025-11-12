@@ -375,7 +375,7 @@ class EmotionManager:
 
         # Отправляем сообщение в TTS с учётом текущего пресета
         try:
-            voice.send(profile, emotion=self._tts_preset)
+            voice.send(profile)
         except Exception:
             log.exception("voice.send failed", extra={"ctx": {"text": profile}})
 
