@@ -139,6 +139,59 @@ def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
     log.info("Поведенческое дерево запущено")
     return tree
 
+
+async def start_robot_audio_stream(
+    cfg: configparser.ConfigParser,
+) -> RobotAudioStream | None:
+    """Запустить WebSocket‑поток аудио робота с отказоустойчивостью.
+
+    Возвращает экземпляр ``RobotAudioStream`` при успешном старте или ``None``
+    при сетевой ошибке (например, если интерфейс недоступен или порт занят).
+    Такой режим нужен, когда ассистент используется только через Telegram и
+    воспроизводить звук некуда: падающий сервер не должен обрывать обработку
+    сообщений.
+    """
+
+    robot_audio_endpoint = cfg.get(
+        "ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/"
+    )
+    robot_subprotocol = cfg.get("ROBOT_AUDIO", "subprotocol", fallback="").strip() or None
+    robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
+    ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
+    ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
+
+    audio_stream = RobotAudioStream(
+        endpoint=robot_audio_endpoint,
+        queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
+        expected_sample_rate=cfg.getint("AUDIO", "sample_rate", fallback=16000),
+        expected_channels=2,
+        subprotocol=robot_subprotocol,
+        authorization=robot_auth,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+    )
+
+    try:
+        await audio_stream.start()
+    except OSError as exc:
+        log.error(
+            "Не удалось запустить WebSocket-сервер аудио робота",
+            exc_info=exc,
+            extra={
+                "attrs": {
+                    "endpoint": robot_audio_endpoint,
+                    "hint": "проверьте доступность интерфейса или смените endpoint на 0.0.0.0/127.0.0.1",
+                }
+            },
+        )
+        log.info(
+            "Перехожу в режим без робота: отвечаю в Telegram/текстом без WebSocket-потока",
+            extra={"attrs": {"endpoint": robot_audio_endpoint}},
+        )
+        return None
+
+    return audio_stream
+
 async def main() -> None:
     """Инициализация и основной цикл ассистента."""
 
@@ -304,48 +357,33 @@ async def main() -> None:
         cfg.getboolean("ROBOT_AUDIO", "local_playback", fallback=False)
     )
 
-    robot_audio_endpoint = cfg.get("ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/")
-    if not robot_audio_endpoint:
-        raise RuntimeError("Не задан endpoint WebSocket для аудиопотока робота")
-    robot_subprotocol = cfg.get("ROBOT_AUDIO", "subprotocol", fallback="").strip() or None
-    robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
-    ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
-    ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
+    audio_stream = await start_robot_audio_stream(cfg)
+    if audio_stream is not None:
+        stop_mgr.register(audio_stream.stop)
+        working_tts.register_stream_listener(audio_stream.forward_tts_chunk)
+        sounds.register_stream_listener(audio_stream.forward_effect_chunk)
 
-    audio_stream = RobotAudioStream(
-        endpoint=robot_audio_endpoint,
-        queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
-        expected_sample_rate=expected_sample_rate,
-        expected_channels=2,
-        subprotocol=robot_subprotocol,
-        authorization=robot_auth,
-        ping_interval=ping_interval,
-        ping_timeout=ping_timeout,
-    )
-    await audio_stream.start()
-    stop_mgr.register(audio_stream.stop)
-    working_tts.register_stream_listener(audio_stream.forward_tts_chunk)
-    sounds.register_stream_listener(audio_stream.forward_effect_chunk)
+    if audio_stream is not None:
+        def _detach_tts() -> bool:
+            """Отвязывает поток TTS от робота при остановке приложения."""
 
-    def _detach_tts() -> bool:
-        """Отвязывает поток TTS от робота при остановке приложения."""
+            working_tts.unregister_stream_listener(audio_stream.forward_tts_chunk)
+            return True
 
-        working_tts.unregister_stream_listener(audio_stream.forward_tts_chunk)
-        return True
+        stop_mgr.register(_detach_tts)
 
-    stop_mgr.register(_detach_tts)
+        def _detach_effects() -> bool:
+            """Удаляет слушателя фоновых эффектов при остановке."""
 
-    def _detach_effects() -> bool:
-        """Удаляет слушателя фоновых эффектов при остановке."""
+            sounds.unregister_stream_listener(audio_stream.forward_effect_chunk)
+            return True
 
-        sounds.unregister_stream_listener(audio_stream.forward_effect_chunk)
-        return True
-
-    stop_mgr.register(_detach_effects)
-    log.info(
-        "WebSocket-приёмник аудио готов",
-        extra={"attrs": {"endpoint": robot_audio_endpoint}},
-    )
+        stop_mgr.register(_detach_effects)
+    if audio_stream is not None:
+        log.info(
+            "WebSocket-приёмник аудио готов",
+            extra={"attrs": {"endpoint": audio_stream._parsed.geturl()}},
+        )
 
     # Кольцевой буфер на ~1.5 секунды аудио.
     # Размер maxlen вычисляется после получения первого кадра, потому что
@@ -387,6 +425,17 @@ async def main() -> None:
             publish(Event(kind=kind, attrs={"text": text, "trace_id": trace_id}))
         finally:
             publish(Event(kind="user_query_ended", attrs={"text": text, "trace_id": trace_id}))
+
+    if audio_stream is None:
+        log.warning(
+            "Аудиопоток робота недоступен: остаёмся в режиме Telegram/текста",
+            extra={"attrs": {"telegram_active": app_cfg.telegram.token != ""}},
+        )
+        # Ждём сигнала остановки или отмены тасков, сохраняя активным Telegram.
+        while not tg_stop_event.is_set() and not _shutdown_flag.is_set():
+            await asyncio.sleep(0.5)
+        log.info("Остановлен режим без аудиопотока по запросу пользователя")
+        return
 
     while True:
         try:
