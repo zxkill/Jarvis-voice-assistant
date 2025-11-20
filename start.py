@@ -32,8 +32,35 @@ tg_stop_event = threading.Event()
 tg_task: asyncio.Task | None = None
 # Флаг, предотвращающий повторную обработку сигнала завершения.
 _shutdown_flag = threading.Event()
+# Текущий event loop основного приложения. Используется, чтобы корректно
+# останавливать цикл из обработчика сигналов, не полагаясь на исключения.
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 # ────────────────────────── SIGNALS ──────────────────────────────
+
+def _request_loop_stop() -> None:
+    """Аккуратно останавливает основной event loop.
+
+    Функция отделена для удобства тестирования и переиспользования: она
+    вызывается из обработчика сигналов и может быть применена из других
+    мест, если потребуется.
+    """
+
+    global _main_loop
+
+    if _main_loop is None:
+        # Если цикл ещё не успел стартовать, завершаем процесс жёстко, иначе
+        # приложение может зависнуть в неопределённом состоянии.
+        log.warning(
+            "Основной event loop не инициализирован, завершаю процесс через sys.exit"
+        )
+        sys.exit(0)
+
+    # Планируем остановку loop в потоко-безопасном режиме, чтобы не ловить
+    # ``RuntimeError: Event loop stopped before Future completed``.
+    log.debug("Передаю команду остановки в event loop")
+    _main_loop.call_soon_threadsafe(_main_loop.stop)
+
 
 def _shutdown(signum: int, frame: Any):
     """Корректное завершение по Ctrl‑C/SIGTERM."""
@@ -55,12 +82,9 @@ def _shutdown(signum: int, frame: Any):
     # и другие обработчики), чтобы выход был максимально быстрым.
     log.info("Останавливаю фоновые подсистемы")
     stop_mgr.trigger()
-    # Сообщаем в лог о завершении и немедленно выходим через ``SystemExit``.
-    # Такой подход не вмешивается в текущий ``event loop`` и исключает
-    # ошибку ``RuntimeError: Event loop stopped before Future completed``.
+    # Сообщаем в лог о завершении и просим event loop корректно завершиться.
     log.info("Ассистент завершил работу по запросу пользователя")
-    log.debug("Завершение приложения через SystemExit")
-    raise SystemExit(0)
+    _request_loop_stop()
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
@@ -194,6 +218,13 @@ async def start_robot_audio_stream(
 
 async def main() -> None:
     """Инициализация и основной цикл ассистента."""
+
+    # Сохраняем ссылку на текущий event loop, чтобы обработчик сигналов мог
+    # корректно его остановить. Такой подход устраняет зависания при Ctrl+C,
+    # когда исключение в сигнале может быть проглочено.
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+    log.debug("Основной event loop сохранён для управляемого завершения")
 
     # 0. Загружаем конфиг и инициализируем дисплей как можно раньше,
     # чтобы возможные ошибки были показаны до старта тяжёлых подсистем.
