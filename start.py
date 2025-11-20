@@ -244,7 +244,6 @@ async def main() -> None:
         await asyncio.to_thread(
             working_tts,
             "Дисплей не подключен",
-            preset="neutral",
         )
         return
 
@@ -315,7 +314,6 @@ async def main() -> None:
                 await asyncio.to_thread(
                     working_tts.working_tts,
                     "Дисплей был отключен, завершаю работу",
-                    preset="neutral",
                 )
                 sys.exit(0)
 

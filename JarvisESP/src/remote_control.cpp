@@ -1672,9 +1672,24 @@ loadParams();
       }
       case WStype_TEXT:
         if (payload && length > 0) {
-          Serial.printf("[AUDIO] текстовое сообщение от сервера: %.*s\n",
-                        static_cast<int>(length),
-                        reinterpret_cast<const char*>(payload));
+          std::string text(reinterpret_cast<const char*>(payload), length);
+          Serial.printf("[AUDIO] текстовое сообщение от сервера: %s\n", text.c_str());
+          if (text.rfind("capture:", 0) == 0) {
+            const size_t firstSep = text.find(':', 8);
+            std::string action;
+            std::string reason;
+            if (firstSep == std::string::npos) {
+              action = text.substr(8);
+            } else {
+              action = text.substr(8, firstSep - 8);
+              reason = text.substr(firstSep + 1);
+            }
+            if (action == "pause") {
+              Audio::set_paused(true, reason.c_str());
+            } else if (action == "resume") {
+              Audio::set_paused(false, reason.c_str());
+            }
+          }
         }
         break;
       case WStype_PONG:

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -17,6 +18,8 @@ Diagnostics gDiagnostics{};
 PcmChunk gPendingChunk{};
 bool gChunkReady = false;
 bool gInitialized = false;
+bool gCapturePaused = false;        ///< Признак, что поток временно приостановлен по команде сервера.
+std::string gPauseReason;           ///< Последняя текстовая причина паузы (для логов).
 
 std::vector<int32_t> gRawBuffer;   ///< Буфер для чтения 32-битных сэмплов I2S.
 std::vector<int16_t> gWorkBuffer;  ///< Рабочий буфер с приведёнными значениями.
@@ -124,6 +127,12 @@ void poll() {
     return;
   }
 
+  if (gCapturePaused) {
+    gDiagnostics.streamPaused = true;
+    gDiagnostics.streamHasChunk = false;
+    return;
+  }
+
 #ifdef ARDUINO
   size_t bytesRead = 0;
   const size_t bytesToRead = gRawBuffer.size() * sizeof(int32_t);
@@ -200,6 +209,7 @@ void poll() {
   gDiagnostics.framesCaptured += 1;
   gDiagnostics.lastFrameTimestampUs = esp_timer_get_time();
   gDiagnostics.streamHasChunk = true;
+  gDiagnostics.streamPaused = false;
   gDiagnostics.microphoneSpacingMeters = gConfig.microphoneSpacingMeters;
 
   const auto samplesToCopy = static_cast<std::vector<int16_t>::difference_type>(framesRead * 2);
@@ -235,6 +245,7 @@ void poll() {
 Diagnostics latest_diagnostics() {
   Diagnostics copy = gDiagnostics;
   copy.streamHasChunk = gChunkReady;
+  copy.streamPaused = gCapturePaused;
   return copy;
 }
 
@@ -262,5 +273,25 @@ bool pop_chunk(PcmChunk& out) {
   gDiagnostics.streamHasChunk = false;
   return true;
 }
+
+void set_paused(bool paused, const char* reason) {
+  gCapturePaused = paused;
+  gPauseReason = reason ? reason : std::string();
+  gDiagnostics.streamPaused = gCapturePaused;
+  if (paused) {
+    gChunkReady = false;
+    gDiagnostics.streamHasChunk = false;
+#ifdef ARDUINO
+    Serial.printf("[AUDIO] захват приостановлен сервером (%s)\n", gPauseReason.c_str());
+#endif
+  } else {
+#ifdef ARDUINO
+    Serial.printf("[AUDIO] захват возобновлён (причина: %s)\n", gPauseReason.c_str());
+#endif
+    gPauseReason.clear();
+  }
+}
+
+bool is_paused() { return gCapturePaused; }
 
 } // namespace Audio

@@ -23,6 +23,7 @@ from core import events as core_events
 
 # ────────────────────────── 0. LOGGING ────────────────────────────
 from core.logging_json import configure_logging
+from utils.audio_resample import resample_pcm16
 
 # Настройка базового логирования для всей работы модуля
 log = configure_logging("tts.piper")
@@ -75,12 +76,17 @@ def _notify_stream_listeners(
     sample_rate: int,
     *,
     text: str,
-    preset: str,
     chunk_index: int,
     chunks_total: int,
     volume: float,
 ) -> None:
-    """Передаёт синтезированный PCM всем подписчикам с подробными метаданными."""
+    """Передаёт синтезированный PCM всем подписчикам с подробными метаданными.
+
+    Передаваемый набор метаданных минимален: текст чанка, порядковый номер,
+    общее количество частей и текущая громкость. Информация о пресете
+    намеренно исключена, потому что весь аудиопоток теперь воспроизводится
+    в нейтральном режиме с фиксированной частотой дискретизации.
+    """
 
     with _STREAM_LOCK:
         listeners = list(_STREAM_LISTENERS)
@@ -90,7 +96,6 @@ def _notify_stream_listeners(
                 pcm,
                 sample_rate,
                 text=text,
-                preset=preset,
                 chunk_index=chunk_index,
                 chunks_total=chunks_total,
                 volume=volume,
@@ -140,17 +145,14 @@ SEARCH_DIRS: List[str] = ["./models/piper"]
 MAX_CHARS: int = 180
 # Пауза в секундах, добавляемая в конец каждого чанка, чтобы не обрезать фразу
 TAIL_PAD_SEC: float = 0.3
-# Преднастроенные "эмоции"/тона (громкость, скорость, пауза)
-# Преднастроенные параметры для эмоциональной озвучки.
-# ``pitch`` и ``speed`` регулируют высоту голоса и скорость воспроизведения,
-# ``volume`` отвечает за громкость, а ``pause`` — за длину тишины в конце
-# чанка.  Значения подобраны эмпирически и служат отправной точкой для
-# дальнейшей настройки пользователем.
-TTS_PRESETS = {
-    "neutral": {"volume": 1.0, "speed": 1.0, "pitch": 1.0, "pause": TAIL_PAD_SEC},
-    "happy": {"volume": 1.2, "speed": 1.2, "pitch": 1.1, "pause": 0.2},
-    "sad": {"volume": 0.8, "speed": 0.8, "pitch": 0.9, "pause": 0.5},
-}
+# Единая целевая частота дискретизации для всех исходящих потоков звука.
+# Значение 16 кГц совпадает с трактом робота и позволяет устранить треск,
+# возникавший из-за пересчёта частоты на уровне прошивки.
+TARGET_SAMPLE_RATE: int = 16_000
+# Громкость по умолчанию.  Параметр оставлен в отдельной константе, чтобы
+# при необходимости можно было аккуратно восстановить регулировку без
+# пересборки всей логики озвучки.
+DEFAULT_VOLUME: float = 1.0
 # Можно включить GPU, если доступно
 USE_CUDA: bool = False
 # Каталог для хранения WAV-файлов кэша
@@ -182,11 +184,17 @@ def _find_voice() -> str:
     )
 
 VOICE: PiperVoice = PiperVoice.load(_find_voice(), use_cuda=USE_CUDA)
-SAMPLE_RATE: int = VOICE.config.sample_rate
+VOICE_SAMPLE_RATE: int = VOICE.config.sample_rate
 _SIG_HAS_AUDIO_STREAMING: bool = "audio_streaming" in inspect.signature(
     VOICE.synthesize
 ).parameters
-log.info("Модель голоса '%s' загружена (sr=%d, streaming=%s)", VOICE_ID, SAMPLE_RATE, _SIG_HAS_AUDIO_STREAMING)
+log.info(
+    "Модель голоса '%s' загружена (sr=%d, streaming=%s, target_sr=%d)",
+    VOICE_ID,
+    VOICE_SAMPLE_RATE,
+    _SIG_HAS_AUDIO_STREAMING,
+    TARGET_SAMPLE_RATE,
+)
 
 # ────────────────────────── 3. HELPERS ────────────────────────────
 _SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
@@ -317,41 +325,38 @@ def stop_speaking() -> None:
     except Exception:
         pass
 
-def _save_wav(path: str, pcm_i16: np.ndarray) -> None:
+def _save_wav(path: str, pcm_i16: np.ndarray, sample_rate: int) -> None:
     """Пишет mono-PCM-16 bit в .wav (для отладки)."""
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)              # 16-bit
-        wf.setframerate(SAMPLE_RATE)
+        wf.setframerate(sample_rate)
         wf.writeframes(pcm_i16.tobytes())
-    log.info("WAV-debug: saved %s (%.2f s)", path, pcm_i16.size / SAMPLE_RATE)
+    log.info(
+        "WAV-debug: saved %s (%.2f s)",
+        path,
+        pcm_i16.size / sample_rate if sample_rate else 0.0,
+    )
 
 
 def working_tts(
     text: str,
     *,
     max_chars: int = MAX_CHARS,
-    save_wav: str | None = None,        # ← новый арг.
-    preset: str = "neutral",
-    pitch: float | None = None,
-    speed: float | None = None,
-    emotion: str | None = None,
+    save_wav: str | None = None,        # путь для отладочной записи результата
 ) -> None:
     """Озвучивает *text*; при *save_wav* пишет итоговый WAV-файл.
 
-    Дополнительные параметры позволяют управлять эмоциональной окраской
-    речи:
-
-    * ``pitch``  — коэффициент изменения высоты голоса (1.0 по умолчанию);
-    * ``speed``  — множитель скорости воспроизведения;
-    * ``emotion`` — название пресета из :data:`TTS_PRESETS`.
+    Управление эмоциями, тоном и скоростью речи временно отключено, чтобы
+    исключить любые скачки частоты дискретизации.  Сервер гарантированно
+    выдаёт строго 16 кГц моно-сигнал независимо от внешних настроек.
     """
     global is_playing
     is_playing = True
     core_events.publish(
         core_events.Event(
             kind="speech.synthesis_started",
-            attrs={"text": text, "emotion": emotion or preset},
+            attrs={"text": text, "emotion": "neutral"},
         )
     )
     _STOP_EVENT.clear()
@@ -362,16 +367,13 @@ def working_tts(
     log.debug("Исходный текст для озвучки: %r", text)
     norm = translit(normalize_tts_text(text), "ru")
     log.debug("Нормализованный текст для TTS: %r", norm)
-    log.info("Озвучиваем строку длиной %d символов (preset=%s)", len(norm), preset)
-    cfg = TTS_PRESETS.get(emotion or preset, TTS_PRESETS["neutral"])
-    vol = cfg["volume"]
-    speed = speed if speed is not None else cfg["speed"]
-    pitch = pitch if pitch is not None else cfg["pitch"]
-    pause = cfg["pause"]
-
     log.info(
-        "Эмоция=%s | pitch=%.2f | speed=%.2f", (emotion or preset), pitch, speed
+        "Озвучиваем строку длиной %d символов (target_sr=%d)",
+        len(norm),
+        TARGET_SAMPLE_RATE,
     )
+    pause = TAIL_PAD_SEC
+    vol = DEFAULT_VOLUME
 
     now = time.time()
     # Периодическая очистка устаревшего кэша
@@ -387,6 +389,7 @@ def working_tts(
         now = time.time()
         cache_file = _cache_path(chunk)
         pcm_i16_pad: np.ndarray | None = None
+        chunk_source_rate = VOICE_SAMPLE_RATE
         t_gen = 0.0
 
         # --- 4.1. Попытка взять аудио из кэша ---
@@ -401,6 +404,7 @@ def working_tts(
                     pcm_i16_pad = np.frombuffer(
                         wf.readframes(wf.getnframes()), dtype=np.int16
                     )
+                    chunk_source_rate = wf.getframerate() or TARGET_SAMPLE_RATE
             else:
                 # Файл есть, но устарел — удаляем
                 log.debug("Чанк %d устарел в кэше, удаляем %s", i, cache_file)
@@ -420,26 +424,45 @@ def working_tts(
                 continue
 
             # Добавляем тишину в хвосте, чтобы не обрывалась последняя буква
-            tail = np.zeros(int(SAMPLE_RATE * pause), np.int16)
+            tail = np.zeros(int(VOICE_SAMPLE_RATE * pause), np.int16)
             pcm_i16_pad = np.concatenate([pcm_i16, tail])
+            chunk_source_rate = VOICE_SAMPLE_RATE
+
+        # Применяем изменение высоты голоса согласно коэффициенту ``pitch``.
+        # Сейчас коэффициент жёстко равен 1.0, так как пресеты отключены;
+        # вызов оставлен для будущей обратной совместимости.
+        pcm_i16_pad = _apply_pitch(pcm_i16_pad, 1.0)
+
+        # Приводим аудиоданные к целевой частоте 16 кГц.  Эта операция
+        # выполняется даже для кэша, чтобы гарантировать единый формат.
+        pcm_i16_pad = resample_pcm16(pcm_i16_pad, chunk_source_rate, TARGET_SAMPLE_RATE)
+
+        need_cache_update = True
+        try:
+            stat_info = cache_file.stat()
+            need_cache_update = (
+                chunk_source_rate != TARGET_SAMPLE_RATE
+                or now - stat_info.st_mtime > CACHE_TTL
+            )
+        except FileNotFoundError:
+            need_cache_update = True
+
+        if need_cache_update:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
-            _save_wav(str(cache_file), pcm_i16_pad)
+            _save_wav(str(cache_file), pcm_i16_pad, TARGET_SAMPLE_RATE)
             log.debug("Чанк %d сохранён в кэш %s", i, cache_file)
 
-        # Применяем изменение высоты голоса согласно коэффициенту ``pitch``
-        pcm_i16_pad = _apply_pitch(pcm_i16_pad, pitch)
         playback_parts.append(pcm_i16_pad)
         audio_f32 = pcm_i16_pad.astype(np.float32) / 32767.0
         if vol != 1.0:
             audio_f32 = np.clip(audio_f32 * vol, -1.0, 1.0)
 
-        playback_rate = max(1, int(SAMPLE_RATE * speed))
+        playback_rate = TARGET_SAMPLE_RATE
         pcm_bytes = np.clip(audio_f32 * 32767.0, -32768, 32767).astype(np.int16)
         _notify_stream_listeners(
             pcm_bytes.tobytes(),
             playback_rate,
             text=chunk,
-            preset=emotion or preset,
             chunk_index=i,
             chunks_total=total_chunks,
             volume=vol,
@@ -464,8 +487,8 @@ def working_tts(
 
     full_audio = np.concatenate(playback_parts) if playback_parts else np.zeros(0, np.int16)
     if save_wav:
-        _save_wav(save_wav, full_audio)
-    total_duration = full_audio.size / (SAMPLE_RATE * speed) if speed else 0.0
+        _save_wav(save_wav, full_audio, TARGET_SAMPLE_RATE)
+    total_duration = full_audio.size / TARGET_SAMPLE_RATE if TARGET_SAMPLE_RATE else 0.0
     log.info("Озвучивание завершено: длительность %.2f с", total_duration)
     is_playing = False
     core_events.publish(core_events.Event(kind="speech.synthesis_finished"))
@@ -478,10 +501,6 @@ def working_tts(
 async def speak_async(
     text: str,
     *,
-    preset: str = "neutral",
-    pitch: float | None = None,
-    speed: float | None = None,
-    emotion: str | None = None,
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> None:
     """Неблокирующая озвучка: `working_tts` выполняется в пуле потоков."""
@@ -510,7 +529,7 @@ async def speak_async(
     from functools import partial
 
     loop = loop or asyncio.get_running_loop()
-    func = partial(working_tts, clean, preset=preset, pitch=pitch, speed=speed, emotion=emotion)
+    func = partial(working_tts, clean)
     # Используем отдельный executor, чтобы не блокировать поток
     # чтения с микрофона, работающий через asyncio.to_thread
     await loop.run_in_executor(_EXECUTOR, func)

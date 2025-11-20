@@ -17,7 +17,9 @@ from memory.dialog_log import record_dialog_message
 log = configure_logging("notifiers.voice")
 
 # Очередь запросов на озвучивание.  Каждый элемент — словарь с полями
-# ``text``, ``pitch``, ``speed`` и ``emotion``.
+# ``text`` и ``source``.  Параметры эмоций временно отключены, чтобы
+# исключить расхождения в формате аудио, поэтому очередь хранит только
+# минимально необходимую информацию.
 _queue: asyncio.Queue[dict] = asyncio.Queue()
 # Задача-воркер, обрабатывающая очередь в фоне.
 _worker_task: asyncio.Task | None = None
@@ -47,12 +49,7 @@ async def _worker() -> None:
                     log.warning("telegram reply failed: %s", exc)
                 continue
 
-            await speak_async(
-                item["text"],
-                pitch=item.get("pitch"),
-                speed=item.get("speed"),
-                emotion=item.get("emotion"),
-            )
+            await speak_async(item["text"])
 
             # Ранее здесь дублировались голосовые уведомления в Telegram.
             # По требованию пользователя отключаем такую логику: ответ
@@ -77,28 +74,22 @@ def start() -> None:
         _worker_task = asyncio.create_task(_worker())
 
 
-def say(text: str, *, pitch: float | None = None, speed: float | None = None, emotion: str | None = None) -> None:
-    """Добавить *text* в очередь на озвучивание вместе с параметрами.
+def say(text: str) -> None:
+    """Добавить *text* в очередь на озвучивание.
 
-    ``pitch`` и ``speed`` задаются как коэффициенты, ``emotion`` — имя
-    пресета из :data:`working_tts.TTS_PRESETS`.
+    Управление эмоциями временно отключено, поэтому функция фиксирует
+    только исходный текст и источник запроса.
     """
     # Перед постановкой в очередь пытаемся извлечь поле ``reply`` из JSON.
     clean = extract_reply(text)
     source = get_request_source()
     _queue.put_nowait({
         "text": clean,
-        "pitch": pitch,
-        "speed": speed,
-        "emotion": emotion,
         "source": source,
     })
     log.debug(
-        "queued voice text=%r emotion=%s pitch=%s speed=%s source=%s",
+        "queued voice text=%r fixed_preset=neutral source=%s",
         clean,
-        emotion,
-        pitch,
-        speed,
         source,
     )
     set_metric("tts.queue_len", _queue.qsize())
@@ -110,24 +101,17 @@ def say(text: str, *, pitch: float | None = None, speed: float | None = None, em
                 channel="voice",
                 trace_id=TRACE_ID.get(),
                 status="queued",
-                metadata={"emotion": emotion, "pitch": pitch, "speed": speed},
+                metadata={"fixed_preset": "neutral"},
             )
         except Exception:  # pragma: no cover - защита от сбоев БД
             log.exception("failed to log voice notification")
 
 
-def send(
-    text: str,
-    *,
-    pitch: float | None = None,
-    speed: float | None = None,
-    emotion: str | None = None,
-) -> None:
+def send(text: str) -> None:
     """Публичная обёртка над :func:`say`.
 
     При первом вызове автоматически запускает воркер, чтобы TTS начал
-    обрабатывать очередь сообщений.  Дополнительные параметры передаются
-    в :func:`working_tts.speak_async`.
+    обрабатывать очередь сообщений.
     """
     start()
-    say(text, pitch=pitch, speed=speed, emotion=emotion)
+    say(text)

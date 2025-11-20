@@ -1,70 +1,74 @@
+"""Тесты подтверждают отключение эмоций в TTS."""
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import sys
-from types import SimpleNamespace
+import types
 
 import pytest
-from core.request_source import set_request_source, reset_request_source
+
+from core.request_source import reset_request_source, set_request_source
 
 
-async def _dummy_speak_async(text: str, *, pitch=None, speed=None, emotion=None, loop=None):
-    """Заглушка для модуля ``working_tts``.
-
-    В тестах нас интересует только факт передачи параметров,
-    поэтому функция ничего не воспроизводит."""
-    pass
+async def _dummy_speak_async(text: str, *, loop=None) -> None:
+    """Заглушка для ``working_tts`` в тестах."""
+    return None
 
 
 def _load_voice(monkeypatch):
-    """Загрузить модуль ``notifiers.voice`` с подменённым ``working_tts``."""
-    dummy_module = SimpleNamespace(speak_async=_dummy_speak_async)
+    """Импортировать ``notifiers.voice`` с подменённым ``working_tts``."""
+
+    dummy_module = types.SimpleNamespace(speak_async=_dummy_speak_async)
     monkeypatch.setitem(sys.modules, "working_tts", dummy_module)
     monkeypatch.delitem(sys.modules, "notifiers.voice", raising=False)
     import notifiers.voice as voice
+
     return voice
 
 
-def test_voice_passes_emotion_params(monkeypatch):
+def test_voice_worker_passes_plain_text(monkeypatch):
+    """Очередь должна передавать в ``speak_async`` только текст без параметров."""
+
     voice = _load_voice(monkeypatch)
-    captured = {}
+    captured: dict[str, str] = {}
 
-    async def fake_speak_async(text, *, pitch=None, speed=None, emotion=None, loop=None):
-        captured.update({
-            "text": text,
-            "pitch": pitch,
-            "speed": speed,
-            "emotion": emotion,
-        })
+    async def fake_speak_async(text: str, *, loop=None) -> None:
+        captured["text"] = text
 
-    async def run_test():
+    async def run_test() -> None:
         monkeypatch.setattr(voice, "speak_async", fake_speak_async)
         monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
 
         token = set_request_source("voice")
+        try:
+            voice._queue = asyncio.Queue()
+            if voice._worker_task is not None:
+                voice._worker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await voice._worker_task
+                voice._worker_task = None
 
-        # Сбрасываем очередь и воркер перед тестом
-        voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
+            voice.send("привет")
+            await asyncio.wait_for(voice._queue.join(), timeout=1.0)
+        finally:
+            reset_request_source(token)
 
-        voice.send("hi", pitch=1.3, speed=1.1, emotion="happy")
-        await asyncio.wait_for(voice._queue.join(), timeout=1)
-        reset_request_source(token)
+        assert captured == {"text": "привет"}
 
-        assert captured == {
-            "text": "hi",
-            "pitch": 1.3,
-            "speed": 1.1,
-            "emotion": "happy",
-        }
-
-        # Останавливаем воркер, чтобы не мешал другим тестам
+        assert voice._worker_task is not None
         voice._worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await voice._worker_task
         voice._worker_task = None
 
     asyncio.run(run_test())
+
+
+def test_voice_send_rejects_emotion_kwargs(monkeypatch):
+    """Попытка передать эмоцию должна завершаться ``TypeError``."""
+
+    voice = _load_voice(monkeypatch)
+
+    with pytest.raises(TypeError):
+        voice.send("hi", emotion="sad")  # type: ignore[call-arg]

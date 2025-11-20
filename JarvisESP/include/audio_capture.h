@@ -45,6 +45,7 @@ struct Diagnostics {
   uint64_t lastFrameTimestampUs = 0;///< Метка времени последнего кадра.
   bool streamHasChunk = false;      ///< Готов ли кадр для передачи на сервер.
   float microphoneSpacingMeters = 0.0f; ///< Храним расстояние между микрофонами для телеметрии и сервера.
+  bool streamPaused = false;        ///< Приостановлен ли вывод аудиокадров на сервер по команде с хоста.
 };
 
 bool init(const Config& cfg);
@@ -52,5 +53,7 @@ void shutdown();
 void poll();
 Diagnostics latest_diagnostics();
 bool pop_chunk(PcmChunk& out);
+void set_paused(bool paused, const char* reason = nullptr);
+bool is_paused();
 
 } // namespace Audio

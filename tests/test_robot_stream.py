@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import struct
 
 import pytest
@@ -48,6 +49,19 @@ def test_downmix_to_mono() -> None:
     assert mono == struct.pack("<hh", 0, 0)
 
 
+def test_prepare_payload_reports_extremes() -> None:
+    """Статистика кадра содержит минимум и максимум исходных сэмплов."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:8765/")
+    pcm = struct.pack("<hhhh", 100, -200, 300, -400)
+    prepared = stream._prepare_playback_payload(pcm, 16_000, channels=1, volume=1.0)
+    assert prepared is not None
+    payload, stats = prepared
+    assert payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + len(pcm)] == pcm
+    assert stats["sample_min"] == -400
+    assert stats["sample_max"] == 300
+
+
 def test_decode_frame_fields() -> None:
     """Распаковка заголовка возвращает ожидаемые значения."""
 
@@ -89,31 +103,33 @@ def test_websocket_server_receives_audio() -> None:
 
 
 def test_websocket_server_sends_tts_to_robot() -> None:
-    """Проверяем, что отправка озвучки формирует бинарный кадр."""
+    """Проверяем, что отправка озвучки формирует бинарный кадр и команды паузы."""
 
-    async def _runner() -> tuple[bytes, int]:
+    async def _runner() -> tuple[str, bytes, str, int]:
         stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
         await stream.start()
         assert stream._server is not None
         port = stream._server.sockets[0].getsockname()[1]
 
         async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
-            # PCM двух сэмплов для простоты проверки.
             pcm = struct.pack("<hh", 1200, -1200)
             stream.send_tts(
                 pcm,
                 16_000,
                 text="привет",
-                preset="neutral",
                 chunk_index=1,
                 chunks_total=1,
                 volume=1.0,
             )
+            pause = await asyncio.wait_for(ws.recv(), timeout=1.0)
             payload = await asyncio.wait_for(ws.recv(), timeout=1.0)
-        return payload, len(pcm)
+            resume = await asyncio.wait_for(ws.recv(), timeout=1.0)
+        return pause, payload, resume, len(pcm)
 
-    payload, pcm_len = asyncio.run(_runner())
+    pause_cmd, payload, resume_cmd, pcm_len = asyncio.run(_runner())
 
+    assert pause_cmd == "capture:pause:tts"
+    assert resume_cmd == "capture:resume:tts"
     assert isinstance(payload, (bytes, bytearray))
     header = _PLAYBACK_HEADER.unpack_from(payload)
     (
@@ -147,7 +163,7 @@ def test_websocket_server_sends_tts_to_robot() -> None:
 def test_websocket_server_sends_effect_to_robot() -> None:
     """Эффекты эмоций тоже должны доходить до ESP32 через AP-заголовок."""
 
-    async def _runner() -> tuple[bytes, int]:
+    async def _runner() -> tuple[str, bytes, str, int]:
         stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
         await stream.start()
         assert stream._server is not None
@@ -164,10 +180,15 @@ def test_websocket_server_sends_effect_to_robot() -> None:
                 repeat_total=1,
                 volume=0.75,
             )
+            pause = await asyncio.wait_for(ws.recv(), timeout=1.0)
             payload = await asyncio.wait_for(ws.recv(), timeout=1.0)
-        return payload, len(pcm)
+            resume = await asyncio.wait_for(ws.recv(), timeout=1.0)
+        return pause, payload, resume, len(pcm)
 
-    payload, pcm_len = asyncio.run(_runner())
+    pause_cmd, payload, resume_cmd, pcm_len = asyncio.run(_runner())
+
+    assert pause_cmd == "capture:pause:effect"
+    assert resume_cmd == "capture:resume:effect"
 
     header = _PLAYBACK_HEADER.unpack_from(payload)
     (
@@ -194,3 +215,163 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert pcm_bytes == pcm_len
     assert volume == pytest.approx(0.75)
     assert reserved == pytest.approx(0.0)
+
+
+def test_tts_payload_chunking_prevents_ws_overflow() -> None:
+    """Большой PCM автоматически дробится на одинаковые кадры с паузой микрофона."""
+
+    async def _runner() -> tuple[list[str], list[bytes], bytes, int]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        stream.frame_samples = 4
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        pcm = struct.pack("<" + "h" * 40, *range(40))
+        frame_bytes = stream.frame_samples * 2
+        expected_chunks = math.ceil(len(pcm) / frame_bytes)
+        received: list[bytes] = []
+        commands: list[str] = []
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="diagnostic",
+                chunk_index=1,
+                chunks_total=1,
+                volume=1.0,
+            )
+            commands.append(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            for _ in range(expected_chunks):
+                received.append(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            commands.append(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws.recv(), timeout=0.1)
+
+        stream.stop()
+        await asyncio.sleep(0.05)
+        return commands, received, pcm, expected_chunks
+
+    commands, payloads, original_pcm, expected_chunks = asyncio.run(_runner())
+    assert commands == ["capture:pause:tts", "capture:resume:tts"]
+    assert len(payloads) == expected_chunks
+
+    restored = bytearray()
+    for payload in payloads:
+        header = _PLAYBACK_HEADER.unpack_from(payload)
+        frame_samples = header[8]
+        pcm_bytes = header[9]
+        assert frame_samples <= 4
+        assert pcm_bytes <= 4 * 2
+        restored.extend(payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + pcm_bytes])
+
+    assert bytes(restored) == original_pcm
+
+
+def test_send_queue_backpressure_prevents_drops() -> None:
+    """Даже при минимальном размере очереди кадры доходят до робота без потерь."""
+
+    async def _runner() -> tuple[list[str], list[bytes]]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=1)
+        stream.frame_samples = 4
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        commands: list[str] = []
+        payloads: list[bytes] = []
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            async def _slow_reader() -> None:
+                try:
+                    while True:
+                        message = await ws.recv()
+                        if isinstance(message, str):
+                            commands.append(message)
+                        else:
+                            payloads.append(message)
+                        await asyncio.sleep(0.03)
+                except websockets.ConnectionClosed:
+                    return
+
+            reader_task = asyncio.create_task(_slow_reader())
+
+            pcm = struct.pack("<" + "h" * 80, *range(80))
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="stress-test",
+                chunk_index=1,
+                chunks_total=1,
+                volume=0.9,
+            )
+
+            await asyncio.sleep(0.6)
+            await ws.close()
+            await reader_task
+
+        stream.stop()
+        await asyncio.sleep(0.05)
+        return commands, payloads
+
+    commands, payloads = asyncio.run(_runner())
+
+    assert commands[0] == "capture:pause:tts"
+    assert commands[-1] == "capture:resume:tts"
+    assert len(payloads) == math.ceil((80 * 2) / (4 * 2))
+
+
+def test_effect_payload_chunking_matches_tts_strategy() -> None:
+    """Фоновые эффекты используют тот же механизм дробления и паузы микрофона."""
+
+    async def _runner() -> tuple[list[str], list[bytes], bytes, int]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        stream.frame_samples = 4
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        pcm = struct.pack("<" + "h" * 36, *range(36))
+        frame_bytes = stream.frame_samples * 2
+        expected_chunks = math.ceil(len(pcm) / frame_bytes)
+        received: list[bytes] = []
+        commands: list[str] = []
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            stream.send_effect(
+                pcm,
+                16_000,
+                name="PING",
+                source_file="ping.wav",
+                repeat_index=1,
+                repeat_total=1,
+                volume=0.5,
+            )
+            commands.append(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            for _ in range(expected_chunks):
+                received.append(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            commands.append(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(ws.recv(), timeout=0.1)
+
+        stream.stop()
+        await asyncio.sleep(0.05)
+        return commands, received, pcm, expected_chunks
+
+    commands, payloads, original_pcm, expected_chunks = asyncio.run(_runner())
+    assert commands == ["capture:pause:effect", "capture:resume:effect"]
+    assert len(payloads) == expected_chunks
+
+    restored = bytearray()
+    for payload in payloads:
+        header = _PLAYBACK_HEADER.unpack_from(payload)
+        frame_samples = header[8]
+        pcm_bytes = header[9]
+        assert frame_samples <= 4
+        assert pcm_bytes <= 4 * 2
+        restored.extend(payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + pcm_bytes])
+
+    assert bytes(restored) == original_pcm
+
+

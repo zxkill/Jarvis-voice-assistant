@@ -7,10 +7,11 @@ import dataclasses
 import json
 import math
 import struct
+import sys
 import time
 from array import array
 from collections import deque
-from typing import Deque, Set
+from typing import Awaitable, Callable, Deque, Optional, Set
 from urllib.parse import urlparse
 
 import websockets
@@ -22,6 +23,17 @@ from core.logging_json import configure_logging
 _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
 # Заголовок исходящих кадров TTS, описанный в прошивке ESP32.
 _PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
+
+
+@dataclasses.dataclass(slots=True)
+class _OutgoingMessage:
+    """Описание сообщения, отправляемого роботу по WebSocket."""
+
+    payload: bytes | str
+    is_text: bool
+    purpose: str
+    sequence: Optional[int] = None
+    pcm_bytes: Optional[int] = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -88,12 +100,60 @@ class RobotAudioStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
-        self._send_queues: Set[asyncio.Queue[bytes]] = set()
+        self._send_queues: Set[asyncio.Queue[_OutgoingMessage]] = set()
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
+        self._default_frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
         # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
         self._playback_sequence = 0
+        self._playback_sessions = 0
+        self._capture_paused = False
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы планирования задач и подготовки данных.
+    # ------------------------------------------------------------------
+
+    def _schedule_coroutine(
+        self,
+        factory: Callable[[], Awaitable[None]],
+        *,
+        direct: bool = False,
+    ) -> None:
+        """Запускает корутину в event loop с учётом текущего потока.
+
+        Если ``direct`` и код уже выполняется внутри рабочего цикла, корутина
+        стартует немедленно. В противном случае используем thread-safe вызов,
+        чтобы избежать гонок при обращении из фоновых потоков.
+        """
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов для планирования задачи")
+            return
+
+        def _create_task() -> None:
+            asyncio.create_task(factory())
+
+        if direct:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is self._loop:
+                _create_task()
+                return
+
+        self._loop.call_soon_threadsafe(_create_task)
+
+    @staticmethod
+    def _payload_preview(payload: bytes | str, limit: int = 32) -> str:
+        """Возвращает укороченное представление полезной нагрузки для логов."""
+
+        if isinstance(payload, str):
+            trimmed = payload if len(payload) <= limit else payload[: limit - 3] + "..."
+            return trimmed
+        preview = payload[: limit // 2]
+        return preview.hex() + ("..." if len(payload) > len(preview) else "")
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -183,7 +243,10 @@ class RobotAudioStream:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Очередь исходящих кадров делаем достаточно широкой (200 сообщений), чтобы
+        # роботу не приходилось сбрасывать озвучку при кратковременных всплесках
+        # активности. Даже при чанках по ~30 мс этого хватит почти на 6 секунд буфера.
+        send_queue: asyncio.Queue[_OutgoingMessage] = asyncio.Queue(maxsize=200)
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -232,8 +295,27 @@ class RobotAudioStream:
         except ConnectionClosedOK:
             self.log.info("Робот корректно отключился", extra={"attrs": {"peer": peer}})
         except ConnectionClosedError as exc:
-            self.log.warning(
-                "Соединение закрыто с ошибкой",
+            log_level = self.log.warning
+            message = "Соединение закрыто с ошибкой"
+            if exc.code == 1009:
+                # Код 1009 означает «Message Too Big». Добавляем явное пояснение и
+                # логику самодиагностики: при срабатывании лимита выводим текущие
+                # параметры буфера, чтобы быстрее найти источник переполнения.
+                log_level = self.log.error
+                message = "Соединение закрыто: робот отклонил слишком крупный кадр"
+                self.log.error(
+                    "Диагностика размера кадра",
+                    extra={
+                        "attrs": {
+                            "frame_samples": self.frame_samples,
+                            "expected_payload_bytes": self.frame_samples
+                            * max(1, self._expected_channels)
+                            * 2,
+                        }
+                    },
+                )
+            log_level(
+                message,
                 extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
             )
         except Exception:
@@ -248,7 +330,7 @@ class RobotAudioStream:
     async def _send_loop(
         self,
         websocket: WebSocketServerProtocol,
-        queue: asyncio.Queue[bytes],
+        queue: asyncio.Queue[_OutgoingMessage],
         peer: str,
     ) -> None:
         """Отправляет накопленные чанки озвучки на робота."""
@@ -258,34 +340,52 @@ class RobotAudioStream:
         )
         try:
             while True:
-                payload = await queue.get()
-                await websocket.send(payload)
-                try:
-                    (
-                        _magic,
-                        _ver,
-                        _flags,
-                        seq,
-                        _ts,
-                        _sr,
-                        _ch,
-                        _bits,
-                        _frame_samples,
-                        pcm_bytes,
-                        _volume,
-                        _reserved,
-                    ) = _PLAYBACK_HEADER_STRUCT.unpack_from(payload)
-                except struct.error:
-                    seq = -1
-                    pcm_bytes = len(payload)
+                message = await queue.get()
+                await websocket.send(message.payload)
+                if message.is_text:
+                    self.log.debug(
+                        "Отправлено текстовое сообщение роботу",
+                        extra={
+                            "attrs": {
+                                "peer": peer,
+                                "purpose": message.purpose,
+                                "payload": message.payload,
+                            }
+                        },
+                    )
+                    continue
+
+                seq = message.sequence if message.sequence is not None else -1
+                pcm_bytes = message.pcm_bytes if message.pcm_bytes is not None else 0
+                if seq == -1 or pcm_bytes == 0:
+                    try:
+                        (
+                            _magic,
+                            _ver,
+                            _flags,
+                            seq,
+                            _ts,
+                            _sr,
+                            _ch,
+                            _bits,
+                            _frame_samples,
+                            pcm_bytes,
+                            _volume,
+                            _reserved,
+                        ) = _PLAYBACK_HEADER_STRUCT.unpack_from(message.payload)
+                    except struct.error:
+                        seq = -1
+                        pcm_bytes = len(message.payload)
+
                 self.log.debug(
                     "Отправлен аудиокадр роботу",
                     extra={
                         "attrs": {
                             "peer": peer,
-                            "size": len(payload),
+                            "size": len(message.payload),
                             "sequence": seq,
                             "pcm_bytes": pcm_bytes,
+                            "purpose": message.purpose,
                         }
                     },
                 )
@@ -301,6 +401,73 @@ class RobotAudioStream:
 
         self._playback_sequence = (self._playback_sequence + 1) & 0xFFFFFFFF
         return self._playback_sequence
+
+    def _set_capture_paused(self, paused: bool, *, reason: str, direct: bool = False) -> None:
+        """Посылает роботу команду приостановить или возобновить передачу микрофона."""
+
+        if paused == self._capture_paused:
+            return
+
+        self._capture_paused = paused
+        command = f"capture:{'pause' if paused else 'resume'}:{reason}"
+        purpose = "capture-pause" if paused else "capture-resume"
+        self.log.info(
+            "Отправляю команду роботу о состоянии микрофона",
+            extra={
+                "attrs": {
+                    "paused": paused,
+                    "reason": reason,
+                    "active_sessions": self._playback_sessions,
+                }
+            },
+        )
+        self._broadcast_text(command, purpose=purpose, direct=direct)
+
+    def _start_playback_session(self, *, reason: str, metadata: dict[str, object]) -> None:
+        """Фиксирует старт новой сессии воспроизведения и управляет паузой микрофона."""
+
+        def _increment() -> None:
+            self._playback_sessions += 1
+            self.log.debug(
+                "Активирована сессия воспроизведения",
+                extra={
+                    "attrs": {
+                        "reason": reason,
+                        "active_sessions": self._playback_sessions,
+                        **metadata,
+                    }
+                },
+            )
+            if self._playback_sessions == 1:
+                self._set_capture_paused(True, reason=reason, direct=True)
+
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(_increment)
+
+    def _finish_playback_session(self, *, reason: str, metadata: dict[str, object]) -> None:
+        """Завершает сессию воспроизведения и при необходимости возобновляет микрофон."""
+
+        def _decrement() -> None:
+            if self._playback_sessions == 0:
+                return
+            self._playback_sessions -= 1
+            self.log.debug(
+                "Сессия воспроизведения завершена",
+                extra={
+                    "attrs": {
+                        "reason": reason,
+                        "active_sessions": self._playback_sessions,
+                        **metadata,
+                    }
+                },
+            )
+            if self._playback_sessions == 0:
+                self._set_capture_paused(False, reason=reason, direct=True)
+
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(_decrement)
 
     def _prepare_playback_payload(
         self,
@@ -353,6 +520,13 @@ class RobotAudioStream:
 
         samples = array("h")
         samples.frombytes(pcm)
+        if sys.byteorder != "little":
+            # На системах с big-endian порядок байтов в массиве отличается от того,
+            # что ожидает прошивка (все поля протокола определены как little-endian).
+            # Переводим сэмплы в little-endian, чтобы ESP32 получал корректное PCM.
+            samples.byteswap()
+        pcm = samples.tobytes()
+
         total_samples = len(samples)
         per_channel = total_samples // channels if channels else 0
         duration_ms = (
@@ -383,6 +557,11 @@ class RobotAudioStream:
             0.0,
         )
 
+        # Сохраняем крайние значения сигнала — это помогает из логов понять,
+        # появился ли в кадре живой звук или приходят почти нулевые сэмплы.
+        sample_min = min(samples) if samples else 0
+        sample_max = max(samples) if samples else 0
+
         return header + pcm, {
             "sequence": sequence,
             "duration_ms": round(duration_ms, 2),
@@ -390,35 +569,178 @@ class RobotAudioStream:
             "rms": round(rms_mono, 3),
             "pcm_bytes": len(pcm),
             "sample_rate": sample_rate,
+            "sample_min": int(sample_min),
+            "sample_max": int(sample_max),
         }
 
-    def _broadcast_payload(self, payload: bytes, *, purpose: str) -> None:
+    def _iter_playback_chunks(self, pcm: bytes, channels: int) -> list[bytes]:
+        """Делит PCM-последовательность на безопасные куски для WebSocket.
+
+        Возвращаем список, потому что вызывающий код использует количество чанков
+        для дополнительного логирования. Общий объём PCM обычно ограничен
+        несколькими десятками килобайт, поэтому копирование допустимо. Если в
+        будущем появится потребность стримить много минут подряд, можно перейти на
+        ленивый генератор.
+        """
+
+        if not pcm:
+            return []
+
+        safe_channels = max(1, channels)
+        bytes_per_sample = safe_channels * 2
+        frame_samples = self.frame_samples or self._default_frame_samples
+        if frame_samples <= 0:
+            frame_samples = self._default_frame_samples
+        chunk_samples = max(1, frame_samples)
+        frame_bytes = chunk_samples * bytes_per_sample
+
+        chunks: list[bytes] = []
+        for offset in range(0, len(pcm), frame_bytes):
+            chunk = pcm[offset : offset + frame_bytes]
+            chunks.append(chunk)
+
+        if len(chunks) > 1:
+            self.log.debug(
+                "PCM разбит на несколько кадров для повторного использования ESP32-параметров",
+                extra={
+                    "attrs": {
+                        "chunks": len(chunks),
+                        "chunk_samples": chunk_samples,
+                        "frame_bytes": frame_bytes,
+                        "pcm_bytes": len(pcm),
+                        "expected_frame_samples": self.frame_samples,
+                    }
+                },
+            )
+
+        return chunks
+
+    def _broadcast_payload(
+        self,
+        payload: bytes,
+        *,
+        purpose: str,
+        sequence: int | None = None,
+        pcm_bytes: int | None = None,
+    ) -> None:
         """Отправляет подготовленный пакет во все очереди клиентов."""
 
         if self._loop is None:
             self.log.warning("Event loop сервера ещё не готов, %s не отправлен", purpose)
             return
 
-        def _enqueue() -> None:
+        async def _enqueue_async() -> None:
+            """Помещает аудиопакет в очереди всех активных подключений."""
+
             if not self._send_queues:
                 self.log.warning(
                     "Нет активных подключений робота для отправки %s",
                     purpose,
                 )
                 return
-            for queue in list(self._send_queues):
-                if queue.full():
-                    try:
-                        dropped = queue.get_nowait()
-                        self.log.warning(
-                            "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={"attrs": {"dropped_size": len(dropped), "purpose": purpose}},
-                        )
-                    except asyncio.QueueEmpty:
-                        pass
-                queue.put_nowait(payload)
 
-        self._loop.call_soon_threadsafe(_enqueue)
+            for queue in list(self._send_queues):
+                message = _OutgoingMessage(
+                    payload=payload,
+                    is_text=False,
+                    purpose=purpose,
+                    sequence=sequence,
+                    pcm_bytes=pcm_bytes,
+                )
+                start = self._loop.time()
+                try:
+                    await asyncio.wait_for(queue.put(message), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if queue not in self._send_queues:
+                        self.log.debug(
+                            "Пропускаю очередь отключившегося робота",
+                            extra={"attrs": {"purpose": purpose}},
+                        )
+                        continue
+                    self.log.warning(
+                        "Очередь отправки занята слишком долго",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "queue_size": queue.qsize(),
+                                "timeout_s": 2.0,
+                                "payload_bytes": len(payload),
+                            }
+                        },
+                    )
+                    await queue.put(message)
+                wait_ms = (self._loop.time() - start) * 1000.0
+                if wait_ms >= 5.0:
+                    self.log.debug(
+                        "Ожидал освобождения места в очереди отправки",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "wait_ms": round(wait_ms, 2),
+                                "queue_size": queue.qsize(),
+                                "payload_bytes": len(payload),
+                            }
+                        },
+                    )
+
+        self._schedule_coroutine(_enqueue_async)
+
+    def _broadcast_text(self, text: str, *, purpose: str, direct: bool = False) -> None:
+        """Передаёт текстовую команду всем подключённым роботам."""
+
+        if self._loop is None:
+            self.log.warning("Event loop сервера ещё не готов, текст %s не отправлен", purpose)
+            return
+
+        async def _enqueue_async() -> None:
+            """Добавляет текстовую команду в очереди без потери сообщений."""
+
+            if not self._send_queues:
+                self.log.debug(
+                    "Нет активных роботов для текстовой команды",
+                    extra={"attrs": {"purpose": purpose, "payload": text}},
+                )
+                return
+
+            for queue in list(self._send_queues):
+                message = _OutgoingMessage(payload=text, is_text=True, purpose=purpose)
+                start = self._loop.time()
+                try:
+                    await asyncio.wait_for(queue.put(message), timeout=2.0)
+                except asyncio.TimeoutError:
+                    if queue not in self._send_queues:
+                        self.log.debug(
+                            "Текстовая очередь принадлежит отключившемуся роботу",
+                            extra={"attrs": {"purpose": purpose}},
+                        )
+                        continue
+                    self.log.warning(
+                        "Очередь текстовых команд занята слишком долго",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "queue_size": queue.qsize(),
+                                "timeout_s": 2.0,
+                                "preview": self._payload_preview(text),
+                            }
+                        },
+                    )
+                    await queue.put(message)
+                wait_ms = (self._loop.time() - start) * 1000.0
+                if wait_ms >= 5.0:
+                    self.log.debug(
+                        "Ожидал освобождения места для текстовой команды",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "wait_ms": round(wait_ms, 2),
+                                "queue_size": queue.qsize(),
+                                "preview": self._payload_preview(text),
+                            }
+                        },
+                    )
+
+        self._schedule_coroutine(_enqueue_async, direct=direct)
 
     def send_tts(
         self,
@@ -426,7 +748,6 @@ class RobotAudioStream:
         sample_rate: int,
         *,
         text: str,
-        preset: str,
         chunk_index: int,
         chunks_total: int,
         volume: float,
@@ -438,31 +759,58 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
-            pcm,
-            sample_rate,
-            channels=channels,
-            volume=volume,
-        )
-        if prepared is None:
+        pcm_chunks = self._iter_playback_chunks(pcm, channels)
+        if not pcm_chunks:
+            self.log.warning("Получен пустой PCM для отправки TTS")
             return
-        payload, stats = prepared
 
-        self._broadcast_payload(payload, purpose="TTS")
+        session_metadata = {
+            "text": text,
+            "chunk_index": chunk_index,
+            "chunks_total": chunks_total,
+        }
+        if chunk_index <= 1:
+            self._start_playback_session(reason="tts", metadata=session_metadata)
 
-        self.log.debug(
-            "Сформирован TTS-кадр",
-            extra={
-                "attrs": {
-                    "text": text,
-                    "preset": preset,
-                    "chunk_index": chunk_index,
-                    "chunks_total": chunks_total,
-                    "volume": round(volume, 3),
-                    **stats,
-                }
-            },
-        )
+        total_chunks = len(pcm_chunks)
+        for playback_idx, pcm_chunk in enumerate(pcm_chunks, 1):
+            prepared = self._prepare_playback_payload(
+                pcm_chunk,
+                sample_rate,
+                channels=channels,
+                volume=volume,
+            )
+            if prepared is None:
+                continue
+            payload, stats = prepared
+
+            stats.update({
+                "playback_chunk": playback_idx,
+                "playback_total": total_chunks,
+            })
+
+            self._broadcast_payload(
+                payload,
+                purpose="TTS",
+                sequence=stats.get("sequence"),
+                pcm_bytes=stats.get("pcm_bytes"),
+            )
+
+            self.log.debug(
+                "Сформирован TTS-кадр",
+                extra={
+                    "attrs": {
+                        "text": text,
+                        "chunk_index": chunk_index,
+                        "chunks_total": chunks_total,
+                        "volume": round(volume, 3),
+                        **stats,
+                    }
+                },
+            )
+
+        if chunk_index >= chunks_total:
+            self._finish_playback_session(reason="tts", metadata=session_metadata)
 
     def send_effect(
         self,
@@ -482,32 +830,58 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, эффект не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
-            pcm,
-            sample_rate,
-            channels=channels,
-            volume=volume,
-        )
-        if prepared is None:
+        pcm_chunks = self._iter_playback_chunks(pcm, channels)
+        if not pcm_chunks:
+            self.log.warning("Получен пустой PCM для фонового эффекта", extra={"attrs": {"effect": name}})
             return
-        payload, stats = prepared
 
-        purpose = f"эффекта {name}"
-        self._broadcast_payload(payload, purpose=purpose)
+        session_metadata = {
+            "effect": name,
+            "source_file": source_file,
+            "repeat_index": repeat_index,
+            "repeat_total": repeat_total,
+        }
+        self._start_playback_session(reason="effect", metadata=session_metadata)
 
-        self.log.debug(
-            "Сформирован аудиокадр фонового эффекта",
-            extra={
-                "attrs": {
-                    "effect": name,
-                    "file": source_file,
-                    "repeat_index": repeat_index,
-                    "repeat_total": repeat_total,
-                    "volume": round(volume, 3),
-                    **stats,
-                }
-            },
-        )
+        total_chunks = len(pcm_chunks)
+        for playback_idx, pcm_chunk in enumerate(pcm_chunks, 1):
+            prepared = self._prepare_playback_payload(
+                pcm_chunk,
+                sample_rate,
+                channels=channels,
+                volume=volume,
+            )
+            if prepared is None:
+                continue
+            payload, stats = prepared
+            stats.update({
+                "playback_chunk": playback_idx,
+                "playback_total": total_chunks,
+            })
+
+            purpose = f"эффекта {name}"
+            self._broadcast_payload(
+                payload,
+                purpose=purpose,
+                sequence=stats.get("sequence"),
+                pcm_bytes=stats.get("pcm_bytes"),
+            )
+
+            self.log.debug(
+                "Сформирован аудиокадр фонового эффекта",
+                extra={
+                    "attrs": {
+                        "effect": name,
+                        "file": source_file,
+                        "repeat_index": repeat_index,
+                        "repeat_total": repeat_total,
+                        "volume": round(volume, 3),
+                        **stats,
+                    }
+                },
+            )
+
+        self._finish_playback_session(reason="effect", metadata=session_metadata)
 
     def forward_tts_chunk(
         self,
@@ -515,7 +889,6 @@ class RobotAudioStream:
         sample_rate: int,
         *,
         text: str,
-        preset: str,
         chunk_index: int,
         chunks_total: int,
         volume: float,
@@ -527,7 +900,6 @@ class RobotAudioStream:
                 pcm,
                 sample_rate,
                 text=text,
-                preset=preset,
                 chunk_index=chunk_index,
                 chunks_total=chunks_total,
                 volume=volume,

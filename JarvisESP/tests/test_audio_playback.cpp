@@ -1,5 +1,6 @@
 #include "audio_playback.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <string>
@@ -24,17 +25,15 @@ void write_f32(uint8_t* dst, float value) {
   std::memcpy(dst, &value, sizeof(float));
 }
 
-std::vector<uint8_t> build_playback_frame(uint32_t sequence,
-                                          uint32_t timestamp,
-                                          uint32_t sampleRate,
-                                          uint16_t channels,
-                                          uint32_t frameSamples,
-                                          float volume) {
+std::vector<uint8_t> build_playback_frame_with_pcm(uint32_t sequence,
+                                                   uint32_t timestamp,
+                                                   uint32_t sampleRate,
+                                                   uint16_t channels,
+                                                   uint32_t frameSamples,
+                                                   float volume,
+                                                   const std::vector<int16_t>& pcm) {
   const size_t pcmSamples = static_cast<size_t>(frameSamples) * channels;
-  std::vector<int16_t> pcm(pcmSamples);
-  for (size_t i = 0; i < pcmSamples; ++i) {
-    pcm[i] = static_cast<int16_t>((static_cast<int>(i) * 300) - 1000);
-  }
+  assert(pcm.size() == pcmSamples);
 
   std::vector<uint8_t> frame(HEADER_SIZE + pcmSamples * sizeof(int16_t), 0);
   frame[0] = 'A';
@@ -52,6 +51,20 @@ std::vector<uint8_t> build_playback_frame(uint32_t sequence,
   write_f32(&frame[32], 0.0f); // reserved
   std::memcpy(frame.data() + HEADER_SIZE, pcm.data(), pcmSamples * sizeof(int16_t));
   return frame;
+}
+
+std::vector<uint8_t> build_playback_frame(uint32_t sequence,
+                                          uint32_t timestamp,
+                                          uint32_t sampleRate,
+                                          uint16_t channels,
+                                          uint32_t frameSamples,
+                                          float volume) {
+  const size_t pcmSamples = static_cast<size_t>(frameSamples) * channels;
+  std::vector<int16_t> pcm(pcmSamples);
+  for (size_t i = 0; i < pcmSamples; ++i) {
+    pcm[i] = static_cast<int16_t>((static_cast<int>(i) * 300) - 1000);
+  }
+  return build_playback_frame_with_pcm(sequence, timestamp, sampleRate, channels, frameSamples, volume, pcm);
 }
 
 void test_decode_server_frame_success() {
@@ -124,6 +137,166 @@ void test_handle_requires_init() {
   assert(stats.lastError == "not-initialized");
 }
 
+void test_convert_silence_matches_reference() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  assert(AudioPlayback::init(cfg));
+
+  const std::vector<int16_t> pcm(8, 0);
+  const auto raw = build_playback_frame_with_pcm(11, 0, 16000, 1, 8, 1.0f, pcm);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+  const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame,
+                                                                     cfg.defaultVolume,
+                                                                     cfg.dacOutput);
+  assert(words.size() == pcm.size() * 2u);
+  for (size_t i = 0; i < pcm.size(); ++i) {
+    assert(words[i * 2u] == 0x8000u);     // левый канал
+    assert(words[i * 2u + 1u] == 0x8000u); // правый канал (тишина)
+  }
+
+  AudioPlayback::shutdown();
+}
+
+void test_convert_extremes_and_volume() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  assert(AudioPlayback::init(cfg));
+
+  // Проверяем насыщение при штатной громкости.
+  const std::vector<int16_t> pcmSaturated = {32767, -32768};
+  const auto rawSaturated = build_playback_frame_with_pcm(12, 0, 16000, 1, 2, 1.0f, pcmSaturated);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(rawSaturated.data(), rawSaturated.size(), frame, error));
+  auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame,
+                                                               cfg.defaultVolume,
+                                                               cfg.dacOutput);
+  assert(words.size() == pcmSaturated.size() * 2u);
+  assert(words[0] == 0xFF00u);
+  assert(words[1] == 0x8000u);
+  assert(words[2] == 0x0000u);
+  assert(words[3] == 0x8000u);
+
+  // А теперь проверяем уменьшение амплитуды при громкости 0.5.
+  const std::vector<int16_t> pcmHalf = {16384, -16384};
+  const auto rawHalf = build_playback_frame_with_pcm(13, 0, 16000, 1, 2, 0.5f, pcmHalf);
+  AudioPlayback::Frame frameHalf{};
+  assert(AudioPlayback::decode_server_frame(rawHalf.data(), rawHalf.size(), frameHalf, error));
+  words = AudioPlayback::detail::convert_pcm_to_dac_words(frameHalf,
+                                                          cfg.defaultVolume,
+                                                          cfg.dacOutput);
+  assert(words.size() == pcmHalf.size() * 2u);
+  assert(words[0] == 0xA000u);
+  assert(words[1] == 0x8000u);
+  assert(words[2] == 0x6000u);
+  assert(words[3] == 0x8000u);
+
+  AudioPlayback::shutdown();
+}
+
+void test_convert_stereo_downmix_rounding() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  assert(AudioPlayback::init(cfg));
+
+  const std::vector<int16_t> pcm = {32767, -32768};
+  const auto raw = build_playback_frame_with_pcm(13, 0, 16000, 2, 1, 1.0f, pcm);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+  const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame,
+                                                                     cfg.defaultVolume,
+                                                                     cfg.dacOutput);
+  assert(words.size() == 2u);
+  // Усреднение (32767 + -32768) / 2 = -1 -> 0x7F00 после смещения (левый канал).
+  assert(words[0] == 0x7F00u);
+  assert(words[1] == 0x8000u);
+
+  AudioPlayback::shutdown();
+}
+
+void test_convert_matches_reference_sketch() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  assert(AudioPlayback::init(cfg));
+
+  const std::vector<int16_t> pcm = {0, 1024, -1024, 8192, -8192};
+  const auto raw = build_playback_frame_with_pcm(21, 0, 16000, 1, pcm.size(), 1.0f, pcm);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+  const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame,
+                                                                     cfg.defaultVolume,
+                                                                     cfg.dacOutput);
+  assert(words.size() == pcm.size() * 2u);
+
+  for (size_t i = 0; i < pcm.size(); ++i) {
+    const int32_t shifted = static_cast<int32_t>(pcm[i]) + 32768;
+    const uint8_t expectedByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
+    const uint16_t expectedWord = static_cast<uint16_t>(static_cast<uint16_t>(expectedByte) << 8);
+    assert(words[i * 2u] == expectedWord);
+    assert(words[i * 2u + 1u] == 0x8000u);
+  }
+
+  AudioPlayback::shutdown();
+}
+
+void test_convert_mirror_layout() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  cfg.dacOutput = AudioPlayback::DacOutput::MirrorBoth;
+  assert(AudioPlayback::init(cfg));
+
+  const std::vector<int16_t> pcm = {0, 2048, -2048};
+  const auto raw = build_playback_frame_with_pcm(30, 0, 16000, 1, pcm.size(), 1.0f, pcm);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+
+  const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame,
+                                                                     cfg.defaultVolume,
+                                                                     cfg.dacOutput);
+  assert(words.size() == pcm.size() * 2u);
+  for (size_t i = 0; i < pcm.size(); ++i) {
+    const int32_t shifted = static_cast<int32_t>(pcm[i]) + 32768;
+    const uint8_t expectedByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
+    const uint16_t expectedWord = static_cast<uint16_t>(static_cast<uint16_t>(expectedByte) << 8);
+    assert(words[i * 2u] == expectedWord);
+    assert(words[i * 2u + 1u] == expectedWord);
+  }
+
+  AudioPlayback::shutdown();
+}
+
+void test_convert_right_only_layout() {
+  AudioPlayback::Config cfg{};
+  cfg.defaultSampleRate = 16000;
+  cfg.dacOutput = AudioPlayback::DacOutput::RightOnly;
+  assert(AudioPlayback::init(cfg));
+
+  const std::vector<int16_t> pcm = {0, 4096, -4096};
+  const auto raw = build_playback_frame_with_pcm(31, 0, 16000, 1, pcm.size(), 1.0f, pcm);
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+
+  const auto words = AudioPlayback::detail::convert_pcm_to_dac_words(frame,
+                                                                     cfg.defaultVolume,
+                                                                     cfg.dacOutput);
+  assert(words.size() == pcm.size() * 2u);
+  for (size_t i = 0; i < pcm.size(); ++i) {
+    const int32_t shifted = static_cast<int32_t>(pcm[i]) + 32768;
+    const uint8_t expectedByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
+    const uint16_t expectedWord = static_cast<uint16_t>(static_cast<uint16_t>(expectedByte) << 8);
+    assert(words[i * 2u] == 0x8000u);            // левый канал глушим тишиной
+    assert(words[i * 2u + 1u] == expectedWord);  // правый несёт полезный сигнал
+  }
+
+  AudioPlayback::shutdown();
+}
+
 } // namespace
 
 int main() {
@@ -132,6 +305,12 @@ int main() {
   test_decode_server_frame_rejects_magic();
   test_handle_frame_updates_stats();
   test_handle_requires_init();
+  test_convert_silence_matches_reference();
+  test_convert_extremes_and_volume();
+  test_convert_stereo_downmix_rounding();
+  test_convert_matches_reference_sketch();
+  test_convert_mirror_layout();
+  test_convert_right_only_layout();
   return 0;
 }
 

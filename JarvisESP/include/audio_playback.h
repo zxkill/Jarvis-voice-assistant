@@ -1,7 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -15,6 +18,20 @@ enum class OutputMode : uint8_t {
 };
 
 /**
+ * \brief Конфигурация раскладки ЦАП.
+ *
+ * Встроенный I2S-DAC ESP32 содержит два независимых выхода (DAC1=GPIO25,
+ * DAC2=GPIO26).  Робот использует только первый канал, однако в отладочных
+ * стендах нередко подключают усиливающий модуль ко второму.  Поэтому даём
+ * возможность выбрать явный канал либо задублировать сигнал на оба выхода.
+ */
+enum class DacOutput : uint8_t {
+  LeftOnly = 0,   ///< Выводим звук только на DAC1 (GPIO25), правый канал держим в точке 0x8000.
+  RightOnly = 1,  ///< Выводим звук только на DAC2 (GPIO26), левый остаётся тишиной.
+  MirrorBoth = 2, ///< Дублируем сигнал на оба выхода (левый и правый получают одинаковые значения).
+};
+
+/**
  * \brief Конфигурация приёмника аудиопотока от сервера.
  */
 struct Config {
@@ -24,6 +41,7 @@ struct Config {
   size_t queueCapacity = 6;                  ///< Максимальное количество кадров в очереди.
   float defaultVolume = 1.0f;                ///< Усиление, применяемое при отсутствии указания в кадре.
   uint32_t idleMuteDelayMs = 250;            ///< Задержка (мс) без аудиокадров, после которой тракт переводится в режим тишины.
+  DacOutput dacOutput = DacOutput::LeftOnly; ///< Какой выход встроенного ЦАП активен.
 };
 
 /**
@@ -96,6 +114,154 @@ bool handle_server_frame(const uint8_t* payload, size_t length);
  * \return true, если кадр успешно разобран.
  */
 bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std::string& error);
+
+namespace detail {
+
+/**
+ * \brief Конвертирует интерливированный PCM16 в стереопару DAC-слов ESP32.
+ *
+ * Функция вынесена в заголовок в inline-формате, чтобы модульные тесты на
+ * хосте могли гарантированно использовать ту же математику, что и прошивка.
+ * Возвращает готовый буфер с чередованием L/R (левый канал заполняется
+ * конвертированным значением, правый удерживается в центре диапазона).
+ * Дополнительно при необходимости заполняет диагностические параметры.
+ */
+inline std::vector<uint16_t> convert_pcm_to_dac_words(const Frame& frame,
+                                                      float defaultVolume,
+                                                      DacOutput layout,
+                                                      int32_t* outMin = nullptr,
+                                                      int32_t* outMax = nullptr,
+                                                      uint32_t* clipped = nullptr,
+                                                      float* appliedVolume = nullptr) {
+  // Реализация копирует проверенный эталон, который разработчик приводил
+  // в виде минимального Arduino-скетча: исходные PCM16 переводятся в
+  // «смещённый» 8-битный диапазон 0..255 простым сдвигом. Далее значение
+  // записывается либо в единственный активный канал, либо дублируется на оба
+  // вывода — в зависимости от настроек `dacOutput`.
+  std::vector<uint16_t> out;
+  if (frame.samples.empty()) {
+    if (outMin) {
+      *outMin = std::numeric_limits<int32_t>::max();
+    }
+    if (outMax) {
+      *outMax = std::numeric_limits<int32_t>::min();
+    }
+    if (clipped) {
+      *clipped = 0;
+    }
+    if (appliedVolume) {
+      *appliedVolume = defaultVolume;
+    }
+    return out;
+  }
+
+  const uint16_t channels = frame.channels == 0 ? 1 : frame.channels;
+  const size_t samplesPerChannel = frame.samples.size() / channels;
+  if (samplesPerChannel == 0) {
+    if (outMin) {
+      *outMin = std::numeric_limits<int32_t>::max();
+    }
+    if (outMax) {
+      *outMax = std::numeric_limits<int32_t>::min();
+    }
+    if (clipped) {
+      *clipped = 0;
+    }
+    if (appliedVolume) {
+      *appliedVolume = defaultVolume;
+    }
+    return out;
+  }
+
+  constexpr uint16_t kDacMidWord = 0x8000u;
+  // Независимо от выбранной раскладки всегда формируем стереопару L/R, как в
+  // проверенном пользователем эталонном скетче. Это гарантирует, что I2S,
+  // работающий в формате RIGHT_LEFT, получает полный набор слов и не "теряет"
+  // данные на стыке кадров.
+  constexpr size_t wordsPerSample = 2u;
+  out.assign(samplesPerChannel * wordsPerSample, kDacMidWord);
+
+  const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
+                                    ? frame.volume
+                                    : defaultVolume;
+  const float clampedVolume = std::clamp(requestedVolume, 0.0f, 4.0f);
+  if (appliedVolume) {
+    *appliedVolume = clampedVolume;
+  }
+
+  int32_t inputMin = std::numeric_limits<int32_t>::max();
+  int32_t inputMax = std::numeric_limits<int32_t>::min();
+  uint32_t clippedSamples = 0;
+
+  for (size_t i = 0; i < samplesPerChannel; ++i) {
+    int32_t mixed = 0;
+    for (uint16_t ch = 0; ch < channels; ++ch) {
+      const int32_t value = static_cast<int32_t>(frame.samples[i * channels + ch]);
+      inputMin = std::min(inputMin, value);
+      inputMax = std::max(inputMax, value);
+      mixed += value;
+    }
+
+    if (channels > 1) {
+      if (mixed >= 0) {
+        mixed = (mixed + (channels / 2)) / static_cast<int32_t>(channels);
+      } else {
+        mixed = (mixed - (channels / 2)) / static_cast<int32_t>(channels);
+      }
+    }
+
+    const float scaled = static_cast<float>(mixed) * clampedVolume;
+    int32_t sample = static_cast<int32_t>(std::lrintf(scaled));
+    if (sample < -32768) {
+      sample = -32768;
+      clippedSamples++;
+    } else if (sample > 32767) {
+      sample = 32767;
+      clippedSamples++;
+    }
+
+    const int32_t shifted = sample + 32768; // переводим -32768..32767 в 0..65535
+    const uint8_t dacByte = static_cast<uint8_t>(std::clamp<int32_t>(shifted >> 8, 0, 255));
+    const uint16_t dacWord = static_cast<uint16_t>(static_cast<uint16_t>(dacByte) << 8);
+
+    const size_t leftIndex = i * wordsPerSample;
+    const size_t rightIndex = leftIndex + 1u;
+
+    switch (layout) {
+      case DacOutput::LeftOnly:
+        // Стандартная разводка робота: подаём звук только на DAC1 (GPIO25),
+        // второй канал принудительно держим в центре диапазона (тишина).
+        out[leftIndex] = dacWord;
+        // правый канал уже заполнен значением kDacMidWord
+        break;
+      case DacOutput::RightOnly:
+        // Лабораторный режим: звук отправляется на DAC2 (GPIO26), а левый канал
+        // затираем тишиной, чтобы в основной колонке не появлялся шум.
+        out[rightIndex] = dacWord;
+        break;
+      case DacOutput::MirrorBoth:
+        // Диагностический режим: дублируем сигнал на оба выхода, чтобы услышать
+        // звук независимо от подключённого канала.
+        out[leftIndex] = dacWord;
+        out[rightIndex] = dacWord;
+        break;
+    }
+  }
+
+  if (outMin) {
+    *outMin = inputMin;
+  }
+  if (outMax) {
+    *outMax = inputMax;
+  }
+  if (clipped) {
+    *clipped = clippedSamples;
+  }
+
+  return out;
+}
+
+} // namespace detail
 
 } // namespace AudioPlayback
 
