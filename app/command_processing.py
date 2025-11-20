@@ -10,7 +10,7 @@ Jarvis: разбор фраз, поиск совпадений с именем �
 from typing import Any, Dict, List
 
 import asyncio
-from contextvars import Token
+from contextvars import Token, copy_context
 from rapidfuzz import fuzz
 
 import jarvis_skills
@@ -435,7 +435,16 @@ async def va_respond(voice: str) -> bool:
         getattr(jarvis_skills, "set_main_loop", lambda loop: None)(
             asyncio.get_running_loop()
         )
-        if await asyncio.to_thread(handle_utterance, cmd):
+        # ``handle_utterance`` исполняется в пуле потоков, поэтому
+        # копируем контекст, чтобы туда попали текущий источник запроса
+        # (голос/Telegram) и trace_id. Иначе навыки получают значение
+        # по умолчанию ``voice`` и пытаются озвучить ответ вместо
+        # отправки текста в Telegram, что приводит к ошибкам воспроизведения.
+        ctx = copy_context()
+        log.debug(
+            "dispatching utterance via thread with source=%s", get_request_source()
+        )
+        if await asyncio.to_thread(ctx.run, handle_utterance, cmd):
             return True
         raw = await filter_cmd(cmd)
         raw_norm = normalize(raw)

@@ -12,7 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.request_source import set_request_source, reset_request_source
+from core.request_source import (
+    get_request_source,
+    reset_request_source,
+    set_request_source,
+)
 
 
 def _load_cp(monkeypatch):
@@ -73,6 +77,31 @@ def test_va_respond_processes_telegram_without_alias(monkeypatch):
 
     asyncio.run(run())
     assert called["cmd"] == "проверка"
+
+
+def test_va_respond_keeps_context_for_skills(monkeypatch):
+    """Контекст источника Telegram должен дойти до навыков в потоке."""
+
+    cp = _load_cp(monkeypatch)
+
+    observed: list[str] = []
+
+    def fake_handle(cmd: str) -> bool:
+        # Фиксируем источник запроса, чтобы убедиться, что контекст не потерян.
+        observed.append(f"{cmd}:{get_request_source()}")
+        return True
+
+    monkeypatch.setattr(cp, "handle_utterance", fake_handle)
+
+    async def run():
+        token = set_request_source("telegram")
+        try:
+            assert await cp.va_respond("ответ в телеграм") is True
+        finally:
+            reset_request_source(token)
+
+    asyncio.run(run())
+    assert observed == ["ответ в телеграм:telegram"]
 
 
 def test_suggestion_answer_bypasses_handlers(monkeypatch):
