@@ -99,6 +99,7 @@ def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
 
     async def _ticker() -> None:
         """Циклически вызываем ``tick`` с указанным интервалом."""
+
         while True:
             log.debug("tick поведенческого дерева")
             tree.tick()
@@ -107,13 +108,28 @@ def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
     # Запускаем асинхронную задачу тикера
     ticker = asyncio.create_task(_ticker())
 
-    def _stop_tree() -> bool:
-        """Остановить тикер и само дерево при завершении приложения."""
+    stopped = False
 
+    def _stop_tree() -> bool:
+        """Остановить тикер и корректно завершить поведенческое дерево."""
+
+        nonlocal stopped
+
+        # Не допускаем повторного вызова остановки, чтобы избежать шума в логах
+        # и попыток отменить уже завершённый таск.
+        if stopped:
+            log.debug("Поведенческое дерево уже остановлено, пропускаю повторный вызов")
+            return False
+
+        stopped = True
         log.info("Останавливаю поведенческое дерево")
         ticker.cancel()
         try:
-            tree.stop()
+            # Используем штатный метод ``shutdown`` от ``py_trees``, чтобы
+            # корректно завершить дерево без ``AttributeError``.
+            tree.shutdown()
+        except asyncio.CancelledError:
+            log.debug("Тикер поведенческого дерева уже отменён")
         except Exception:  # pragma: no cover - защита от редких ошибок
             log.exception("ошибка остановки дерева")
         return True
