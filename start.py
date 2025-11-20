@@ -17,6 +17,11 @@ import threading
 from collections import deque
 from typing import Any
 
+# Импортируем аудиопоток робота на уровне модуля, чтобы не получать NameError
+# при раннем запуске ``start_robot_audio_stream`` до ленивых импортов внутри
+# ``main``. Это гарантирует наличие класса в глобальной области видимости.
+from audio.robot_stream import RobotAudioStream, RobotStreamClosed
+
 from display import DisplayItem, init_driver, DisplayDriver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
@@ -273,8 +278,6 @@ async def main() -> None:
     from analysis.mood_visualizer import watch_mood_history
     import vosk
     import yaml
-    from audio.robot_stream import RobotAudioStream, RobotStreamClosed
-
     EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
     EmotionSoundDriver()           # звуки при смене эмоций
 
