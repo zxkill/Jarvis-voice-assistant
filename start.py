@@ -17,6 +17,11 @@ import threading
 from collections import deque
 from typing import Any
 
+# Импортируем аудиопоток робота на уровне модуля, чтобы не получать NameError
+# при раннем запуске ``start_robot_audio_stream`` до ленивых импортов внутри
+# ``main``. Это гарантирует наличие класса в глобальной области видимости.
+from audio.robot_stream import RobotAudioStream, RobotStreamClosed
+
 from display import DisplayItem, init_driver, DisplayDriver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
 from core import stop as stop_mgr
@@ -32,8 +37,35 @@ tg_stop_event = threading.Event()
 tg_task: asyncio.Task | None = None
 # Флаг, предотвращающий повторную обработку сигнала завершения.
 _shutdown_flag = threading.Event()
+# Текущий event loop основного приложения. Используется, чтобы корректно
+# останавливать цикл из обработчика сигналов, не полагаясь на исключения.
+_main_loop: asyncio.AbstractEventLoop | None = None
 
 # ────────────────────────── SIGNALS ──────────────────────────────
+
+def _request_loop_stop() -> None:
+    """Аккуратно останавливает основной event loop.
+
+    Функция отделена для удобства тестирования и переиспользования: она
+    вызывается из обработчика сигналов и может быть применена из других
+    мест, если потребуется.
+    """
+
+    global _main_loop
+
+    if _main_loop is None:
+        # Если цикл ещё не успел стартовать, завершаем процесс жёстко, иначе
+        # приложение может зависнуть в неопределённом состоянии.
+        log.warning(
+            "Основной event loop не инициализирован, завершаю процесс через sys.exit"
+        )
+        sys.exit(0)
+
+    # Планируем остановку loop в потоко-безопасном режиме, чтобы не ловить
+    # ``RuntimeError: Event loop stopped before Future completed``.
+    log.debug("Передаю команду остановки в event loop")
+    _main_loop.call_soon_threadsafe(_main_loop.stop)
+
 
 def _shutdown(signum: int, frame: Any):
     """Корректное завершение по Ctrl‑C/SIGTERM."""
@@ -55,12 +87,9 @@ def _shutdown(signum: int, frame: Any):
     # и другие обработчики), чтобы выход был максимально быстрым.
     log.info("Останавливаю фоновые подсистемы")
     stop_mgr.trigger()
-    # Сообщаем в лог о завершении и немедленно выходим через ``SystemExit``.
-    # Такой подход не вмешивается в текущий ``event loop`` и исключает
-    # ошибку ``RuntimeError: Event loop stopped before Future completed``.
+    # Сообщаем в лог о завершении и просим event loop корректно завершиться.
     log.info("Ассистент завершил работу по запросу пользователя")
-    log.debug("Завершение приложения через SystemExit")
-    raise SystemExit(0)
+    _request_loop_stop()
 
 signal.signal(signal.SIGINT, _shutdown)
 signal.signal(signal.SIGTERM, _shutdown)
@@ -99,6 +128,7 @@ def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
 
     async def _ticker() -> None:
         """Циклически вызываем ``tick`` с указанным интервалом."""
+
         while True:
             log.debug("tick поведенческого дерева")
             tree.tick()
@@ -107,13 +137,28 @@ def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
     # Запускаем асинхронную задачу тикера
     ticker = asyncio.create_task(_ticker())
 
-    def _stop_tree() -> bool:
-        """Остановить тикер и само дерево при завершении приложения."""
+    stopped = False
 
+    def _stop_tree() -> bool:
+        """Остановить тикер и корректно завершить поведенческое дерево."""
+
+        nonlocal stopped
+
+        # Не допускаем повторного вызова остановки, чтобы избежать шума в логах
+        # и попыток отменить уже завершённый таск.
+        if stopped:
+            log.debug("Поведенческое дерево уже остановлено, пропускаю повторный вызов")
+            return False
+
+        stopped = True
         log.info("Останавливаю поведенческое дерево")
         ticker.cancel()
         try:
-            tree.stop()
+            # Используем штатный метод ``shutdown`` от ``py_trees``, чтобы
+            # корректно завершить дерево без ``AttributeError``.
+            tree.shutdown()
+        except asyncio.CancelledError:
+            log.debug("Тикер поведенческого дерева уже отменён")
         except Exception:  # pragma: no cover - защита от редких ошибок
             log.exception("ошибка остановки дерева")
         return True
@@ -123,8 +168,68 @@ def start_behavior_tree(interval: float = 1.0) -> BehaviourTree:
     log.info("Поведенческое дерево запущено")
     return tree
 
+
+async def start_robot_audio_stream(
+    cfg: configparser.ConfigParser,
+) -> RobotAudioStream | None:
+    """Запустить WebSocket‑поток аудио робота с отказоустойчивостью.
+
+    Возвращает экземпляр ``RobotAudioStream`` при успешном старте или ``None``
+    при сетевой ошибке (например, если интерфейс недоступен или порт занят).
+    Такой режим нужен, когда ассистент используется только через Telegram и
+    воспроизводить звук некуда: падающий сервер не должен обрывать обработку
+    сообщений.
+    """
+
+    robot_audio_endpoint = cfg.get(
+        "ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/"
+    )
+    robot_subprotocol = cfg.get("ROBOT_AUDIO", "subprotocol", fallback="").strip() or None
+    robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
+    ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
+    ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
+
+    audio_stream = RobotAudioStream(
+        endpoint=robot_audio_endpoint,
+        queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
+        expected_sample_rate=cfg.getint("AUDIO", "sample_rate", fallback=16000),
+        expected_channels=2,
+        subprotocol=robot_subprotocol,
+        authorization=robot_auth,
+        ping_interval=ping_interval,
+        ping_timeout=ping_timeout,
+    )
+
+    try:
+        await audio_stream.start()
+    except OSError as exc:
+        log.error(
+            "Не удалось запустить WebSocket-сервер аудио робота",
+            exc_info=exc,
+            extra={
+                "attrs": {
+                    "endpoint": robot_audio_endpoint,
+                    "hint": "проверьте доступность интерфейса или смените endpoint на 0.0.0.0/127.0.0.1",
+                }
+            },
+        )
+        log.info(
+            "Перехожу в режим без робота: отвечаю в Telegram/текстом без WebSocket-потока",
+            extra={"attrs": {"endpoint": robot_audio_endpoint}},
+        )
+        return None
+
+    return audio_stream
+
 async def main() -> None:
     """Инициализация и основной цикл ассистента."""
+
+    # Сохраняем ссылку на текущий event loop, чтобы обработчик сигналов мог
+    # корректно его остановить. Такой подход устраняет зависания при Ctrl+C,
+    # когда исключение в сигнале может быть проглочено.
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+    log.debug("Основной event loop сохранён для управляемого завершения")
 
     # 0. Загружаем конфиг и инициализируем дисплей как можно раньше,
     # чтобы возможные ошибки были показаны до старта тяжёлых подсистем.
@@ -173,8 +278,6 @@ async def main() -> None:
     from analysis.mood_visualizer import watch_mood_history
     import vosk
     import yaml
-    from audio.robot_stream import RobotAudioStream, RobotStreamClosed
-
     EmotionDisplayDriver()         # мост: эмоции → выбранный драйвер дисплея
     EmotionSoundDriver()           # звуки при смене эмоций
 
@@ -288,48 +391,33 @@ async def main() -> None:
         cfg.getboolean("ROBOT_AUDIO", "local_playback", fallback=False)
     )
 
-    robot_audio_endpoint = cfg.get("ROBOT_AUDIO", "endpoint", fallback="ws://127.0.0.1:8765/")
-    if not robot_audio_endpoint:
-        raise RuntimeError("Не задан endpoint WebSocket для аудиопотока робота")
-    robot_subprotocol = cfg.get("ROBOT_AUDIO", "subprotocol", fallback="").strip() or None
-    robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
-    ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
-    ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
+    audio_stream = await start_robot_audio_stream(cfg)
+    if audio_stream is not None:
+        stop_mgr.register(audio_stream.stop)
+        working_tts.register_stream_listener(audio_stream.forward_tts_chunk)
+        sounds.register_stream_listener(audio_stream.forward_effect_chunk)
 
-    audio_stream = RobotAudioStream(
-        endpoint=robot_audio_endpoint,
-        queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
-        expected_sample_rate=expected_sample_rate,
-        expected_channels=2,
-        subprotocol=robot_subprotocol,
-        authorization=robot_auth,
-        ping_interval=ping_interval,
-        ping_timeout=ping_timeout,
-    )
-    await audio_stream.start()
-    stop_mgr.register(audio_stream.stop)
-    working_tts.register_stream_listener(audio_stream.forward_tts_chunk)
-    sounds.register_stream_listener(audio_stream.forward_effect_chunk)
+    if audio_stream is not None:
+        def _detach_tts() -> bool:
+            """Отвязывает поток TTS от робота при остановке приложения."""
 
-    def _detach_tts() -> bool:
-        """Отвязывает поток TTS от робота при остановке приложения."""
+            working_tts.unregister_stream_listener(audio_stream.forward_tts_chunk)
+            return True
 
-        working_tts.unregister_stream_listener(audio_stream.forward_tts_chunk)
-        return True
+        stop_mgr.register(_detach_tts)
 
-    stop_mgr.register(_detach_tts)
+        def _detach_effects() -> bool:
+            """Удаляет слушателя фоновых эффектов при остановке."""
 
-    def _detach_effects() -> bool:
-        """Удаляет слушателя фоновых эффектов при остановке."""
+            sounds.unregister_stream_listener(audio_stream.forward_effect_chunk)
+            return True
 
-        sounds.unregister_stream_listener(audio_stream.forward_effect_chunk)
-        return True
-
-    stop_mgr.register(_detach_effects)
-    log.info(
-        "WebSocket-приёмник аудио готов",
-        extra={"attrs": {"endpoint": robot_audio_endpoint}},
-    )
+        stop_mgr.register(_detach_effects)
+    if audio_stream is not None:
+        log.info(
+            "WebSocket-приёмник аудио готов",
+            extra={"attrs": {"endpoint": audio_stream._parsed.geturl()}},
+        )
 
     # Кольцевой буфер на ~1.5 секунды аудио.
     # Размер maxlen вычисляется после получения первого кадра, потому что
@@ -371,6 +459,17 @@ async def main() -> None:
             publish(Event(kind=kind, attrs={"text": text, "trace_id": trace_id}))
         finally:
             publish(Event(kind="user_query_ended", attrs={"text": text, "trace_id": trace_id}))
+
+    if audio_stream is None:
+        log.warning(
+            "Аудиопоток робота недоступен: остаёмся в режиме Telegram/текста",
+            extra={"attrs": {"telegram_active": app_cfg.telegram.token != ""}},
+        )
+        # Ждём сигнала остановки или отмены тасков, сохраняя активным Telegram.
+        while not tg_stop_event.is_set() and not _shutdown_flag.is_set():
+            await asyncio.sleep(0.5)
+        log.info("Остановлен режим без аудиопотока по запросу пользователя")
+        return
 
     while True:
         try:
