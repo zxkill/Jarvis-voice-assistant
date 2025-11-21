@@ -56,6 +56,16 @@ class IntelConfig:
 
 
 @dataclass
+class LlmConfig:
+    """Параметры выбора бэкенда LLM."""
+
+    provider: str
+    xiaozhi_url: str
+    xiaozhi_agent_code: str
+    xiaozhi_timeout: float
+
+
+@dataclass
 class TelegramConfig:
     """Конфигурация для Telegram‑бота."""
 
@@ -87,6 +97,7 @@ class AppConfig:
 
     user: UserConfig
     intel: IntelConfig
+    llm: LlmConfig
     telegram: TelegramConfig
     presence: PresenceConfig
     quiet: QuietConfig
@@ -155,6 +166,19 @@ def load_config(path: str = "config.ini") -> AppConfig:
         if section not in parser:
             raise ConfigError(f"Missing section '{section}'")
 
+    # Секция LLM может отсутствовать в старых конфигурациях, поэтому подставляем
+    # значения по умолчанию, чтобы не ломать обратную совместимость.
+    if "LLM" not in parser:
+        parser.add_section("LLM")
+        parser.set("LLM", "provider", os.getenv("LLM_PROVIDER", "local"))
+        parser.set(
+            "LLM",
+            "xiaozhi_url",
+            os.getenv("XIAOZHI_URL", "https://api.tenclass.net/xiaozhi/chat"),
+        )
+        parser.set("LLM", "xiaozhi_agent_code", os.getenv("XIAOZHI_AGENT", ""))
+        parser.set("LLM", "xiaozhi_timeout", os.getenv("XIAOZHI_TIMEOUT", "40"))
+
     # Формируем dataclass-объекты для каждой секции конфигурации
     user = UserConfig(
         name=_require(parser, "USER", "name"),
@@ -167,6 +191,18 @@ def load_config(path: str = "config.ini") -> AppConfig:
     intel = IntelConfig(
         api_key=_env_or_cfg(parser, "INTEL", "api_key", "INTEL_API_KEY"),
         absent_after_sec=parser.getfloat("INTEL", "absent_after_sec"),
+    )
+    llm = LlmConfig(
+        provider=parser.get("LLM", "provider", fallback="local").strip().lower(),
+        xiaozhi_url=_env_or_cfg(
+            parser,
+            "LLM",
+            "xiaozhi_url",
+            "XIAOZHI_URL",
+            default="https://api.tenclass.net/xiaozhi/chat",
+        ),
+        xiaozhi_agent_code=parser.get("LLM", "xiaozhi_agent_code", fallback=""),
+        xiaozhi_timeout=parser.getfloat("LLM", "xiaozhi_timeout", fallback=40.0),
     )
     telegram = TelegramConfig(
         token=_env_or_cfg(parser, "TELEGRAM", "token", "TELEGRAM_TOKEN")
@@ -193,6 +229,7 @@ def load_config(path: str = "config.ini") -> AppConfig:
     return AppConfig(
         user=user,
         intel=intel,
+        llm=llm,
         telegram=telegram,
         presence=presence,
         quiet=quiet,

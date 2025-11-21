@@ -23,6 +23,8 @@ import requests
 
 from context import long_term, short_term, current_date
 from memory import long_memory, preferences
+from core.config import load_config
+from core.xiaozhi_client import XiaozhiClient, XiaozhiSettings
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,11 @@ PROFILES = {
 
 # Базовый URL локального сервера Ollama
 BASE_URL = "http://localhost:11434"
+
+# Конфигурация бэкенда LLM загружается из config.ini один раз, чтобы
+# ускорить дальнейшие вызовы и не читать файл при каждом обращении.
+_APP_CFG = load_config()
+LLM_BACKEND = os.getenv("LLM_PROVIDER", _APP_CFG.llm.provider)
 
 # Файл для записи подробных запросов и ответов LLM. Путь можно переопределить
 # переменной окружения ``LLM_LOG_FILE``.  По умолчанию журнал создаётся в
@@ -199,6 +206,21 @@ def _query_ollama(prompt: str, profile: str, trace_id: str = "") -> str:
         extra={"length": len(text), "trace_id": trace_id, "legacy": use_legacy},
     )
     return text
+
+
+def _query_xiaozhi(prompt: str, trace_id: str = "") -> str:
+    """Отправить запрос в облачный сервис Xiaozhi."""
+
+    settings = XiaozhiSettings(
+        endpoint=_APP_CFG.llm.xiaozhi_url,
+        agent_code=_APP_CFG.llm.xiaozhi_agent_code,
+        timeout=_APP_CFG.llm.xiaozhi_timeout,
+    )
+    if not settings.agent_code:
+        raise RuntimeError("В конфигурации не указан share code агента Xiaozhi")
+
+    client = XiaozhiClient(settings)
+    return client.ask(prompt, trace_id=trace_id)
 
 
 def _query_ollama_stream(prompt: str, profile: str, trace_id: str = "") -> Iterable[str]:
@@ -366,7 +388,13 @@ def _run(
         )
         raise
     logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
-    reply = _query_ollama(prompt, profile=profile, trace_id=trace_id)
+    # Выбираем бэкенд в зависимости от конфигурации: локальная Ollama или
+    # облачный агент Xiaozhi. Облачный вариант полезен, когда хочется
+    # бесплатный сетевой ИИ без нагрузки на устройство.
+    if LLM_BACKEND == "xiaozhi":
+        reply = _query_xiaozhi(prompt, trace_id=trace_id)
+    else:
+        reply = _query_ollama(prompt, profile=profile, trace_id=trace_id)
     # Логируем каждый запрос и ответ в отдельный файл для последующего анализа
     _log_llm_exchange(
         stage=prompt_name,
@@ -415,6 +443,30 @@ def _run_stream(
         )
         raise
     logger.debug("Готовый prompt %s: %s", prompt_name, prompt)
+
+    if LLM_BACKEND == "xiaozhi":
+        # Потоковый вывод эмулируем: возвращаем генератор, который отдаёт
+        # единый ответ и завершает последовательность.
+        def _single_chunk() -> Iterable[str]:
+            collected = _query_xiaozhi(prompt, trace_id=trace_id)
+            yield collected
+            _log_llm_exchange(
+                stage=prompt_name,
+                prompt=prompt,
+                reply=collected,
+                trace_id=trace_id,
+                context=str(kwargs.get("context", "")),
+            )
+            if user_input:
+                short_term.add({"trace_id": trace_id, "user": user_input, "reply": collected})
+                long_term.add_daily_event(
+                    f"user: {user_input}\nassistant: {collected}", [prompt_name]
+                )
+            else:
+                short_term.add({"stage": prompt_name, "text": collected})
+            logger.info("Ответ %s: %s", prompt_name, collected)
+
+        return _single_chunk()
 
     stream = _query_ollama_stream(prompt, profile=profile, trace_id=trace_id)
 
