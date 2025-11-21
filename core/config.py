@@ -174,7 +174,7 @@ def load_config(path: str = "config.ini") -> AppConfig:
         parser.set(
             "LLM",
             "xiaozhi_url",
-            os.getenv("XIAOZHI_URL", "https://api.tenclass.net/xiaozhi/chat"),
+            os.getenv("XIAOZHI_URL", "wss://api.tenclass.net/xiaozhi/v1/"),
         )
         parser.set("LLM", "xiaozhi_agent_code", os.getenv("XIAOZHI_AGENT", ""))
         parser.set("LLM", "xiaozhi_timeout", os.getenv("XIAOZHI_TIMEOUT", "40"))
@@ -199,7 +199,7 @@ def load_config(path: str = "config.ini") -> AppConfig:
             "LLM",
             "xiaozhi_url",
             "XIAOZHI_URL",
-            default="https://api.tenclass.net/xiaozhi/chat",
+            default="wss://api.tenclass.net/xiaozhi/v1/",
         ),
         xiaozhi_agent_code=parser.get("LLM", "xiaozhi_agent_code", fallback=""),
         xiaozhi_timeout=parser.getfloat("LLM", "xiaozhi_timeout", fallback=40.0),

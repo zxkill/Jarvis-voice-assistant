@@ -198,9 +198,11 @@ class XiaozhiClient:
     def _derive_ws_endpoint(self) -> Optional[str]:
         """Попробовать вычислить WebSocket‑адрес из HTTP URL.
 
-        Это помогает в ситуации, когда в конфиге указан HTTP путь, а сервис
-        обрабатывает только WebSocket соединения. Меняем схему на ws/wss и
-        добавляем суффикс ``/ws`` если он отсутствует, подражая прошивке ESP32.
+        Если видим официальный домен ``api.tenclass.net``, строим канонический
+        путь ``/xiaozhi/v1/`` — он прописан в исходниках сервера и в OTA
+        распаковке клиента. Для остальных адресов сохраняем мягкую схему
+        http→ws и добавляем суффикс ``/ws`` для обратной совместимости с
+        самодельными прокси.
         """
 
         parsed = urlparse(self.settings.endpoint)
@@ -208,6 +210,19 @@ class XiaozhiClient:
             return None
 
         ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+
+        # Специальный кейс: официальный CDN api.tenclass.net публикует
+        # WebSocket на пути /xiaozhi/v1/, поэтому не полагаемся на путь из
+        # конфига, а подставляем известный шаблон.
+        if parsed.hostname and "api.tenclass.net" in parsed.hostname:
+            candidate = parsed._replace(scheme=ws_scheme, path="/xiaozhi/v1/")
+            derived = urlunparse(candidate)
+            logger.debug(
+                "Автоконвертация HTTP → WebSocket для официального Xiaozhi",
+                extra={"source": self.settings.endpoint, "derived": derived},
+            )
+            return derived
+
         path = parsed.path
         if not path.endswith("/ws"):
             path = f"{path.rstrip('/')}/ws"

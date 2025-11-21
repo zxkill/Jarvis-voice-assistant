@@ -129,3 +129,12 @@ def test_derives_ws_endpoint_from_http():
     client = XiaozhiClient(settings)
 
     assert client._derive_ws_endpoint() == "ws://demo.local/xz/api/ws"
+
+
+def test_derives_official_ws_endpoint_for_tenclass():
+    """Официальный CDN api.tenclass.net должен переводиться в /xiaozhi/v1/."""
+
+    settings = XiaozhiSettings(endpoint="https://api.tenclass.net/xiaozhi/chat", agent_code="abc", timeout=1)
+    client = XiaozhiClient(settings)
+
+    assert client._derive_ws_endpoint() == "wss://api.tenclass.net/xiaozhi/v1/"
