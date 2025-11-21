@@ -69,6 +69,7 @@ class XiaozhiClient:
         headers = {
             "Content-Type": "application/json",
             "device-id": self.settings.device_id,
+            "client-id": self.settings.device_id,
         }
         if trace_id:
             headers["X-Trace-Id"] = trace_id
@@ -135,7 +136,11 @@ class XiaozhiClient:
         # ESP32 — без него сервер xiaozhi-esp32-server отвечает сообщением об ошибке
         # и закрывает соединение кодом 1005. Идентификатор задаётся в конфиге
         # (xiaozhi_device_id) и по умолчанию равен "jarvis-client".
+        # Сервер ожидает идентификаторы клиента в заголовках: device-id нужен
+        # для учёта сессий, client-id — для совместимости с прошивкой ESP32,
+        # которая дублирует UUID устройства. Это убирает немые закрытия 1005.
         headers["device-id"] = self.settings.device_id
+        headers["client-id"] = self.settings.device_id
         if self.settings.agent_code:
             # Дополнительно отправляем код агента как авторизацию — прошивка
             # использует заголовок Authorization, поэтому копируем паттерн.
@@ -165,7 +170,7 @@ class XiaozhiClient:
                     {
                         "type": "hello",
                         "version": 1,
-                        "features": {"mcp": False},
+                        "features": {"mcp": True},
                         "transport": "websocket",
                         "audio_params": {
                             "format": "opus",
@@ -176,12 +181,16 @@ class XiaozhiClient:
                     }
                 )
                 ws.send(hello)
-                # Ждём ответ hello, но не падаем, если сервер молчит — просто логируем.
+                # Сервер ожидает приветствие и в ответ отдаёт hello с session_id.
+                # Если его нет, прекращаем диалог, чтобы не держать полузакрытый канал.
                 try:
                     message = ws.recv(timeout=5)
                     logger.debug("Hello-ответ Xiaozhi: %s", message, extra={"trace_id": trace_id})
+                    if not self._is_valid_hello(message):
+                        raise RuntimeError("Xiaozhi не подтвердил hello")
                 except Exception as exc:  # pragma: no cover - сетевые особенности
-                    logger.warning("Не получили hello от Xiaozhi: %s", exc, extra={"trace_id": trace_id})
+                    logger.error("Не получили корректный hello от Xiaozhi: %s", exc, extra={"trace_id": trace_id})
+                    raise RuntimeError("Xiaozhi разорвал соединение без hello") from exc
 
                 ws.send(payload)
                 # Читаем первые несколько сообщений, собирая содержимое
@@ -277,6 +286,23 @@ class XiaozhiClient:
             extra={"source": self.settings.endpoint, "derived": derived},
         )
         return derived
+
+    @staticmethod
+    def _is_valid_hello(message: Any) -> bool:
+        """Проверить, что ответ hello от сервера корректен.
+
+        Сервер должен вернуть JSON с ``type=hello`` и транспортом ``websocket``.
+        Дополнительно допускаем передачу ``session_id`` — его можно будет
+        проксировать в метриках в будущем. Неверный формат — повод закрыть
+        соединение, чтобы повторить попытку через HTTP или другой URL.
+        """
+
+        try:
+            data = json.loads(message) if isinstance(message, (str, bytes)) else message
+        except Exception:
+            return False
+
+        return isinstance(data, dict) and data.get("type") == "hello" and data.get("transport") == "websocket"
 
     @staticmethod
     def _extract_text(payload: Dict[str, Any]) -> str:

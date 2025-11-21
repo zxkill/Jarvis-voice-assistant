@@ -38,6 +38,7 @@ def test_extracts_text_and_headers(monkeypatch):
     assert captured.payload == {"share_code": "abc", "input": "ping", "stream": False}
     assert captured.headers["X-Trace-Id"] == "trace-1"
     assert captured.headers["device-id"] == "jarvis-client"
+    assert captured.headers["client-id"] == "jarvis-client"
 
 
 def test_missing_text_raises(monkeypatch):
@@ -59,12 +60,12 @@ def test_websocket_roundtrip():
     """Проверяем отправку и получение ответа по WebSocket."""
 
     def handler(websocket):
-        # Сервер сперва принимает hello, затем полезную нагрузку
+        # Сервер сперва принимает hello, отвечает hello и только потом ждёт payload
         hello = json.loads(websocket.recv())
         assert hello["type"] == "hello"
+        websocket.send(json.dumps({"type": "hello", "transport": "websocket"}))
         payload = json.loads(websocket.recv())
         assert payload["share_code"] == "ws-code"
-        websocket.send(json.dumps({"type": "hello", "transport": "websocket"}))
         websocket.send(json.dumps({"text": f"echo-{payload['input']}", "done": True}))
 
     with serve(handler, "127.0.0.1", 0) as server:
@@ -100,6 +101,7 @@ def test_http_404_triggers_ws_autoconversion(monkeypatch):
                 assert additional_headers["Authorization"] == "Bearer abc"
                 assert additional_headers["Protocol-Version"] == "1"
                 assert additional_headers["device-id"] == "jarvis-client"
+                assert additional_headers["client-id"] == "jarvis-client"
                 return self
 
             def __exit__(self, exc_type, exc, tb):  # noqa: D401
@@ -114,10 +116,12 @@ def test_http_404_triggers_ws_autoconversion(monkeypatch):
                     assert data["share_code"] == "abc"
 
             def recv(self, timeout=None):  # noqa: D401
-                if "hello" in events:
-                    events.append("reply")
-                    return json.dumps({"text": "from-ws", "done": True})
-                return json.dumps({"type": "hello", "transport": "websocket"})
+                if "hello" in events and "hello-sent" not in events:
+                    events.append("hello-sent")
+                    return json.dumps({"type": "hello", "transport": "websocket"})
+
+                events.append("reply")
+                return json.dumps({"text": "from-ws", "done": True})
 
         return DummyWs()
 
