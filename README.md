@@ -833,6 +833,7 @@ Promtail читает файлы из каталога `./logs` и отправ�
 [LLM]
 provider = xiaozhi           ; local для Ollama, xiaozhi для облака
 xiaozhi_url = wss://api.tenclass.net/xiaozhi/v1/     ; можно указать https://... или wss://...
+xiaozhi_device_id = jarvis-client                   ; попадёт в заголовок device-id WebSocket-сессии
 xiaozhi_agent_code = yj3GmNYZw0  ; share code/токен из личного кабинета Xiaozhi
 xiaozhi_timeout = 40             ; таймаут запроса в секундах
 ```

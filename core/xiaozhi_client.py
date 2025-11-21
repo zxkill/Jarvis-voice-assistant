@@ -26,6 +26,7 @@ class XiaozhiSettings:
 
     endpoint: str
     agent_code: str
+    device_id: str = "jarvis-client"
     timeout: float = 40.0
 
 
@@ -65,7 +66,10 @@ class XiaozhiClient:
             return self._ask_websocket(prompt, trace_id=trace_id)
 
         payload = self._build_payload(prompt)
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "device-id": self.settings.device_id,
+        }
         if trace_id:
             headers["X-Trace-Id"] = trace_id
 
@@ -127,6 +131,11 @@ class XiaozhiClient:
         headers = {}
         if trace_id:
             headers["X-Trace-Id"] = trace_id
+        # Передаём идентификатор клиента в заголовке так же, как это делает прошивка
+        # ESP32 — без него сервер xiaozhi-esp32-server отвечает сообщением об ошибке
+        # и закрывает соединение кодом 1005. Идентификатор задаётся в конфиге
+        # (xiaozhi_device_id) и по умолчанию равен "jarvis-client".
+        headers["device-id"] = self.settings.device_id
         if self.settings.agent_code:
             # Дополнительно отправляем код агента как авторизацию — прошивка
             # использует заголовок Authorization, поэтому копируем паттерн.

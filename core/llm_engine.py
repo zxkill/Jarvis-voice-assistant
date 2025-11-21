@@ -214,6 +214,7 @@ def _query_xiaozhi(prompt: str, trace_id: str = "") -> str:
     settings = XiaozhiSettings(
         endpoint=_APP_CFG.llm.xiaozhi_url,
         agent_code=_APP_CFG.llm.xiaozhi_agent_code,
+        device_id=_APP_CFG.llm.xiaozhi_device_id,
         timeout=_APP_CFG.llm.xiaozhi_timeout,
     )
     if not settings.agent_code:

@@ -37,6 +37,7 @@ def test_extracts_text_and_headers(monkeypatch):
     assert reply == "ok"
     assert captured.payload == {"share_code": "abc", "input": "ping", "stream": False}
     assert captured.headers["X-Trace-Id"] == "trace-1"
+    assert captured.headers["device-id"] == "jarvis-client"
 
 
 def test_missing_text_raises(monkeypatch):
@@ -98,6 +99,7 @@ def test_http_404_triggers_ws_autoconversion(monkeypatch):
                 # Заголовки должны содержать авторизацию и версию
                 assert additional_headers["Authorization"] == "Bearer abc"
                 assert additional_headers["Protocol-Version"] == "1"
+                assert additional_headers["device-id"] == "jarvis-client"
                 return self
 
             def __exit__(self, exc_type, exc, tb):  # noqa: D401

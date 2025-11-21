@@ -62,6 +62,7 @@ class LlmConfig:
     provider: str
     xiaozhi_url: str
     xiaozhi_agent_code: str
+    xiaozhi_device_id: str
     xiaozhi_timeout: float
 
 
@@ -177,6 +178,11 @@ def load_config(path: str = "config.ini") -> AppConfig:
             os.getenv("XIAOZHI_URL", "wss://api.tenclass.net/xiaozhi/v1/"),
         )
         parser.set("LLM", "xiaozhi_agent_code", os.getenv("XIAOZHI_AGENT", ""))
+        parser.set(
+            "LLM",
+            "xiaozhi_device_id",
+            os.getenv("XIAOZHI_DEVICE_ID", "jarvis-client"),
+        )
         parser.set("LLM", "xiaozhi_timeout", os.getenv("XIAOZHI_TIMEOUT", "40"))
 
     # Формируем dataclass-объекты для каждой секции конфигурации
@@ -202,6 +208,13 @@ def load_config(path: str = "config.ini") -> AppConfig:
             default="wss://api.tenclass.net/xiaozhi/v1/",
         ),
         xiaozhi_agent_code=parser.get("LLM", "xiaozhi_agent_code", fallback=""),
+        xiaozhi_device_id=_env_or_cfg(
+            parser,
+            "LLM",
+            "xiaozhi_device_id",
+            "XIAOZHI_DEVICE_ID",
+            default="jarvis-client",
+        ),
         xiaozhi_timeout=parser.getfloat("LLM", "xiaozhi_timeout", fallback=40.0),
     )
     telegram = TelegramConfig(
