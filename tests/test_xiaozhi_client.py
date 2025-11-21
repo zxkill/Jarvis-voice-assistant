@@ -1,7 +1,4 @@
 import json
-from types import SimpleNamespace
-import threading
-import json
 import threading
 from types import SimpleNamespace
 from typing import List
@@ -61,9 +58,12 @@ def test_websocket_roundtrip():
     """Проверяем отправку и получение ответа по WebSocket."""
 
     def handler(websocket):
-        # Получаем JSON, убеждаемся что share_code присутствует
+        # Сервер сперва принимает hello, затем полезную нагрузку
+        hello = json.loads(websocket.recv())
+        assert hello["type"] == "hello"
         payload = json.loads(websocket.recv())
         assert payload["share_code"] == "ws-code"
+        websocket.send(json.dumps({"type": "hello", "transport": "websocket"}))
         websocket.send(json.dumps({"text": f"echo-{payload['input']}", "done": True}))
 
     with serve(handler, "127.0.0.1", 0) as server:
@@ -95,18 +95,27 @@ def test_http_404_triggers_ws_autoconversion(monkeypatch):
 
         class DummyWs:
             def __enter__(self):  # noqa: D401
+                # Заголовки должны содержать авторизацию и версию
+                assert additional_headers["Authorization"] == "Bearer abc"
+                assert additional_headers["Protocol-Version"] == "1"
                 return self
 
             def __exit__(self, exc_type, exc, tb):  # noqa: D401
                 return False
 
             def send(self, payload):  # noqa: D401
-                # Проверяем, что share_code прокинулся в тело
+                # Первое сообщение — hello, второе — основная нагрузка
                 data = jsonlib.loads(payload)
-                assert data["share_code"] == "abc"
+                if data.get("type") == "hello":
+                    events.append("hello")
+                else:
+                    assert data["share_code"] == "abc"
 
             def recv(self, timeout=None):  # noqa: D401
-                return json.dumps({"text": "from-ws", "done": True})
+                if "hello" in events:
+                    events.append("reply")
+                    return json.dumps({"text": "from-ws", "done": True})
+                return json.dumps({"type": "hello", "transport": "websocket"})
 
         return DummyWs()
 

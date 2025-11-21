@@ -128,9 +128,13 @@ class XiaozhiClient:
         if trace_id:
             headers["X-Trace-Id"] = trace_id
         if self.settings.agent_code:
-            # Сайт передаёт share code в теле, но для WebSocket полезно продублировать
-            # его в header, чтобы прокси мог быстро отвергать чужие подключения.
+            # Дополнительно отправляем код агента как авторизацию — прошивка
+            # использует заголовок Authorization, поэтому копируем паттерн.
+            headers["Authorization"] = f"Bearer {self.settings.agent_code}"
             headers["X-Share-Code"] = self.settings.agent_code
+        # Версия протокола взята из open‑source прошивки: сервер ждёт номер, иначе
+        # может оборвать соединение без кода (1005), как в логах пользователя.
+        headers["Protocol-Version"] = "1"
 
         payload = json.dumps(self._build_payload(prompt))
         logger.debug(
@@ -146,6 +150,30 @@ class XiaozhiClient:
                 open_timeout=self.settings.timeout,
                 close_timeout=self.settings.timeout,
             ) as ws:
+                # Отправляем приветствие по аналогии с прошивкой: без него сервер
+                # может закрыть соединение кодом 1005, не дожидаясь текста.
+                hello = json.dumps(
+                    {
+                        "type": "hello",
+                        "version": 1,
+                        "features": {"mcp": False},
+                        "transport": "websocket",
+                        "audio_params": {
+                            "format": "opus",
+                            "sample_rate": 16000,
+                            "channels": 1,
+                            "frame_duration": 60,
+                        },
+                    }
+                )
+                ws.send(hello)
+                # Ждём ответ hello, но не падаем, если сервер молчит — просто логируем.
+                try:
+                    message = ws.recv(timeout=5)
+                    logger.debug("Hello-ответ Xiaozhi: %s", message, extra={"trace_id": trace_id})
+                except Exception as exc:  # pragma: no cover - сетевые особенности
+                    logger.warning("Не получили hello от Xiaozhi: %s", exc, extra={"trace_id": trace_id})
+
                 ws.send(payload)
                 # Читаем первые несколько сообщений, собирая содержимое
                 accumulated = ""
@@ -170,6 +198,12 @@ class XiaozhiClient:
                         data = json.loads(message)
                     except ValueError:
                         logger.warning("Некорректный JSON кадр Xiaozhi: %s", message, extra={"trace_id": trace_id})
+                        continue
+
+                    # В WebSocket-ответах может прийти служебный hello — сохраняем
+                    # его, но пропускаем при сборке текста.
+                    if isinstance(data, dict) and data.get("type") == "hello":
+                        logger.info("Xiaozhi подтвердил hello", extra={"trace_id": trace_id})
                         continue
 
                     chunk = self._extract_text(data)
