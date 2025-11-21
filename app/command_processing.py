@@ -10,6 +10,7 @@ Jarvis: разбор фраз, поиск совпадений с именем �
 from typing import Any, Dict, List
 
 import asyncio
+from core import llm_engine
 from contextvars import Token, copy_context
 from rapidfuzz import fuzz
 
@@ -450,27 +451,72 @@ async def va_respond(voice: str) -> bool:
         raw_norm = normalize(raw)
         cmd_info = await recognize_cmd(raw_norm)
         if not cmd_info["cmd"] or cmd_info["percent"] < CMD_CONFIDENCE_THRESHOLD:
-            reply = "можете повторить?"
-            await speak_async(reply)
+            # Если навыки не нашли совпадения, передаём запрос в LLM. Это
+            # позволяет отвечать на свободные вопросы без добавления нового
+            # скилла и значительно сокращает случаи возврата «можете
+            # повторить?». Подробное логирование нужно для отладки.
             log.info(
-                "fallback reply",
-                extra={"ctx": {"text": cmd, "trace_id": trace_id}},
+                "no skill match, delegating to llm",
+                extra={"ctx": {"text": cmd, "trace_id": trace_id, "channel": channel}},
             )
-            _log_dialog("outgoing", reply, channel, trace_id, {"kind": "fallback"})
-            try:
-                from context.short_term import add as ctx_add
-
-                ctx_add({"trace_id": trace_id, "user": cmd, "reply": reply})
-                daily_memory.add(
-                    {
-                        "label": "fallback",
-                        "text": f"Пользователь: {cmd}\nАссистент: {reply}",
-                    }
-                )
-            except Exception:
-                pass
-            return True
+            reply = await _delegate_to_llm(cmd, channel=channel, trace_id=trace_id)
+            return bool(reply)
         return await execute_cmd(cmd_info["cmd"], voice)
     finally:
         if token:
             TRACE_ID.reset(token)
+
+
+async def _delegate_to_llm(text: str, *, channel: str, trace_id: str) -> str:
+    """Отправить произвольный запрос в LLM и озвучить ответ.
+
+    Сначала пытаемся получить осмысленный ответ от выбранного бэкенда LLM
+    (локальный Ollama или облачный Xiaozhi). Если что-то пошло не так или
+    модель вернула пустую строку, используем вежливый запрос повтора, чтобы
+    пользователь понимал, что запрос нужно сформулировать яснее.
+    """
+
+    try:
+        # LLM-запрос выполняем в пуле потоков, чтобы не блокировать основной
+        # event-loop. Все параметры передаём явно для удобства трассировки.
+        reply = await asyncio.to_thread(llm_engine.think, text, trace_id=trace_id)
+        if not reply:
+            raise ValueError("LLM вернула пустой ответ")
+        await speak_async(reply)
+        _log_dialog("outgoing", reply, channel, trace_id, {"kind": "llm"})
+        log.info(
+            "llm replied",
+            extra={"ctx": {"trace_id": trace_id, "channel": channel, "reply": reply}},
+        )
+        return reply
+    except Exception as exc:  # pragma: no cover - покрыто отдельным тестом
+        # Ошибка LLM не должна ломать сценарий: сообщаем пользователю, что
+        # стоит повторить запрос, и сохраняем контекст для диагностики.
+        reply = "можете повторить?"
+        await speak_async(reply)
+        _log_dialog(
+            "outgoing",
+            reply,
+            channel,
+            trace_id,
+            {"kind": "fallback", "error": str(exc)},
+        )
+        log.exception(
+            "llm fallback reply",
+            extra={"ctx": {"text": text, "trace_id": trace_id, "channel": channel}},
+        )
+        try:
+            from context.short_term import add as ctx_add
+
+            ctx_add({"trace_id": trace_id, "user": text, "reply": reply})
+            daily_memory.add(
+                {
+                    "label": "fallback",
+                    "text": f"Пользователь: {text}\nАссистент: {reply}",
+                }
+            )
+        except Exception:
+            log.exception(
+                "failed to persist fallback", extra={"ctx": {"trace_id": trace_id}}
+            )
+        return reply
