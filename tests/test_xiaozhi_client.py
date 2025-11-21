@@ -1,5 +1,7 @@
 import json
 from types import SimpleNamespace
+import threading
+from websockets.sync.server import serve
 
 import pytest
 
@@ -49,3 +51,27 @@ def test_missing_text_raises(monkeypatch):
 
     with pytest.raises(RuntimeError):
         client.ask("ping")
+
+
+def test_websocket_roundtrip():
+    """Проверяем отправку и получение ответа по WebSocket."""
+
+    def handler(websocket):
+        # Получаем JSON, убеждаемся что share_code присутствует
+        payload = json.loads(websocket.recv())
+        assert payload["share_code"] == "ws-code"
+        websocket.send(json.dumps({"text": f"echo-{payload['input']}", "done": True}))
+
+    with serve(handler, "127.0.0.1", 0) as server:
+        port = server.socket.getsockname()[1]
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+
+        settings = XiaozhiSettings(endpoint=f"ws://127.0.0.1:{port}", agent_code="ws-code", timeout=3)
+        client = XiaozhiClient(settings)
+
+        try:
+            assert client.ask("hello") == "echo-hello"
+        finally:
+            server.shutdown()
+            worker.join(timeout=3)

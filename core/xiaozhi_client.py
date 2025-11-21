@@ -7,11 +7,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import socket
 from dataclasses import dataclass
 from typing import Any, Dict
 
 import requests
+from websockets.sync.client import connect
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +29,12 @@ class XiaozhiSettings:
 
 
 class XiaozhiClient:
-    """Простой HTTP‑клиент для обмена текстовыми запросами.
+    """Клиент Xiaozhi с поддержкой HTTP и WebSocket протоколов.
 
-    Используется POST‑endpoint облачного сервиса, куда передаём share code
-    агента и текстовый prompt. Клиент не делает предположений о конкретном
-    формате ответа: он извлекает текст либо из поля ``text``, либо из
-    ``message`` / ``content`` внутри словаря ``data``.
+    По умолчанию пытаемся выбрать подходящий транспорт по схеме URL:
+    ``http/https`` → обычный POST, ``ws/wss`` → WebSocket-сеанс. Это приближает
+    поведение к прошивке ESP32, где основное общение с моделью идёт через
+    WebSocket, но сохраняет обратную совместимость с HTTP‑прокси.
     """
 
     def __init__(self, settings: XiaozhiSettings) -> None:
@@ -56,6 +59,9 @@ class XiaozhiClient:
 
         При сетевой ошибке или пустом ответе возбуждается :class:`RuntimeError`.
         """
+
+        if self.settings.endpoint.startswith(("ws://", "wss://")):
+            return self._ask_websocket(prompt, trace_id=trace_id)
 
         payload = self._build_payload(prompt)
         headers = {"Content-Type": "application/json"}
@@ -97,6 +103,84 @@ class XiaozhiClient:
 
         logger.info("Ответ Xiaozhi длиной %d символов", len(text), extra={"trace_id": trace_id})
         return text
+
+    def _ask_websocket(self, prompt: str, *, trace_id: str = "") -> str:
+        """Отправить текст в Xiaozhi через WebSocket и дождаться ответа.
+
+        Мы повторяем базовый handshake из документации проекта: открываем сессию,
+        отправляем единичное текстовое сообщение с полями ``share_code`` и
+        ``input`` и читаем первые осмысленные данные в ответ. Формат ответа
+        совпадает с HTTP‑веткой, поэтому повторно используем извлечение текста.
+        """
+
+        headers = {}
+        if trace_id:
+            headers["X-Trace-Id"] = trace_id
+        if self.settings.agent_code:
+            # Сайт передаёт share code в теле, но для WebSocket полезно продублировать
+            # его в header, чтобы прокси мог быстро отвергать чужие подключения.
+            headers["X-Share-Code"] = self.settings.agent_code
+
+        payload = json.dumps(self._build_payload(prompt))
+        logger.debug(
+            "Устанавливаем WebSocket сессию Xiaozhi", extra={"endpoint": self.settings.endpoint, "trace_id": trace_id}
+        )
+
+        try:
+            with connect(
+                self.settings.endpoint,
+                additional_headers=headers,
+                open_timeout=self.settings.timeout,
+                close_timeout=self.settings.timeout,
+            ) as ws:
+                ws.send(payload)
+                # Читаем первые несколько сообщений, собирая содержимое
+                accumulated = ""
+                while True:
+                    try:
+                        message = ws.recv(timeout=self.settings.timeout)
+                    except TimeoutError as exc:  # pragma: no cover - сетевые таймауты вне тестов
+                        logger.error("Xiaozhi WebSocket timeout", extra={"trace_id": trace_id})
+                        raise RuntimeError("Таймаут ожидания ответа от Xiaozhi") from exc
+                    except (ConnectionError, socket.error) as exc:  # pragma: no cover - сетевые сбои
+                        logger.error("Xiaozhi WebSocket connection error: %s", exc, extra={"trace_id": trace_id})
+                        raise RuntimeError("Соединение с Xiaozhi разорвано") from exc
+
+                    if message is None:
+                        break
+
+                    if isinstance(message, bytes):
+                        logger.debug("Пропускаем бинарный кадр длиной %d", len(message), extra={"trace_id": trace_id})
+                        continue
+
+                    try:
+                        data = json.loads(message)
+                    except ValueError:
+                        logger.warning("Некорректный JSON кадр Xiaozhi: %s", message, extra={"trace_id": trace_id})
+                        continue
+
+                    chunk = self._extract_text(data)
+                    if chunk:
+                        accumulated += (" " if accumulated else "") + chunk
+                        logger.debug(
+                            "Получен текстовый фрагмент Xiaozhi", extra={"len": len(chunk), "trace_id": trace_id}
+                        )
+
+                    # Если сервис прислал флажок об окончании генерации, прекращаем чтение
+                    if isinstance(data, dict) and data.get("done") is True:
+                        break
+
+                if not accumulated:
+                    logger.error("Пустой ответ от Xiaozhi по WebSocket", extra={"trace_id": trace_id})
+                    raise RuntimeError("Xiaozhi не вернул текст ответа")
+
+                logger.info(
+                    "Ответ Xiaozhi (WebSocket) длиной %d символов", len(accumulated), extra={"trace_id": trace_id}
+                )
+                return accumulated
+        except Exception as exc:
+            logger.error("Ошибка WebSocket Xiaozhi: %s", exc, extra={"trace_id": trace_id})
+            raise RuntimeError("Не удалось получить ответ от Xiaozhi по WebSocket") from exc
 
     @staticmethod
     def _extract_text(payload: Dict[str, Any]) -> str:
