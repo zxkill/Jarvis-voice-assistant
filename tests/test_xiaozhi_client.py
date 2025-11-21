@@ -1,9 +1,13 @@
 import json
 from types import SimpleNamespace
 import threading
-from websockets.sync.server import serve
+import json
+import threading
+from types import SimpleNamespace
+from typing import List
 
 import pytest
+from websockets.sync.server import serve
 
 from core.xiaozhi_client import XiaozhiClient, XiaozhiSettings
 
@@ -75,3 +79,53 @@ def test_websocket_roundtrip():
         finally:
             server.shutdown()
             worker.join(timeout=3)
+
+
+def test_http_404_triggers_ws_autoconversion(monkeypatch):
+    """HTTP 404 должен конвертировать URL в WebSocket и вернуть ответ."""
+
+    events: List[str] = []
+
+    def fake_post(url, json=None, headers=None, timeout=None):  # noqa: A002
+        events.append("http")
+        return DummyResponse(status_code=404, body="{}")
+
+    def fake_connect(url, additional_headers=None, open_timeout=None, close_timeout=None):  # noqa: ANN001
+        events.append(url)
+
+        class DummyWs:
+            def __enter__(self):  # noqa: D401
+                return self
+
+            def __exit__(self, exc_type, exc, tb):  # noqa: D401
+                return False
+
+            def send(self, payload):  # noqa: D401
+                # Проверяем, что share_code прокинулся в тело
+                data = jsonlib.loads(payload)
+                assert data["share_code"] == "abc"
+
+            def recv(self, timeout=None):  # noqa: D401
+                return json.dumps({"text": "from-ws", "done": True})
+
+        return DummyWs()
+
+    jsonlib = __import__("json")
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("core.xiaozhi_client.connect", fake_connect)
+
+    settings = XiaozhiSettings(endpoint="https://example.com/xiaozhi/chat", agent_code="abc", timeout=2)
+    client = XiaozhiClient(settings)
+
+    reply = client.ask("ping")
+    assert reply == "from-ws"
+    assert events[1] == "wss://example.com/xiaozhi/chat/ws"
+
+
+def test_derives_ws_endpoint_from_http():
+    """Проверяем чистую конвертацию http → ws."""
+
+    settings = XiaozhiSettings(endpoint="http://demo.local/xz/api", agent_code="abc", timeout=1)
+    client = XiaozhiClient(settings)
+
+    assert client._derive_ws_endpoint() == "ws://demo.local/xz/api/ws"

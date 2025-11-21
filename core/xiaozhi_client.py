@@ -11,7 +11,8 @@ import json
 import logging
 import socket
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from websockets.sync.client import connect
@@ -83,6 +84,16 @@ class XiaozhiClient:
             logger.error("Сервис Xiaozhi недоступен: %s", exc)
             raise RuntimeError("Не удалось связаться с Xiaozhi") from exc
 
+        # Если HTTP‑путь не найден, пробуем автоматически переключиться на WebSocket
+        if not response.ok and response.status_code == 404:
+            ws_endpoint = self._derive_ws_endpoint()
+            if ws_endpoint:
+                logger.warning(
+                    "HTTP путь Xiaozhi вернул 404, пробуем WebSocket",
+                    extra={"endpoint": ws_endpoint, "trace_id": trace_id},
+                )
+                return self._ask_websocket(prompt, trace_id=trace_id, override_endpoint=ws_endpoint)
+
         if not response.ok:
             logger.error(
                 "Xiaozhi вернул ошибку", extra={"status": response.status_code, "body": response.text}
@@ -104,7 +115,7 @@ class XiaozhiClient:
         logger.info("Ответ Xiaozhi длиной %d символов", len(text), extra={"trace_id": trace_id})
         return text
 
-    def _ask_websocket(self, prompt: str, *, trace_id: str = "") -> str:
+    def _ask_websocket(self, prompt: str, *, trace_id: str = "", override_endpoint: Optional[str] = None) -> str:
         """Отправить текст в Xiaozhi через WebSocket и дождаться ответа.
 
         Мы повторяем базовый handshake из документации проекта: открываем сессию,
@@ -123,12 +134,14 @@ class XiaozhiClient:
 
         payload = json.dumps(self._build_payload(prompt))
         logger.debug(
-            "Устанавливаем WebSocket сессию Xiaozhi", extra={"endpoint": self.settings.endpoint, "trace_id": trace_id}
+            "Устанавливаем WebSocket сессию Xiaozhi",
+            extra={"endpoint": override_endpoint or self.settings.endpoint, "trace_id": trace_id},
         )
 
         try:
+            ws_endpoint = override_endpoint or self.settings.endpoint
             with connect(
-                self.settings.endpoint,
+                ws_endpoint,
                 additional_headers=headers,
                 open_timeout=self.settings.timeout,
                 close_timeout=self.settings.timeout,
@@ -181,6 +194,31 @@ class XiaozhiClient:
         except Exception as exc:
             logger.error("Ошибка WebSocket Xiaozhi: %s", exc, extra={"trace_id": trace_id})
             raise RuntimeError("Не удалось получить ответ от Xiaozhi по WebSocket") from exc
+
+    def _derive_ws_endpoint(self) -> Optional[str]:
+        """Попробовать вычислить WebSocket‑адрес из HTTP URL.
+
+        Это помогает в ситуации, когда в конфиге указан HTTP путь, а сервис
+        обрабатывает только WebSocket соединения. Меняем схему на ws/wss и
+        добавляем суффикс ``/ws`` если он отсутствует, подражая прошивке ESP32.
+        """
+
+        parsed = urlparse(self.settings.endpoint)
+        if parsed.scheme not in {"http", "https"}:
+            return None
+
+        ws_scheme = "wss" if parsed.scheme == "https" else "ws"
+        path = parsed.path
+        if not path.endswith("/ws"):
+            path = f"{path.rstrip('/')}/ws"
+
+        candidate = parsed._replace(scheme=ws_scheme, path=path)
+        derived = urlunparse(candidate)
+        logger.debug(
+            "Автоконвертация HTTP → WebSocket для Xiaozhi",
+            extra={"source": self.settings.endpoint, "derived": derived},
+        )
+        return derived
 
     @staticmethod
     def _extract_text(payload: Dict[str, Any]) -> str:
