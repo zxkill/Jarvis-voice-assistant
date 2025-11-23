@@ -165,7 +165,13 @@ class XiaozhiClient:
         }
 
     def _build_hello_message(self) -> str:
-        """Сформировать hello для WebSocket по образцу прошивки ESP32."""
+        """Сформировать hello для WebSocket по образцу прошивки ESP32.
+
+        В оригинальной прошивке заголовок Authorization передаётся вместе с
+        hello, поэтому мы дополнительно прокидываем share_code и идентификаторы
+        устройства в тело. Это помогает серверу не разрывать соединение кодом
+        1005 из‑за отсутствия связки устройства с агентом.
+        """
 
         return json.dumps(
             {
@@ -173,6 +179,9 @@ class XiaozhiClient:
                 "version": 1,
                 "features": {"mcp": True},
                 "transport": "websocket",
+                "share_code": self.settings.agent_code,
+                "device_id": self.settings.device_id,
+                "client_id": self.settings.client_id,
                 "audio_params": {
                     "format": "opus",
                     "sample_rate": 16000,
@@ -230,6 +239,10 @@ class XiaozhiClient:
             bind_code = self._request_bind_code(trace_id=trace_id)
             if bind_code:
                 raise XiaozhiBindingRequired(bind_code)
+
+        if not self.settings.agent_code:
+            logger.error("Не задан xiaozhi_agent_code, WebSocket недоступен", extra={"trace_id": trace_id})
+            raise RuntimeError("Укажите xiaozhi_agent_code в конфиге")
 
         if self.settings.endpoint.startswith(("ws://", "wss://")):
             return self._ask_websocket(prompt, trace_id=trace_id)
@@ -298,6 +311,16 @@ class XiaozhiClient:
         404, автоматически переключаемся на WebSocket и пытаемся повторить
         бинарный обмен.
         """
+
+        if not self._binding_checked:
+            self._binding_checked = True
+            bind_code = self._request_bind_code(trace_id=trace_id)
+            if bind_code:
+                raise XiaozhiBindingRequired(bind_code)
+
+        if not self.settings.agent_code:
+            logger.error("Не задан xiaozhi_agent_code, WebSocket аудио недоступен", extra={"trace_id": trace_id})
+            raise RuntimeError("Укажите xiaozhi_agent_code в конфиге для аудио")
 
         headers = {
             "Content-Type": "audio/wav",

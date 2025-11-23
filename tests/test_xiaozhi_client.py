@@ -255,3 +255,13 @@ def test_audio_websocket(monkeypatch):
     reply = client.ask_audio(b"pcm")
     assert reply == b"part1"
     assert events[0] == "ws://localhost:1234"
+
+
+def test_audio_requires_agent_code(monkeypatch):
+    """Если не задан секрет агента, WebSocket аудио сразу падает с подсказкой."""
+
+    settings = XiaozhiSettings(endpoint="wss://api.tenclass.net/xiaozhi/v1/", agent_code="")
+    client = XiaozhiClient(settings)
+
+    with pytest.raises(RuntimeError, match="agent_code"):
+        client.ask_audio(b"pcm")
