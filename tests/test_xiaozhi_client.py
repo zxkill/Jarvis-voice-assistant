@@ -521,8 +521,43 @@ async def test_ask_text_uses_websocket(tmp_path: Path, monkeypatch: pytest.Monke
     reply = await client.ask_text("hi", trace_id="trace", timeout=1)
 
     assert reply == "привет от Xiaozhi"
+    # hello уходит первым, за ним listen/detect с текстом, как в py-xiaozhi
     assert any("hello" in sent for sent in ws.sent)
-    assert any("hi" in sent for sent in ws.sent)
+    sent_payloads = [json.loads(raw) for raw in ws.sent if "listen" in raw]
+    assert sent_payloads
+    assert sent_payloads[-1]["state"] == "detect"
+    assert sent_payloads[-1]["text"] == "hi"
+    assert sent_payloads[-1]["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_ask_text_sends_trace_id_and_detect(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Поле trace_id должно попадать в listen/detect, как в py-xiaozhi."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://example",
+        websocket_token="secret-token",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="cli",
+    )
+
+    ws = DummyWebSocket()
+    ws.feed(json.dumps({"text": "ответ"}))
+    ws.feed(None)
+
+    async def fake_connect(*_: Any, **__: Any) -> DummyWebSocket:
+        return ws
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    client = XiaozhiClient(cfg)
+    reply = await client.ask_text("ping", trace_id="trace-id", timeout=1)
+
+    assert reply == "ответ"
+    sent_payloads = [json.loads(raw) for raw in ws.sent if "listen" in raw]
+    assert sent_payloads[-1]["trace_id"] == "trace-id"
+    assert sent_payloads[-1]["state"] == "detect"
 
 
 @pytest.mark.asyncio

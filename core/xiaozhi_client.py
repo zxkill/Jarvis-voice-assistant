@@ -588,7 +588,14 @@ class XiaozhiClient:
         await self._ws.send(json.dumps(hello_message))
 
     async def ask_text(self, text: str, trace_id: str | None = None, timeout: float = 20.0) -> str | None:
-        """Отправляет текст на сервер Xiaozhi и возвращает первый текстовый ответ."""
+        """Отправляет текст на сервер Xiaozhi и возвращает первый текстовый ответ.
+
+        В протоколе py-xiaozhi текстовая команда передаётся как событие
+        ``listen/detect`` (см. ``Protocol.send_wake_word_detected`` в оригинальном
+        проекте). Простое сообщение ``{"type": "text"}`` сервер игнорирует, поэтому
+        формируем точный аналог wake-word события: это ключевой момент, из-за
+        которого ответы не приходили после успешной активации.
+        """
 
         async with self._lock:
             # Сначала гарантируем актуальную OTA‑конфигурацию и проверяем, нет
@@ -599,10 +606,21 @@ class XiaozhiClient:
                 return activation_prompt
 
             ws = await self._connect(ensure_config=False)
-            payload = {"type": "text", "text": text, "session_id": self._session_id}
+            # Сообщение повторяет py-xiaozhi: wake-word событие listen/detect с
+            # полем text. Используем тот же session_id, чтобы сервер связал
+            # диалог с последующими аудио/текстовыми ответами.
+            payload = {
+                "type": "listen",
+                "state": "detect",
+                "text": text,
+                "session_id": self._session_id,
+            }
             if trace_id:
                 payload["trace_id"] = trace_id
-            log.info("отправляю текст в Xiaozhi", extra={"ctx": {"text": text, "trace_id": trace_id}})
+            log.info(
+                "отправляю текст в Xiaozhi",
+                extra={"ctx": {"text": text, "trace_id": trace_id, "session_id": self._session_id}},
+            )
             await ws.send(json.dumps(payload))
             try:
                 return await asyncio.wait_for(self._wait_text_reply(ws), timeout=timeout)
