@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 from websockets.frames import Close
 
 from core.xiaozhi_client import XiaozhiClient
@@ -667,6 +667,36 @@ async def test_connection_close_invalidates_cache(
     assert reply is None
     assert cfg.get("websocket_token") is None
     assert cfg.get("network")["websocket"]["token"] is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_status_code_resets_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При ответе 4xx на рукопожатии кэш должен сбрасываться и логироваться."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://example",
+        websocket_token="expired-token",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="cli",
+        efuse={"activation_status": True},
+    )
+
+    async def fake_connect(*_: Any, **__: Any) -> None:  # pragma: no cover - исключение вместо возврата
+        raise InvalidStatusCode(401, headers={"X-Test": "bad-token"})
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    client = XiaozhiClient(cfg)
+    with pytest.raises(InvalidStatusCode):
+        await client._connect(ensure_config=False)
+
+    # После ошибки рукопожатия конфиг должен быть очищен, чтобы следующая
+    # попытка запросила свежие параметры OTA.
+    assert cfg.get("websocket_url") is None
+    assert cfg.get("websocket_token") is None
 
 
 @pytest.mark.asyncio

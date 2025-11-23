@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, Optional
 
 import requests
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatusCode
 
 from core.logging_json import configure_logging
 from core.xiaozhi_config import XiaozhiConfigManager
@@ -627,10 +627,39 @@ class XiaozhiClient:
                     extra_headers=headers,
                     **connect_kwargs,
                 )
+        except InvalidStatusCode as err:
+            # Подробно логируем коды/заголовки рукопожатия, чтобы понимать,
+            # почему сервер отверг соединение (например, протухший токен).
+            self._invalidate_cached_websocket(reason=f"ws status {err.status_code}")
+            log.error(
+                "WebSocket отклонён сервером",
+                extra={
+                    "ctx": {
+                        "status": err.status_code,
+                        "headers": dict(err.headers or {}),
+                        "url": url,
+                        "device_id": headers.get("Device-Id"),
+                        "client_id": headers.get("Client-Id"),
+                    }
+                },
+            )
+            raise
         except Exception as err:
             # При ошибке подключения сразу обнуляем кэш, чтобы следующая
-            # попытка запросила свежие параметры OTA.
+            # попытка запросила свежие параметры OTA. Добавляем расширенный
+            # контекст (URL/ID), чтобы видеть, на какой стадии рвётся соединение.
             self._invalidate_cached_websocket(reason=str(err))
+            log.error(
+                "ошибка установления WebSocket",
+                extra={
+                    "ctx": {
+                        "error": str(err),
+                        "url": url,
+                        "device_id": headers.get("Device-Id"),
+                        "client_id": headers.get("Client-Id"),
+                    }
+                },
+            )
             raise
 
         # Обновляем очередь и служебные события для свежего подключения.
@@ -639,6 +668,23 @@ class XiaozhiClient:
         # Стартуем фоновую задачу чтения, чтобы не потерять server hello и
         # чтобы последующие ответы появлялись в очереди без гонок.
         self._message_task = asyncio.create_task(self._message_loop())
+
+        # Фиксируем детали рукопожатия от сервера: полезно видеть, какие
+        # заголовки он вернул и какой сабпротокол выбрал. Это помогает
+        # расследовать странные ответы или несоответствие протокола.
+        try:
+            log.debug(
+                "рукопожатие WebSocket успешно",
+                extra={
+                    "ctx": {
+                        "response_headers": dict(getattr(self._ws, "response_headers", {}) or {}),
+                        "subprotocol": getattr(self._ws, "subprotocol", None),
+                    }
+                },
+            )
+        except Exception:
+            # Заголовки могут отсутствовать у заглушек в тестах — просто пропускаем.
+            pass
 
         await self._send_hello()
         await self._wait_for_server_hello()
@@ -686,6 +732,15 @@ class XiaozhiClient:
                 extra={"ctx": {"transport": "websocket", "url": getattr(self._ws, "host", None)}},
             )
         except asyncio.TimeoutError:
+            log.error(
+                "таймаут ожидания server hello",
+                extra={
+                    "ctx": {
+                        "pending_queue": getattr(self._incoming_messages, "qsize", lambda: None)(),
+                        "url": getattr(self._ws, "host", None),
+                    }
+                },
+            )
             self._invalidate_cached_websocket(reason="hello timeout", code=None)
             raise RuntimeError("не дождались hello от сервера Xiaozhi") from None
 
@@ -748,6 +803,10 @@ class XiaozhiClient:
                 await self._incoming_messages.put(data)
 
         except ConnectionClosed as err:
+            log.warning(
+                "WebSocket закрыт удалённой стороной",
+                extra={"ctx": {"code": err.code, "reason": err.reason}},
+            )
             self._invalidate_cached_websocket(reason=str(err), code=err.code)
         except Exception:
             log.exception("ошибка при чтении WebSocket")
