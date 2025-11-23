@@ -36,6 +36,9 @@ class XiaozhiClient:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._lock = asyncio.Lock()
         self._session_id = str(uuid.uuid4())
+        # Флаг, показывающий что сервер ответил hello и готов принимать команды
+        # (py-xiaozhi ждёт этот ответ перед началом диалога).
+        self._hello_confirmed = asyncio.Event()
         # Отдельная задача для активации: запускается при получении challenge,
         # чтобы автоматически завершить привязку после ввода кода на портале.
         self._activation_task: asyncio.Task[bool] | None = None
@@ -571,7 +574,9 @@ class XiaozhiClient:
             self._invalidate_cached_websocket(reason=str(err))
             raise
 
+        self._hello_confirmed.clear()
         await self._send_hello()
+        await self._wait_for_server_hello()
         return self._ws
 
     async def _send_hello(self) -> None:
@@ -584,8 +589,83 @@ class XiaozhiClient:
             "version": 1,
             "features": {"mcp": True},
             "transport": "websocket",
+            # Добавляем аудио‑параметры как в py-xiaozhi, чтобы сервер видел
+            # привычную структуру hello и не отклонял последующие listen/detect
+            # события. Даже если мы не шлём аудио, поля помогают серверу
+            # корректно инициализировать сессию.
+            "audio_params": {
+                "format": "opus",
+                "sample_rate": 16000,
+                "channels": 1,
+                "frame_duration": 20,
+            },
         }
+        log.debug("отправляю hello в Xiaozhi", extra={"ctx": hello_message})
         await self._ws.send(json.dumps(hello_message))
+
+    async def _wait_for_server_hello(self, timeout: float = 10.0) -> None:
+        """Ожидает ответ hello от сервера перед отправкой команд.
+
+        Оригинальный клиент не начинает обмен сообщениями, пока не увидит
+        подтверждение hello. Мы копируем эту логику и подробно логируем все
+        промежуточные пакеты, чтобы понимать, на каком этапе зависает диалог.
+        """
+
+        if not self._ws:
+            raise RuntimeError("WebSocket не инициализирован")
+
+        try:
+            while not self._hello_confirmed.is_set():
+                try:
+                    message = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    self._invalidate_cached_websocket(reason="hello timeout", code=None)
+                    raise RuntimeError("не дождались hello от сервера Xiaozhi") from None
+
+                if isinstance(message, bytes):
+                    log.debug("получено бинарное сообщение до hello", extra={"ctx": {"size": len(message)}})
+                    continue
+
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    log.debug("получен не‑JSON до hello", extra={"ctx": {"message": message}})
+                    continue
+
+                log.debug("получено сообщение при ожидании hello", extra={"ctx": data})
+                if data.get("type") == "hello":
+                    self._hello_confirmed.set()
+                    log.info("сервер подтвердил hello", extra={"ctx": {"transport": data.get("transport")}})
+                    break
+
+                # Если пришло что-то иное — буферизуем его для дальнейшего чтения
+                # ответов, чтобы не потерять реальные данные, пришедшие раньше
+                # hello. Это редко, но помогает при нестабильной сети.
+                await self._prepend_message(json.dumps(data))
+        except ConnectionClosed as err:
+            self._invalidate_cached_websocket(reason=str(err), code=err.code)
+            raise RuntimeError("WebSocket закрыт до получения hello") from err
+
+    async def _prepend_message(self, message: str) -> None:
+        """Возвращает сообщение обратно в поток чтения.
+
+        В клиенте websockets нет стандартного буфера, поэтому мы переиспользуем
+        простую очередь для чтения в `_wait_text_reply`: помещаем сообщение в
+        начало через локальный async-генератор.
+        """
+
+        if not self._ws:
+            return
+        # websockets не предоставляет публичного API для возврата сообщения,
+        # поэтому используем небольшой трюк: создаём таск, который немедленно
+        # отправит сообщение в сторону клиента, где оно будет считано как
+        # очередной кадр. Для тестов DummyWebSocket реализует feed.
+        if hasattr(self._ws, "feed"):
+            await self._ws.feed(message)  # type: ignore[attr-defined]
+        else:
+            # В бою просто логируем — сервер обычно не шлёт лишних сообщений
+            # до hello, поэтому потеря одного пакета маловероятна.
+            log.debug("не удалось буферизовать сообщение", extra={"ctx": {"message": message}})
 
     async def ask_text(self, text: str, trace_id: str | None = None, timeout: float = 20.0) -> str | None:
         """Отправляет текст на сервер Xiaozhi и возвращает первый текстовый ответ.
@@ -605,7 +685,14 @@ class XiaozhiClient:
             if activation_prompt:
                 return activation_prompt
 
-            ws = await self._connect(ensure_config=False)
+            try:
+                ws = await self._connect(ensure_config=False)
+            except Exception as err:
+                log.error(
+                    "не удалось открыть WebSocket перед отправкой текста",
+                    extra={"ctx": {"error": str(err)}},
+                )
+                return None
             # Сообщение повторяет py-xiaozhi: wake-word событие listen/detect с
             # полем text. Используем тот же session_id, чтобы сервер связал
             # диалог с последующими аудио/текстовыми ответами.

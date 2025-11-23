@@ -35,23 +35,31 @@ class DummyWebSocket:
         self.sent: list[str] = []
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
         self.closed = False
+        self.recv_calls: list[str | None] = []
 
     async def send(self, message: str) -> None:
         self.sent.append(message)
 
-    def feed(self, message: str | None) -> None:
+    async def feed(self, message: str | None) -> None:
         """Помещает сообщение в очередь ответа."""
 
         self._queue.put_nowait(message)
+
+    async def recv(self) -> str:
+        item = await self._queue.get()
+        self.recv_calls.append(item)
+        if item is None:
+            raise ConnectionClosed(Close(1000, "closed"), Close(1000, "closed"))
+        return item
 
     def __aiter__(self) -> "DummyWebSocket":
         return self
 
     async def __anext__(self) -> str:
-        item = await self._queue.get()
-        if item is None:
+        try:
+            return await self.recv()
+        except ConnectionClosed:
             raise StopAsyncIteration
-        return item
 
 
 def test_ensure_efuse_generates_persistent_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -276,8 +284,9 @@ async def test_activation_code_is_returned_to_user_once(
 
     # Повторный вызов должен идти в WebSocket, так как код уже доставлен.
     ws = DummyWebSocket()
-    ws.feed(json.dumps({"text": "ответ после активации"}))
-    ws.feed(None)
+    await ws.feed(json.dumps({"type": "hello"}))
+    await ws.feed(json.dumps({"text": "ответ после активации"}))
+    await ws.feed(None)
 
     async def fake_connect_second(*_: Any, **__: Any) -> DummyWebSocket:
         return ws
@@ -509,8 +518,9 @@ async def test_ask_text_uses_websocket(tmp_path: Path, monkeypatch: pytest.Monke
     )
 
     ws = DummyWebSocket()
-    ws.feed(json.dumps({"text": "привет от Xiaozhi"}))
-    ws.feed(None)
+    await ws.feed(json.dumps({"type": "hello"}))
+    await ws.feed(json.dumps({"text": "привет от Xiaozhi"}))
+    await ws.feed(None)
 
     async def fake_connect(*_: Any, **__: Any) -> DummyWebSocket:
         return ws
@@ -543,8 +553,9 @@ async def test_ask_text_sends_trace_id_and_detect(tmp_path: Path, monkeypatch: p
     )
 
     ws = DummyWebSocket()
-    ws.feed(json.dumps({"text": "ответ"}))
-    ws.feed(None)
+    await ws.feed(json.dumps({"type": "hello"}))
+    await ws.feed(json.dumps({"text": "ответ"}))
+    await ws.feed(None)
 
     async def fake_connect(*_: Any, **__: Any) -> DummyWebSocket:
         return ws
@@ -558,6 +569,41 @@ async def test_ask_text_sends_trace_id_and_detect(tmp_path: Path, monkeypatch: p
     sent_payloads = [json.loads(raw) for raw in ws.sent if "listen" in raw]
     assert sent_payloads[-1]["trace_id"] == "trace-id"
     assert sent_payloads[-1]["state"] == "detect"
+
+
+@pytest.mark.asyncio
+async def test_waits_for_server_hello_before_listen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Клиент ожидает hello от сервера и только потом шлёт listen/detect."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://example",
+        websocket_token="secret-token",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="cli",
+    )
+
+    ws = DummyWebSocket()
+    # Сначала придёт серверный hello, затем текстовый ответ
+    await ws.feed(json.dumps({"type": "hello", "transport": "websocket"}))
+    await ws.feed(json.dumps({"text": "ответ после hello"}))
+    await ws.feed(None)
+
+    async def fake_connect(*_: Any, **__: Any) -> DummyWebSocket:
+        return ws
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    client = XiaozhiClient(cfg)
+    reply = await client.ask_text("hi", timeout=1)
+
+    assert reply == "ответ после hello"
+    # Проверяем, что серверный hello действительно считан до listen/detect
+    assert ws.recv_calls and json.loads(ws.recv_calls[0])["type"] == "hello"
+    sent_payloads = [json.loads(raw) for raw in ws.sent if "listen" in raw]
+    assert sent_payloads and sent_payloads[-1]["text"] == "hi"
 
 
 @pytest.mark.asyncio
