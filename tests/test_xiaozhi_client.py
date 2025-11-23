@@ -18,6 +18,19 @@ from core.xiaozhi_client import (
 )
 
 
+def _build_dummy_wav() -> bytes:
+    import io
+    import wave
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x01\x00" * 960)  # 60 мс моно PCM
+    return buffer.getvalue()
+
+
 class DummyResponse:
     def __init__(self, status_code: int = 200, body: str | bytes | None = None):
         self.status_code = status_code
@@ -220,6 +233,9 @@ def test_audio_http(monkeypatch):
 def test_audio_websocket(monkeypatch):
     events: List[str] = []
 
+    def fake_opus_to_wav(frames, trace_id=""):
+        return b"".join(frames)
+
     def fake_connect(url, additional_headers=None, open_timeout=None, close_timeout=None):  # noqa: ANN001
         events.append(url)
 
@@ -248,11 +264,12 @@ def test_audio_websocket(monkeypatch):
 
     jsonlib = __import__("json")
     monkeypatch.setattr("core.xiaozhi_client.connect", fake_connect)
+    monkeypatch.setattr(XiaozhiClient, "_opus_frames_to_wav", staticmethod(fake_opus_to_wav))
 
     settings = XiaozhiSettings(endpoint="ws://localhost:1234", agent_code="abc", timeout=2)
     client = XiaozhiClient(settings)
 
-    reply = client.ask_audio(b"pcm")
+    reply = client.ask_audio(_build_dummy_wav())
     assert reply == b"part1"
     assert events[0] == "ws://localhost:1234"
 
@@ -265,3 +282,17 @@ def test_audio_requires_agent_code(monkeypatch):
 
     with pytest.raises(RuntimeError, match="agent_code"):
         client.ask_audio(b"pcm")
+
+
+def test_opus_roundtrip_helpers():
+    """WAV → Opus → WAV должен проходить без потери API контракта."""
+
+    settings = XiaozhiSettings(endpoint="wss://example", agent_code="token")
+    client = XiaozhiClient(settings)
+
+    wav = _build_dummy_wav()
+    frames = client._encode_wav_to_opus(wav)
+    assert frames, "Opus кадры должны быть сформированы"
+
+    restored = client._opus_frames_to_wav(frames)
+    assert len(restored) > 44  # WAV header + полезная нагрузка

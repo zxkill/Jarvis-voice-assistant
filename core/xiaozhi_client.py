@@ -7,15 +7,18 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import socket
+import wave
 from dataclasses import dataclass
 import re
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests
+from opuslib import Decoder, Encoder
 from websockets.sync.client import connect
 
 logger = logging.getLogger(__name__)
@@ -50,6 +53,13 @@ class XiaozhiClient:
     поведение к прошивке ESP32, где основное общение с моделью идёт через
     WebSocket, но сохраняет обратную совместимость с HTTP‑прокси.
     """
+
+    # Настройки аудио, совпадающие с официальной прошивкой ESP32: Opus 16 kHz,
+    # моно, длительность кадра 60 мс. Значения используются и при кодировании
+    # исходного WAV, и при декодировании бинарных ответов в PCM/WAV.
+    OPUS_SAMPLE_RATE = 16000
+    OPUS_FRAME_DURATION_MS = 60
+    OPUS_FRAME_SIZE = int(OPUS_SAMPLE_RATE * (OPUS_FRAME_DURATION_MS / 1000))
 
     def __init__(self, settings: XiaozhiSettings) -> None:
         self.settings = settings
@@ -165,12 +175,13 @@ class XiaozhiClient:
         }
 
     def _build_hello_message(self) -> str:
-        """Сформировать hello для WebSocket по образцу прошивки ESP32.
+        """Сформировать hello для WebSocket по официальной схеме.
 
-        В оригинальной прошивке заголовок Authorization передаётся вместе с
-        hello, поэтому мы дополнительно прокидываем share_code и идентификаторы
-        устройства в тело. Это помогает серверу не разрывать соединение кодом
-        1005 из‑за отсутствия связки устройства с агентом.
+        Оригинальная прошивка шлёт минимальный набор полей: тип сообщения,
+        версию протокола, поддержку MCP и параметры аудио (Opus, 16 kHz, mono,
+        60 мс). Идентификаторы устройства и токен идут строго в заголовках
+        WebSocket, поэтому не передаём их в body, чтобы не нарушать серверную
+        проверку формата (разрыв с кодом 1005 без ответа).
         """
 
         return json.dumps(
@@ -179,14 +190,11 @@ class XiaozhiClient:
                 "version": 1,
                 "features": {"mcp": True},
                 "transport": "websocket",
-                "share_code": self.settings.agent_code,
-                "device_id": self.settings.device_id,
-                "client_id": self.settings.client_id,
                 "audio_params": {
                     "format": "opus",
-                    "sample_rate": 16000,
+                    "sample_rate": self.OPUS_SAMPLE_RATE,
                     "channels": 1,
-                    "frame_duration": 60,
+                    "frame_duration": self.OPUS_FRAME_DURATION_MS,
                 },
             }
         )
@@ -467,10 +475,103 @@ class XiaozhiClient:
             logger.error("Ошибка WebSocket Xiaozhi: %s", exc, extra={"trace_id": trace_id})
             raise RuntimeError("Не удалось получить ответ от Xiaozhi по WebSocket") from exc
 
+    @staticmethod
+    def _read_wav_pcm(wav_bytes: bytes, *, trace_id: str = "") -> tuple[bytes, int]:
+        """Извлечь PCM и sample rate из WAV-байтов с подробным логом."""
+
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            sample_rate = wf.getframerate()
+            pcm = wf.readframes(wf.getnframes())
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+
+        logger.debug(
+            "Разобрали WAV для Xiaozhi",
+            extra={"trace_id": trace_id, "rate": sample_rate, "channels": channels, "width": sampwidth},
+        )
+        if channels != 1 or sampwidth != 2:
+            logger.warning(
+                "WAV не mono/16-bit, сервер Xiaozhi ожидает mono PCM",
+                extra={"trace_id": trace_id, "channels": channels, "width": sampwidth},
+            )
+        return pcm, sample_rate
+
+    def _encode_wav_to_opus(self, wav_bytes: bytes, *, trace_id: str = "") -> list[bytes]:
+        """Преобразовать WAV в список Opus-кадров длительностью 60 мс."""
+
+        pcm, sample_rate = self._read_wav_pcm(wav_bytes, trace_id=trace_id)
+        if sample_rate != self.OPUS_SAMPLE_RATE:
+            logger.warning(
+                "Частота WAV %s Hz не совпадает с 16 kHz, Opus будет пересчитывать",
+                sample_rate,
+                extra={"trace_id": trace_id},
+            )
+
+        encoder = Encoder(self.OPUS_SAMPLE_RATE, 1, application="audio")
+        frame_bytes = self.OPUS_FRAME_SIZE * 2  # 16-bit mono → 2 байта на сэмпл
+        opus_frames: list[bytes] = []
+        for offset in range(0, len(pcm), frame_bytes):
+            frame = pcm[offset : offset + frame_bytes]
+            if len(frame) < frame_bytes:
+                # Добиваем тишиной, чтобы последний кадр не был урезан сервером
+                frame = frame.ljust(frame_bytes, b"\x00")
+            encoded = encoder.encode(frame, self.OPUS_FRAME_SIZE)
+            opus_frames.append(encoded)
+            logger.debug(
+                "Сформирован Opus-кадр для Xiaozhi",
+                extra={"trace_id": trace_id, "frame_len": len(encoded), "offset": offset},
+            )
+
+        logger.info(
+            "Всего подготовлено %d Opus-кадров для Xiaozhi",
+            len(opus_frames),
+            extra={"trace_id": trace_id},
+        )
+        return opus_frames
+
+    def _opus_frames_to_wav(self, frames: list[bytes], *, trace_id: str = "") -> bytes:
+        """Собрать WAV из списка Opus-кадров для дальнейшей транскрипции."""
+
+        decoder = Decoder(self.OPUS_SAMPLE_RATE, 1)
+        pcm_chunks: list[bytes] = []
+        for index, frame in enumerate(frames):
+            try:
+                pcm = decoder.decode(frame, self.OPUS_FRAME_SIZE)
+                pcm_chunks.append(pcm)
+                logger.debug(
+                    "Декодирован Opus-кадр Xiaozhi",
+                    extra={"trace_id": trace_id, "index": index, "pcm_len": len(pcm)},
+                )
+            except Exception as exc:  # pragma: no cover - декодер может упасть на битых данных
+                logger.error(
+                    "Ошибка декодирования Opus-кадра Xiaozhi: %s",
+                    exc,
+                    extra={"trace_id": trace_id, "index": index, "frame_len": len(frame)},
+                )
+                continue
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.OPUS_SAMPLE_RATE)
+            wf.writeframes(b"".join(pcm_chunks))
+
+        wav = buffer.getvalue()
+        logger.info(
+            "Собран WAV из %d Opus-кадров Xiaozhi", len(frames), extra={"trace_id": trace_id, "bytes": len(wav)}
+        )
+        return wav
+
     def _ask_websocket_audio(
         self, wav_bytes: bytes, *, trace_id: str = "", override_endpoint: Optional[str] = None
     ) -> bytes:
         """Передать аудио в Xiaozhi по WebSocket и вернуть бинарный ответ."""
+
+        opus_frames = self._encode_wav_to_opus(wav_bytes, trace_id=trace_id)
+        if not opus_frames:
+            logger.error("Не удалось подготовить Opus кадры для Xiaozhi", extra={"trace_id": trace_id})
+            raise RuntimeError("Не удалось подготовить аудио для Xiaozhi")
 
         headers = {
             "device-id": self.settings.device_id,
@@ -482,9 +583,10 @@ class XiaozhiClient:
             headers["X-Trace-Id"] = trace_id
 
         endpoint = override_endpoint or self.settings.endpoint
+        total_opus_bytes = sum(len(frame) for frame in opus_frames)
         logger.debug(
             "Устанавливаем WebSocket для аудио Xiaozhi",
-            extra={"endpoint": endpoint, "trace_id": trace_id, "bytes": len(wav_bytes)},
+            extra={"endpoint": endpoint, "trace_id": trace_id, "bytes": total_opus_bytes},
         )
 
         try:
@@ -504,8 +606,12 @@ class XiaozhiClient:
                     )
                     ws.send(listen)
 
-                # Основной аудио-трафик отправляем бинарным кадром, как это делает ESP32.
-                ws.send(wav_bytes)
+                # Основной аудио-трафик отправляем кадр за кадром Opus, как в прошивке ESP32.
+                for idx, frame in enumerate(opus_frames):
+                    ws.send(frame)
+                    logger.debug(
+                        "Отправлен Opus-кадр Xiaozhi", extra={"trace_id": trace_id, "index": idx, "len": len(frame)}
+                    )
 
                 chunks: list[bytes] = []
                 while True:
@@ -542,11 +648,11 @@ class XiaozhiClient:
                     logger.error("Пустой аудио-ответ от Xiaozhi", extra={"trace_id": trace_id})
                     raise RuntimeError("Xiaozhi не вернул аудио")
 
-                merged = b"".join(chunks)
+                wav_response = self._opus_frames_to_wav(chunks, trace_id=trace_id)
                 logger.info(
-                    "Получен аудио-ответ от Xiaozhi (WebSocket)", extra={"bytes": len(merged), "trace_id": trace_id}
+                    "Получен аудио-ответ от Xiaozhi (WebSocket)", extra={"bytes": len(wav_response), "trace_id": trace_id}
                 )
-                return merged
+                return wav_response
         except Exception as exc:
             logger.error("Ошибка WebSocket Xiaozhi (аудио): %s", exc, extra={"trace_id": trace_id})
             raise RuntimeError("Не удалось получить аудио от Xiaozhi по WebSocket") from exc
