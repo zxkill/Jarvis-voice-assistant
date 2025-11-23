@@ -172,6 +172,54 @@ async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_activation_code_is_returned_to_user_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Код активации должен один раз вернуться пользователю вместо диалога."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    client = XiaozhiClient(cfg)
+
+    payload = {
+        "websocket": {"url": "ws://example", "token": "secret-token"},
+        "activation": {"code": "5678", "message": "Введите его на xiaozhi.me"},
+    }
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        return DummyResponse(payload)
+
+    called_ws = False
+
+    async def fake_connect(*_: Any, **__: Any) -> DummyWebSocket:  # pragma: no cover - на первом вызове не должен сработать
+        nonlocal called_ws
+        called_ws = True
+        return DummyWebSocket()
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    reply = await client.ask_text("hi", trace_id="trace", timeout=1)
+
+    assert "5 6 7 8" in (reply or "")
+    assert called_ws is False  # код отдали в чат без открытия WebSocket
+    assert cfg.get("activation")["last_notified_code"] == "5678"
+
+    # Повторный вызов должен идти в WebSocket, так как код уже доставлен.
+    ws = DummyWebSocket()
+    ws.feed(json.dumps({"text": "ответ после активации"}))
+    ws.feed(None)
+
+    async def fake_connect_second(*_: Any, **__: Any) -> DummyWebSocket:
+        return ws
+
+    monkeypatch.setattr("websockets.connect", fake_connect_second)
+
+    reply2 = await client.ask_text("hi", trace_id="trace", timeout=1)
+
+    assert reply2 == "ответ после активации"
+
+
+@pytest.mark.asyncio
 async def test_ensure_remote_config_respects_activation_version_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

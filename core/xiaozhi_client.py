@@ -33,6 +33,9 @@ class XiaozhiClient:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._lock = asyncio.Lock()
         self._session_id = str(uuid.uuid4())
+        # Память для текстового уведомления о привязке устройства, которое надо
+        # отдать пользователю один раз и не спамить в чат при каждом запросе.
+        self._activation_prompt: str | None = None
 
     def _resolve_mac(self, fallback: Optional[str] = None) -> str:
         """Пытается получить и нормализовать MAC из разных источников.
@@ -72,6 +75,56 @@ class XiaozhiClient:
         hint = "укажите корректный MAC в config/xiaozhi.json -> efuse.mac_address"
         raise RuntimeError(f"не удалось определить MAC для Xiaozhi: {last_error or 'нет кандидатов'}; {hint}")
 
+    def _capture_activation_prompt(self, activation: Dict[str, Any]) -> None:
+        """Формирует текст подсказки для привязки устройства, если есть код.
+
+        Метод вызывается после успешного запроса OTA. Чтобы не заспамить чат,
+        мы сверяем код с ранее отправленным (`activation.last_notified_code`)
+        и сохраняем сформированную подсказку во временное поле `_activation_prompt`.
+        """
+
+        code = activation.get("code")
+        if not code:
+            # Если код не пришёл, сбрасываем подсказку — возможно устройство уже
+            # активировано, и напоминание не требуется.
+            self._activation_prompt = None
+            return
+
+        last_notified = (self.config.get("activation") or {}).get("last_notified_code")
+        if last_notified and str(last_notified) == str(code):
+            # Код уже сообщали, повторять нет смысла.
+            self._activation_prompt = None
+            return
+
+        pretty_code = " ".join(list(str(code)))
+        message = activation.get("message") or "Откройте https://xiaozhi.me/ и введите код для привязки."
+        self._activation_prompt = f"Код привязки Xiaozhi: {pretty_code}. {message}"
+        log.info(
+            "получен новый код привязки", extra={"ctx": {"code": pretty_code, "hint": message}}
+        )
+
+    def _consume_activation_prompt(self) -> str | None:
+        """Возвращает и сбрасывает подсказку по привязке устройства.
+
+        Одновременно помечает код как доставленный, сохраняя его в конфигурации,
+        чтобы больше не отправлять одно и то же значение в чат.
+        """
+
+        prompt = self._activation_prompt
+        if not prompt:
+            return None
+
+        activation = self.config.get("activation") or {}
+        code = activation.get("code")
+        if code:
+            self.config.update(activation={"last_notified_code": code})
+            log.info(
+                "отправляю пользователю код привязки", extra={"ctx": {"code": code}}
+            )
+
+        self._activation_prompt = None
+        return prompt
+
     async def ensure_remote_config(self) -> Dict[str, Any]:
         """Получает настройки с OTA и фиксирует их в конфиге.
 
@@ -83,6 +136,9 @@ class XiaozhiClient:
         cached_url = (network_cfg.get("websocket") or {}).get("url") or self.config.get("websocket_url")
         cached_token = (network_cfg.get("websocket") or {}).get("token") or self.config.get("websocket_token")
         if cached_url and cached_token:
+            # Даже при наличии кэша пробуем показать код активации, если он
+            # был сохранён ранее, но ещё не отправлялся пользователю.
+            self._capture_activation_prompt(self.config.get("activation") or {})
             log.debug("websocket конфигурация найдена в кэше")
             return self.config.data
 
@@ -192,12 +248,10 @@ class XiaozhiClient:
             hardware_hash=profile.hardware_hash,
             efuse=efuse_block,
         )
-        if activation.get("code"):
-            pretty_code = " ".join(list(str(activation.get("code"))))
-            log.info(
-                "получен код привязки устройства", extra={"ctx": {"code": pretty_code, "hint": activation.get("message")}}
-            )
-        else:
+        # Запоминаем код активации, если он пришёл, чтобы потом показать его
+        # пользователю в чате и не заставлять искать сообщение в логах.
+        self._capture_activation_prompt(activation)
+        if not activation.get("code"):
             log.info("сервер не вернул код активации, устройство вероятно уже привязано")
         log.debug(
             "получены сетевые настройки Xiaozhi",
@@ -249,13 +303,19 @@ class XiaozhiClient:
         log.info("задал новый device_id", extra={"ctx": {"device_id": fallback_mac}})
         return fallback_mac
 
-    async def _connect(self) -> websockets.WebSocketClientProtocol:
-        """Открывает WebSocket‑соединение, если его ещё нет."""
+    async def _connect(self, *, ensure_config: bool = True) -> websockets.WebSocketClientProtocol:
+        """Открывает WebSocket‑соединение, если его ещё нет.
+
+        Параметр ``ensure_config`` позволяет пропускать повторный запрос OTA,
+        если он уже выполнен ранее (например, в ``ask_text`` для получения
+        кода привязки до установления соединения).
+        """
 
         if self._ws and not self._ws.closed:
             return self._ws
 
-        await self.ensure_remote_config()
+        if ensure_config:
+            await self.ensure_remote_config()
         network_cfg = self.config.get("network") or {}
         url = (network_cfg.get("websocket") or {}).get("url") or self.config.get("websocket_url")
         token = (network_cfg.get("websocket") or {}).get("token") or self.config.get("websocket_token")
@@ -290,7 +350,14 @@ class XiaozhiClient:
         """Отправляет текст на сервер Xiaozhi и возвращает первый текстовый ответ."""
 
         async with self._lock:
-            ws = await self._connect()
+            # Сначала гарантируем актуальную OTA‑конфигурацию и проверяем, нет
+            # ли свежего кода активации, который нужно отдать пользователю.
+            await self.ensure_remote_config()
+            activation_prompt = self._consume_activation_prompt()
+            if activation_prompt:
+                return activation_prompt
+
+            ws = await self._connect(ensure_config=False)
             payload = {"type": "text", "text": text, "session_id": self._session_id}
             if trace_id:
                 payload["trace_id"] = trace_id
