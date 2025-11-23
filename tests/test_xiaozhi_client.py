@@ -18,6 +18,32 @@ from core.xiaozhi_client import (
 )
 
 
+@pytest.fixture()
+def dummy_opus(monkeypatch):
+    """Подменяет загрузку opuslib, чтобы тесты не требовали системный libopus."""
+
+    class DummyEncoder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def encode(self, frame, *_args, **_kwargs):  # noqa: D401
+            return frame
+
+    class DummyDecoder:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def decode(self, frame, *_args, **_kwargs):  # noqa: D401
+            return frame
+
+    monkeypatch.setattr(
+        XiaozhiClient,
+        "_ensure_opus_loaded",
+        lambda self: (DummyEncoder, DummyDecoder),
+        raising=False,
+    )
+
+
 def _build_dummy_wav() -> bytes:
     import io
     import wave
@@ -230,7 +256,7 @@ def test_audio_http(monkeypatch):
     assert captured["headers"]["X-Trace-Id"] == "trace-audio"
 
 
-def test_audio_websocket(monkeypatch):
+def test_audio_websocket(monkeypatch, dummy_opus):
     events: List[str] = []
 
     def fake_opus_to_wav(frames, trace_id=""):
@@ -284,7 +310,7 @@ def test_audio_requires_agent_code(monkeypatch):
         client.ask_audio(b"pcm")
 
 
-def test_opus_roundtrip_helpers():
+def test_opus_roundtrip_helpers(dummy_opus):
     """WAV → Opus → WAV должен проходить без потери API контракта."""
 
     settings = XiaozhiSettings(endpoint="wss://example", agent_code="token")

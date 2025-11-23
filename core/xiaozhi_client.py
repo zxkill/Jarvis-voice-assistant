@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import importlib
 import io
 import json
 import logging
@@ -18,7 +19,6 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
 import requests
-from opuslib import Decoder, Encoder
 from websockets.sync.client import connect
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,33 @@ class XiaozhiClient:
         # чтобы заголовок Client-Id всегда присутствовал, как в прошивке ESP32.
         if not self.settings.client_id:
             self.settings.client_id = self.settings.device_id
+
+        # Загрузка Opus откладывается до первого аудио-запроса. Так сервис
+        # сможет стартовать даже при отсутствии зависимости, а в логах будет
+        # понятная ошибка о необходимости установить `opuslib` перед
+        # использованием голосового моста.
+        self._opus_encoder_cls = None
+        self._opus_decoder_cls = None
+
+    def _ensure_opus_loaded(self) -> tuple[type, type]:
+        """Лениво загрузить классы Encoder/Decoder из ``opuslib``."""
+
+        if self._opus_encoder_cls and self._opus_decoder_cls:
+            return self._opus_encoder_cls, self._opus_decoder_cls
+
+        import importlib
+
+        spec = importlib.util.find_spec("opuslib")
+        if spec is None:
+            raise RuntimeError(
+                "Отсутствует зависимость opuslib: установите её из requirements.txt перед использованием Xiaozhi аудио"
+            )
+
+        opus_module = importlib.import_module("opuslib")
+        self._opus_encoder_cls = opus_module.Encoder
+        self._opus_decoder_cls = opus_module.Decoder
+        logger.debug("Библиотека opuslib загружена лениво", extra={"encoder": str(self._opus_encoder_cls)})
+        return self._opus_encoder_cls, self._opus_decoder_cls
 
     def _build_auth_headers(self) -> Dict[str, str]:
         """Собрать авторизационные заголовки с безопасной обработкой префикса.
@@ -507,7 +534,8 @@ class XiaozhiClient:
                 extra={"trace_id": trace_id},
             )
 
-        encoder = Encoder(self.OPUS_SAMPLE_RATE, 1, application="audio")
+        encoder_cls, _ = self._ensure_opus_loaded()
+        encoder = encoder_cls(self.OPUS_SAMPLE_RATE, 1, application="audio")
         frame_bytes = self.OPUS_FRAME_SIZE * 2  # 16-bit mono → 2 байта на сэмпл
         opus_frames: list[bytes] = []
         for offset in range(0, len(pcm), frame_bytes):
@@ -532,7 +560,8 @@ class XiaozhiClient:
     def _opus_frames_to_wav(self, frames: list[bytes], *, trace_id: str = "") -> bytes:
         """Собрать WAV из списка Opus-кадров для дальнейшей транскрипции."""
 
-        decoder = Decoder(self.OPUS_SAMPLE_RATE, 1)
+        _, decoder_cls = self._ensure_opus_loaded()
+        decoder = decoder_cls(self.OPUS_SAMPLE_RATE, 1)
         pcm_chunks: list[bytes] = []
         for index, frame in enumerate(frames):
             try:
