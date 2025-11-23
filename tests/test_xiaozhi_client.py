@@ -646,3 +646,54 @@ async def test_connection_close_invalidates_cache(
     assert reply is None
     assert cfg.get("websocket_token") is None
     assert cfg.get("network")["websocket"]["token"] is None
+
+
+@pytest.mark.asyncio
+async def test_retries_ota_after_websocket_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При ошибке WebSocket клиент повторно запрашивает OTA и переподключается."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://stale",  # протухший URL
+        websocket_token="stale-token",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="cli",
+        efuse={"activation_status": True},
+    )
+
+    # Первый вызов websockets.connect рушится, второй отдаёт нормальный сокет.
+    ws = DummyWebSocket()
+    await ws.feed(json.dumps({"type": "hello"}))
+    await ws.feed(json.dumps({"text": "новый ответ"}))
+    await ws.feed(None)
+
+    connect_calls = 0
+
+    async def fake_connect(*_: Any, **__: Any):
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls == 1:
+            raise RuntimeError("ws failed")
+        return ws
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    # OTA вызывается только после сброшенного кэша.
+    ota_calls = 0
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        nonlocal ota_calls
+        ota_calls += 1
+        return DummyResponse({"websocket": {"url": "ws://fresh", "token": "fresh-token"}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    client = XiaozhiClient(cfg)
+    reply = await client.ask_text("hi", timeout=1)
+
+    assert reply == "новый ответ"
+    assert connect_calls == 2  # Вторая попытка после обновления OTA
+    assert ota_calls == 1  # Сходили за новым токеном только после ошибки
+    assert cfg.get("websocket_url") == "ws://fresh"

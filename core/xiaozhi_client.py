@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import ssl
 import uuid
 from hashlib import sha256
 from typing import Any, Callable, Dict, Optional
@@ -134,13 +135,18 @@ class XiaozhiClient:
         self._activation_prompt = None
         return prompt
 
-    async def ensure_remote_config(self) -> Dict[str, Any]:
+    async def ensure_remote_config(self, *, force_refresh: bool = False) -> Dict[str, Any]:
         """Получает настройки с OTA и фиксирует их в конфиге.
 
         Возвращаем словарь с полями, полезными для дальнейшего подключения.
         Если сохранённые значения уже присутствуют, повторный запрос не нужен,
         но только после успешной активации устройства. До подтверждения кода
         мы принудительно обновляем OTA, чтобы поймать свежий токен/URL.
+
+        Аргумент ``force_refresh`` позволяет принудительно переспросить OTA даже
+        при наличии валидного кэша. Это нужно, если сервер разорвал WebSocket
+        или токен протух — в таком случае мы полностью повторяем поведение
+        py-xiaozhi и получаем новый набор параметров без перезапуска клиента.
         """
 
         network_cfg = self.config.get("network") or {}
@@ -156,7 +162,13 @@ class XiaozhiClient:
         activation_confirmed = bool(efuse_block.get("activation_status"))
         activation_pending = bool(activation_block.get("code")) and not activation_confirmed
 
-        if cached_url and cached_token and activation_confirmed:
+        if force_refresh:
+            log.info(
+                "принудительно обновляю OTA, игнорируя кэш",
+                extra={"ctx": {"cached_url": cached_url, "has_token": bool(cached_token)}},
+            )
+
+        if cached_url and cached_token and activation_confirmed and not force_refresh:
             # Даже при наличии кэша пробуем показать код активации, если он
             # был сохранён ранее, но ещё не отправлялся пользователю.
             self._capture_activation_prompt(activation_block)
@@ -171,7 +183,7 @@ class XiaozhiClient:
                 extra={"ctx": {"cached_url": cached_url}},
             )
 
-        elif cached_url and cached_token:
+        elif cached_url and cached_token and not force_refresh:
             # Ситуация, когда активация явно не подтверждена и код не известен.
             # Возможно, пользователь перенёс готовый конфиг вручную. Доверяем
             # этим данным, но оставляем подробное логирование для диагностики.
@@ -563,10 +575,20 @@ class XiaozhiClient:
             "Device-Id": self._ensure_device_id(),
             "Client-Id": self._ensure_client_id(),
         }
-        log.info("открываю WebSocket с Xiaozhi", extra={"ctx": {"url": url}})
+        # Используем отключенную проверку сертификатов, как это делает
+        # оригинальный py-xiaozhi, чтобы не упасть на кастомных CA.
+        ssl_context = ssl._create_unverified_context()
+        log.info(
+            "открываю WebSocket с Xiaozhi",
+            extra={"ctx": {"url": url, "token_tail": token[-6:] if token else None}},
+        )
         try:
             self._ws = await websockets.connect(
-                url, extra_headers=headers, ping_interval=20, ping_timeout=20
+                url,
+                extra_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+                ssl=ssl_context,
             )
         except Exception as err:
             # При ошибке подключения сразу обнуляем кэш, чтобы следующая
@@ -692,7 +714,18 @@ class XiaozhiClient:
                     "не удалось открыть WebSocket перед отправкой текста",
                     extra={"ctx": {"error": str(err)}},
                 )
-                return None
+                # Восстанавливаем соединение по образцу py-xiaozhi: если кэш
+                # токена сброшен из-за ошибки, пытаемся заново запросить OTA и
+                # сразу переподключиться.
+                try:
+                    await self.ensure_remote_config(force_refresh=True)
+                    ws = await self._connect(ensure_config=False)
+                except Exception as retry_err:
+                    log.error(
+                        "повторное подключение к Xiaozhi не удалось",
+                        extra={"ctx": {"error": str(retry_err)}},
+                    )
+                    return None
             # Сообщение повторяет py-xiaozhi: wake-word событие listen/detect с
             # полем text. Используем тот же session_id, чтобы сервер связал
             # диалог с последующими аудио/текстовыми ответами.
