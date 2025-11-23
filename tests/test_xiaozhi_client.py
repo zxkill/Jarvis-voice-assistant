@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+import functools
 from typing import Any
 
 import pytest
@@ -625,6 +626,41 @@ async def test_waits_for_server_hello_before_listen(
     assert ws.recv_calls and json.loads(ws.recv_calls[0])["type"] == "hello"
     sent_payloads = [json.loads(raw) for raw in ws.sent if "listen" in raw]
     assert sent_payloads and sent_payloads[-1]["text"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_hello_timeout_does_not_block_dialogue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Даже при отсутствии server hello клиент продолжает диалог."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://example",
+        websocket_token="secret-token",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="cli",
+    )
+
+    ws = DummyWebSocket()
+    await ws.feed(json.dumps({"text": "ответ без hello"}))
+    await ws.feed(None)
+
+    async def fake_connect(*_: Any, **__: Any) -> DummyWebSocket:
+        return ws
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    client = XiaozhiClient(cfg)
+    # Укорачиваем ожидание hello, чтобы таймаут наступил быстро и не ломал диалог.
+    original_wait = client._wait_for_server_hello
+    client._wait_for_server_hello = functools.partial(original_wait, timeout=0.01)  # type: ignore[assignment]
+
+    reply = await client.ask_text("привет", timeout=1)
+
+    assert reply == "ответ без hello"
+    sent_payloads = [json.loads(raw) for raw in ws.sent if "listen" in raw]
+    assert sent_payloads and sent_payloads[-1]["text"] == "привет"
 
 
 @pytest.mark.asyncio

@@ -712,6 +712,13 @@ class XiaozhiClient:
 
         await self._send_hello()
         await self._wait_for_server_hello()
+        # Если фоновый слушатель успел закрыть соединение (например, сервер
+        # немедленно сбросил рукопожатие), фиксируем это и вызываем ошибку, чтобы
+        # верхний уровень мог повторить запрос OTA/соединения, как делает
+        # py-xiaozhi при 4401/401.
+        if not self._ws or getattr(self._ws, "closed", False):
+            self._invalidate_cached_websocket(reason="ws closed after hello wait", code=None)
+            raise RuntimeError("WebSocket закрылся до начала диалога")
         return self._ws
 
     async def _send_hello(self) -> None:
@@ -742,8 +749,11 @@ class XiaozhiClient:
         """Ожидает ответ hello от сервера перед отправкой команд.
 
         Оригинальный клиент не начинает обмен сообщениями, пока не увидит
-        подтверждение hello. Мы копируем эту логику и подробно логируем все
-        промежуточные пакеты, чтобы понимать, на каком этапе зависает диалог.
+        подтверждение hello. В бою сервер иногда может не прислать приветствие
+        (наблюдается в логах пользователя), поэтому таймаут не роняет процесс,
+        а лишь фиксирует проблему и даёт продолжить обмен. Так проще сравнить
+        поведение с py-xiaozhi и увидеть, возвращаются ли ответы на listen/detect
+        даже без server hello.
         """
 
         if not self._ws:
@@ -787,8 +797,11 @@ class XiaozhiClient:
                     }
                 },
             )
-            self._invalidate_cached_websocket(reason="hello timeout", code=None)
-            raise RuntimeError("не дождались hello от сервера Xiaozhi") from None
+            # В условиях боевого сервера лучше не падать: фиксируем метрику и
+            # позволяем продолжить отправку listen/detect, чтобы проверить,
+            # ответит ли сервер без явного приветствия.
+            self._hello_confirmed.set()
+            return
 
     async def _prepend_message(self, message: str) -> None:
         """Возвращает сообщение обратно в поток чтения.
