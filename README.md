@@ -56,8 +56,30 @@ Jarvis-Pi — русскоязычный офлайн голосовой асс�
 - При первом запросе создаёт код для привязки устройства к агенту Xiaozhi и сохраняет URL/TOKEN WebSocket‑канала.
 - Все текстовые команды из Telegram после неудачного поиска среди навыков отправляются на сервер Xiaozhi; ответ возвращается в чат.
 - Для активации достаточно запустить Jarvis и ввести полученный код на панели https://xiaozhi.me/.
-- Дополнительные параметры (`app_version`, `activation_version`, `accept_language`) можно отредактировать в `config/xiaozhi.json`,
-  чтобы избежать ошибок 400 при обращении к OTA и совместить протокол с официальным клиентом.
+- Конфигурация повторяет структуру оригинального клиента: блок `network` хранит OTA/WebSocket/MQTT параметры, а `efuse` —
+  серийник, MAC и HMAC‑ключ устройства. Это облегчает перенос данных из существующих установок (см. пример ниже) и помогает
+  исключить ошибки 400 при запросах OTA.
+
+Пример секции `config/xiaozhi.json`, формируемой автоматически (поля можно подменить из оригинального клиента):
+
+```json
+{
+  "client_id": "2c2d23b2-be3b-4834-9538-013289d649b5",
+  "device_id": "7a:46:5c:d2:3c:2b",
+  "network": {
+    "ota_url": "https://api.tenclass.net/xiaozhi/ota/",
+    "websocket": {"url": "wss://api.tenclass.net/xiaozhi/v1/", "token": "test-token"},
+    "mqtt": {"endpoint": "mqtt.xiaozhi.me", "client_id": "GID_test@@@...", "publish_topic": "device-server"},
+    "activation_version": "v2",
+    "authorization_url": "https://xiaozhi.me/"
+  },
+  "efuse": {
+    "mac_address": "7a:46:5c:d2:3c:2b",
+    "serial_number": "SN-52C59E20-7a465cd23c2b",
+    "hmac_key": "9659942e3297f9daed59ed269f8e7a1f13a6e5239e19ffff1c2970da23f95031"
+  }
+}
+```
 
 
 ## Подключение аудиопотока робота ESP32

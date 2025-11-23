@@ -41,19 +41,29 @@ class XiaozhiClient:
         Если сохранённые значения уже присутствуют, повторный запрос не нужен.
         """
 
-        cached_url = self.config.get("websocket_url")
-        cached_token = self.config.get("websocket_token")
+        network_cfg = self.config.get("network") or {}
+        cached_url = (network_cfg.get("websocket") or {}).get("url") or self.config.get("websocket_url")
+        cached_token = (network_cfg.get("websocket") or {}).get("token") or self.config.get("websocket_token")
         if cached_url and cached_token:
             log.debug("websocket конфигурация найдена в кэше")
             return self.config.data
 
+        profile = self.device_info.profile()
+        efuse_block = self.config.ensure_efuse(
+            mac=profile.mac_address,
+            machine_id=profile.machine_id,
+            system=profile.system,
+            hostname=profile.hostname,
+        )
+        activation_version = self.config.get("activation_version") or network_cfg.get("activation_version") or "v2"
+        app_version = self.config.get("app_version") or "2.0.0"
         payload = {
             # Блок ``application`` строго повторяет структуру py-xiaozhi:
             # версия приложения уходит в серверные логи и помогает
             # сопоставить клиентскую сборку с используемым протоколом.
             "application": {
-                "version": self.config.get("app_version") or "2.0.0",
-                "elf_sha256": self.device_info.profile().hardware_hash,
+                "version": app_version,
+                "elf_sha256": profile.hardware_hash,
             },
             # Описание платы: тип и имя можно оставить как есть, сервер
             # опирается на MAC/серийник, поэтому важно передать отпечаток
@@ -63,13 +73,22 @@ class XiaozhiClient:
                 "name": "jarvis",
                 **self.device_info.as_payload(),
             },
+            # Efuse‑секция соответствует формату оригинального клиента и
+            # содержит критичные идентификаторы устройства.
+            "efuse": {
+                "mac_address": efuse_block.get("mac_address"),
+                "serial_number": efuse_block.get("serial_number"),
+                "hmac_key": efuse_block.get("hmac_key"),
+                "activation_status": efuse_block.get("activation_status"),
+                "device_fingerprint": efuse_block.get("device_fingerprint"),
+            },
         }
         headers = {
             "Device-Id": self._ensure_device_id(),
             "Client-Id": self._ensure_client_id(),
             "Content-Type": "application/json",
             # User-Agent повторяет оригинальный клиент: <board>/<name>-<version>.
-            "User-Agent": f"linux/jarvis-{self.config.get('app_version') or '2.0.0'}",
+            "User-Agent": f"linux/jarvis-{app_version}",
             # Язык ответов на стороне сервера: по умолчанию zh-CN для
             # совместимости с XiaoZhi, но поле настраиваемое в конфиге.
             "Accept-Language": self.config.get("accept_language") or "zh-CN",
@@ -77,14 +96,15 @@ class XiaozhiClient:
         # Заголовок Activation-Version нужен только для протокола v2 — его
         # значение должно совпадать с версией приложения, иначе сервер
         # вернёт 400. Храним флаг в конфиге, чтобы можно было форсировать v1.
-        if (self.config.get("activation_version") or "v2").lower() == "v2":
-            headers["Activation-Version"] = self.config.get("app_version") or "2.0.0"
+        if activation_version.lower() == "v2":
+            headers["Activation-Version"] = activation_version
 
-        log.info("запрашиваю OTA конфигурацию Xiaozhi", extra={"ctx": {"url": self.config.get("ota_url")}})
+        ota_url = network_cfg.get("ota_url") or self.config.get("ota_url")
+        log.info("запрашиваю OTA конфигурацию Xiaozhi", extra={"ctx": {"url": ota_url}})
         try:
             response = await asyncio.to_thread(
                 requests.post,
-                self.config.get("ota_url"),
+                ota_url,
                 headers=headers,
                 json=payload,
                 timeout=10,
@@ -106,9 +126,17 @@ class XiaozhiClient:
         data = response.json()
         activation = data.get("activation") or {}
         websocket_info = data.get("websocket") or {}
+        mqtt_info = data.get("mqtt") or data.get("MQTT_INFO") or {}
         updated = self.config.update(
             websocket_url=websocket_info.get("url"),
             websocket_token=websocket_info.get("token"),
+            network={
+                "ota_url": ota_url,
+                "websocket": {"url": websocket_info.get("url"), "token": websocket_info.get("token")},
+                "mqtt": mqtt_info,
+                "activation_version": activation_version,
+                "authorization_url": network_cfg.get("authorization_url") or self.config.get("authorization_url"),
+            },
             activation={
                 "code": activation.get("code"),
                 "challenge": activation.get("challenge"),
@@ -116,7 +144,8 @@ class XiaozhiClient:
             },
             device_id=self._ensure_device_id(),
             client_id=self._ensure_client_id(),
-            hardware_hash=self.device_info.profile().hardware_hash,
+            hardware_hash=profile.hardware_hash,
+            efuse=efuse_block,
         )
         if activation.get("code"):
             pretty_code = " ".join(list(str(activation.get("code"))))
@@ -125,6 +154,16 @@ class XiaozhiClient:
             )
         else:
             log.info("сервер не вернул код активации, устройство вероятно уже привязано")
+        log.debug(
+            "получены сетевые настройки Xiaozhi",
+            extra={
+                "ctx": {
+                    "websocket_url": websocket_info.get("url"),
+                    "mqtt_endpoint": mqtt_info.get("endpoint"),
+                    "has_token": bool(websocket_info.get("token")),
+                }
+            },
+        )
         return updated
 
     def _ensure_client_id(self) -> str:
@@ -144,7 +183,9 @@ class XiaozhiClient:
         device_id = self.config.get("device_id")
         if device_id:
             return str(device_id)
-        device_id = self.device_info.profile().hardware_hash[:16]
+        # Используем MAC в качестве device_id для полной совместимости с
+        # оригинальным клиентом Xiaozhi.
+        device_id = self.device_info.profile().mac_address
         self.config.update(device_id=device_id)
         log.info("задал новый device_id", extra={"ctx": {"device_id": device_id}})
         return device_id
@@ -156,8 +197,9 @@ class XiaozhiClient:
             return self._ws
 
         await self.ensure_remote_config()
-        url = self.config.get("websocket_url")
-        token = self.config.get("websocket_token")
+        network_cfg = self.config.get("network") or {}
+        url = (network_cfg.get("websocket") or {}).get("url") or self.config.get("websocket_url")
+        token = (network_cfg.get("websocket") or {}).get("token") or self.config.get("websocket_token")
         if not url or not token:
             raise RuntimeError("WebSocket параметры Xiaozhi не заданы")
 
