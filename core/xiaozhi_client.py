@@ -129,17 +129,48 @@ class XiaozhiClient:
         """Получает настройки с OTA и фиксирует их в конфиге.
 
         Возвращаем словарь с полями, полезными для дальнейшего подключения.
-        Если сохранённые значения уже присутствуют, повторный запрос не нужен.
+        Если сохранённые значения уже присутствуют, повторный запрос не нужен,
+        но только после успешной активации устройства. До подтверждения кода
+        мы принудительно обновляем OTA, чтобы поймать свежий токен/URL.
         """
 
         network_cfg = self.config.get("network") or {}
+        activation_block = self.config.get("activation") or {}
+        efuse_block = self.config.get("efuse") or {}
         cached_url = (network_cfg.get("websocket") or {}).get("url") or self.config.get("websocket_url")
         cached_token = (network_cfg.get("websocket") or {}).get("token") or self.config.get("websocket_token")
-        if cached_url and cached_token:
+
+        # Сервер выдаёт временный токен/URL пока устройство не подтверждено.
+        # После ввода кода привязки нужно повторно сходить в OTA, иначе
+        # WebSocket может игнорировать команды. Поэтому кэш используем только
+        # если активация подтверждена на стороне efuse (activation_status=True).
+        activation_confirmed = bool(efuse_block.get("activation_status"))
+        activation_pending = bool(activation_block.get("code")) and not activation_confirmed
+
+        if cached_url and cached_token and activation_confirmed:
             # Даже при наличии кэша пробуем показать код активации, если он
             # был сохранён ранее, но ещё не отправлялся пользователю.
-            self._capture_activation_prompt(self.config.get("activation") or {})
-            log.debug("websocket конфигурация найдена в кэше")
+            self._capture_activation_prompt(activation_block)
+            log.debug(
+                "websocket конфигурация найдена в кэше", extra={"ctx": {"activation_confirmed": activation_confirmed}}
+            )
+            return self.config.data
+
+        if cached_url and cached_token and activation_pending:
+            log.info(
+                "активация ещё не подтверждена на стороне сервера, принудительно обновляю OTA",
+                extra={"ctx": {"cached_url": cached_url}},
+            )
+
+        elif cached_url and cached_token:
+            # Ситуация, когда активация явно не подтверждена и код не известен.
+            # Возможно, пользователь перенёс готовый конфиг вручную. Доверяем
+            # этим данным, но оставляем подробное логирование для диагностики.
+            self._capture_activation_prompt(activation_block)
+            log.info(
+                "использую сохранённые WebSocket параметры без повторной OTA",
+                extra={"ctx": {"activation_confirmed": activation_confirmed}},
+            )
             return self.config.data
 
         profile = self.device_info.profile()
@@ -226,6 +257,18 @@ class XiaozhiClient:
 
         data = response.json()
         activation = data.get("activation") or {}
+        # Сервер может вернуть новое состояние активации ("activation_status"),
+        # поэтому фиксируем его в efuse, чтобы в следующий раз можно было
+        # безопасно использовать кэш без дополнительного запроса OTA.
+        activation_status = (
+            activation.get("activation_status")
+            or (data.get("efuse") or {}).get("activation_status")
+            or (data.get("efuse") or {}).get("activationStatus")
+            or data.get("activation_status")
+        )
+        if activation_status is not None:
+            efuse_block = {**efuse_block, "activation_status": bool(activation_status)}
+            self.config.update(efuse=efuse_block)
         websocket_info = data.get("websocket") or {}
         mqtt_info = data.get("mqtt") or data.get("MQTT_INFO") or {}
         updated = self.config.update(
@@ -389,6 +432,11 @@ class XiaozhiClient:
             for entry in text_fields:
                 if entry:
                     log.info("получен ответ Xiaozhi", extra={"ctx": {"text": entry}})
+                    # Раз ответ пришёл, можно считать устройство успешно
+                    # активированным: фиксируем флаг, чтобы больше не дёргать OTA.
+                    efuse = self.config.get("efuse") or {}
+                    if not efuse.get("activation_status"):
+                        self.config.update(efuse={**efuse, "activation_status": True})
                     return entry
             log.debug("получено промежуточное сообщение", extra={"ctx": data})
         return None

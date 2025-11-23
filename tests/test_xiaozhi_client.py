@@ -172,6 +172,71 @@ async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_ensure_remote_config_forces_refresh_until_activated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Даже при наличии кэша до активации нужно повторно сходить в OTA."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    # Симулируем сохранённый ответ до ввода кода: токены есть, но активации нет.
+    cfg.update(
+        websocket_url="ws://cached",
+        websocket_token="cached-token",
+        efuse={"activation_status": False},
+        activation={"code": "111222"},
+    )
+
+    client = XiaozhiClient(cfg)
+
+    called = 0
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        nonlocal called
+        called += 1
+        payload = {
+            "websocket": {"url": "ws://fresh", "token": "fresh-token"},
+            "activation": {"activation_status": True},
+        }
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    data = await client.ensure_remote_config()
+
+    assert called == 1  # Кэш не использован, сходили за новым токеном.
+    assert data["websocket_url"] == "ws://fresh"
+    assert data["efuse"]["activation_status"] is True
+
+
+@pytest.mark.asyncio
+async def test_ensure_remote_config_uses_cache_after_activation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """После подтверждённой активации кэш повторно не дёргает OTA."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://cached", websocket_token="cached-token", efuse={"activation_status": True}
+    )
+
+    client = XiaozhiClient(cfg)
+
+    called = 0
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:  # pragma: no cover - не должен вызываться
+        nonlocal called
+        called += 1
+        return DummyResponse({"websocket": {"url": "ws://fresh", "token": "fresh-token"}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    data = await client.ensure_remote_config()
+
+    assert called == 0  # Использовали кэш, не стучались в сеть.
+    assert data["websocket_url"] == "ws://cached"
+
+
+@pytest.mark.asyncio
 async def test_activation_code_is_returned_to_user_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
