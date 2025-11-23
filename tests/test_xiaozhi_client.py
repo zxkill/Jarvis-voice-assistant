@@ -11,6 +11,7 @@ import pytest
 
 from core.xiaozhi_client import XiaozhiClient
 from core.xiaozhi_config import XiaozhiConfigManager
+from core.xiaozhi_device import normalize_mac
 
 
 class DummyResponse:
@@ -113,6 +114,30 @@ def test_device_id_prefers_mac(tmp_path: Path) -> None:
     assert cfg.get("device_id") == "11:22:33:44:55:66"
 
 
+def test_resolve_mac_prefers_configured_efuse(tmp_path: Path) -> None:
+    """Если MAC есть в efuse, он используется и нормализуется."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(efuse={"mac_address": "7a-46-5c-d2-3c-2b"})
+
+    client = XiaozhiClient(cfg)
+
+    assert client._resolve_mac() == "7A:46:5C:D2:3C:2B"
+
+
+def test_normalize_mac_supports_various_formats() -> None:
+    """Нормализация должна принимать разные разделители и регистр."""
+
+    assert normalize_mac("7a:46:5c:d2:3c:2b") == "7A:46:5C:D2:3C:2B"
+    assert normalize_mac("7A-46-5C-D2-3C-2B") == "7A:46:5C:D2:3C:2B"
+    assert normalize_mac("7A46.5CD2.3C2B") == "7A:46:5C:D2:3C:2B"
+
+    with pytest.raises(ValueError):
+        normalize_mac("123")
+    with pytest.raises(ValueError):
+        normalize_mac("zz:zz:zz:zz:zz:zz")
+
+
 @pytest.mark.asyncio
 async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Убеждаемся, что OTA ответ сохраняется в конфиг."""
@@ -193,6 +218,57 @@ async def test_ensure_remote_config_raises_on_bad_status(
 
 
 @pytest.mark.asyncio
+async def test_ensure_remote_config_fails_fast_on_invalid_mac(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При некорректном MAC запрос OTA даже не отправляется."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(device_id="invalid-mac")
+
+    class DummyProfile:
+        def __init__(self) -> None:
+            self.system = "Linux"
+            self.hostname = "jarvis"
+            self.hardware_hash = "hash"
+            self.mac_address = "invalid-mac"
+            self.machine_id = "machine"
+            self.ip_address = "127.0.0.1"
+
+    class DummyDeviceInfo:
+        def profile(self) -> DummyProfile:
+            return DummyProfile()
+
+        def as_payload(self) -> dict[str, str]:
+            return {
+                "system": "Linux",
+                "hostname": "jarvis",
+                "hardware_hash": "hash",
+                "mac": "invalid-mac",
+                "machine_id": "machine",
+                "ip": "127.0.0.1",
+            }
+
+    client = XiaozhiClient(cfg)
+    client.device_info = DummyDeviceInfo()  # type: ignore[assignment]
+
+    called = False
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:  # pragma: no cover - защита от случайного вызова
+        nonlocal called
+        called = True
+        return DummyResponse({})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    with pytest.raises(RuntimeError) as err:
+        await client.ensure_remote_config()
+
+    assert "не удалось определить MAC" in str(err.value)
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_ask_text_uses_websocket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Клиент отправляет hello и читает текстовый ответ."""
 
@@ -200,7 +276,7 @@ async def test_ask_text_uses_websocket(tmp_path: Path, monkeypatch: pytest.Monke
     cfg.update(
         websocket_url="ws://example",
         websocket_token="secret-token",
-        device_id="dev",
+        device_id="AA:BB:CC:DD:EE:FF",
         client_id="cli",
     )
 

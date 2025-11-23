@@ -5,14 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 import requests
 import websockets
 
 from core.logging_json import configure_logging
 from core.xiaozhi_config import XiaozhiConfigManager
-from core.xiaozhi_device import XiaozhiDeviceInfo
+from core.xiaozhi_device import XiaozhiDeviceInfo, normalize_mac
 
 
 log = configure_logging("core.xiaozhi.client")
@@ -34,6 +34,44 @@ class XiaozhiClient:
         self._lock = asyncio.Lock()
         self._session_id = str(uuid.uuid4())
 
+    def _resolve_mac(self, fallback: Optional[str] = None) -> str:
+        """Пытается получить и нормализовать MAC из разных источников.
+
+        Порядок приоритета:
+        1. efuse.mac_address, если он уже сохранён пользователем.
+        2. device_id, если оно похоже на MAC (для обратной совместимости).
+        3. Переданное значение fallback (обычно из DeviceInfo.profile).
+        При любой ошибке выбрасываем понятное исключение, чтобы пользователь
+        смог исправить конфигурацию и исключить ответ "Invalid MAC address".
+        """
+
+        candidates = [
+            ("efuse", (self.config.get("efuse") or {}).get("mac_address")),
+            ("device_id", self.config.get("device_id")),
+            ("fallback", fallback),
+        ]
+
+        last_error: Exception | None = None
+        for source, candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                normalized = normalize_mac(str(candidate))
+                if source != "fallback":
+                    log.debug(
+                        "использую сохранённый MAC", extra={"ctx": {"source": source, "mac": normalized}}
+                    )
+                return normalized
+            except ValueError as err:
+                last_error = err
+                log.warning(
+                    "невалидный MAC обнаружен", extra={"ctx": {"source": source, "mac": candidate, "error": str(err)}}
+                )
+
+        # Если все варианты оказались некорректными — явно сообщаем о проблеме.
+        hint = "укажите корректный MAC в config/xiaozhi.json -> efuse.mac_address"
+        raise RuntimeError(f"не удалось определить MAC для Xiaozhi: {last_error or 'нет кандидатов'}; {hint}")
+
     async def ensure_remote_config(self) -> Dict[str, Any]:
         """Получает настройки с OTA и фиксирует их в конфиге.
 
@@ -49,14 +87,21 @@ class XiaozhiClient:
             return self.config.data
 
         profile = self.device_info.profile()
+        # Нормализуем MAC заранее, чтобы server-side проверка не отвергла запрос.
+        mac = self._resolve_mac(profile.mac_address)
         efuse_block = self.config.ensure_efuse(
-            mac=profile.mac_address,
+            mac=mac,
             machine_id=profile.machine_id,
             system=profile.system,
             hostname=profile.hostname,
         )
         activation_version = self.config.get("activation_version") or network_cfg.get("activation_version") or "v2"
         app_version = self.config.get("app_version") or "2.0.0"
+        board_payload = self.device_info.as_payload()
+        # Перезаписываем MAC внутри board_payload на нормализованный, чтобы не
+        # было расхождений между efuse и полем board.mac.
+        board_payload["mac"] = mac
+
         payload = {
             # Блок ``application`` строго повторяет структуру py-xiaozhi:
             # версия приложения уходит в серверные логи и помогает
@@ -71,7 +116,7 @@ class XiaozhiClient:
             "board": {
                 "type": "linux",
                 "name": "jarvis",
-                **self.device_info.as_payload(),
+                **board_payload,
             },
             # Efuse‑секция соответствует формату оригинального клиента и
             # содержит критичные идентификаторы устройства.
@@ -84,7 +129,7 @@ class XiaozhiClient:
             },
         }
         headers = {
-            "Device-Id": self._ensure_device_id(),
+            "Device-Id": self._ensure_device_id(mac),
             "Client-Id": self._ensure_client_id(),
             "Content-Type": "application/json",
             # User-Agent повторяет оригинальный клиент: <board>/<name>-<version>.
@@ -142,7 +187,7 @@ class XiaozhiClient:
                 "challenge": activation.get("challenge"),
                 "message": activation.get("message"),
             },
-            device_id=self._ensure_device_id(),
+            device_id=self._ensure_device_id(mac),
             client_id=self._ensure_client_id(),
             hardware_hash=profile.hardware_hash,
             efuse=efuse_block,
@@ -177,18 +222,32 @@ class XiaozhiClient:
         log.info("создан новый client_id для Xiaozhi", extra={"ctx": {"client_id": client_id}})
         return client_id
 
-    def _ensure_device_id(self) -> str:
-        """Возвращает детерминированный device_id на базе hardware_hash."""
+    def _ensure_device_id(self, mac_override: Optional[str] = None) -> str:
+        """Возвращает детерминированный device_id на базе MAC."""
 
         device_id = self.config.get("device_id")
         if device_id:
-            return str(device_id)
+            try:
+                normalized = normalize_mac(str(device_id))
+                if normalized != device_id:
+                    # Приводим legacy значение к каноничному виду и сохраняем.
+                    self.config.update(device_id=normalized)
+                    log.info("нормализовал сохранённый device_id", extra={"ctx": {"device_id": normalized}})
+                return normalized
+            except ValueError:
+                log.warning(
+                    "device_id в конфиге некорректен, переопределяю из MAC",
+                    extra={"ctx": {"device_id": device_id}},
+                )
+
         # Используем MAC в качестве device_id для полной совместимости с
         # оригинальным клиентом Xiaozhi.
-        device_id = self.device_info.profile().mac_address
-        self.config.update(device_id=device_id)
-        log.info("задал новый device_id", extra={"ctx": {"device_id": device_id}})
-        return device_id
+        # Используем переданный MAC или, если его нет, берём актуальный профиль
+        # устройства, чтобы всегда иметь валидное значение для заголовков.
+        fallback_mac = mac_override or self._resolve_mac(self.device_info.profile().mac_address)
+        self.config.update(device_id=fallback_mac)
+        log.info("задал новый device_id", extra={"ctx": {"device_id": fallback_mac}})
+        return fallback_mac
 
     async def _connect(self) -> websockets.WebSocketClientProtocol:
         """Открывает WebSocket‑соединение, если его ещё нет."""

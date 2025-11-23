@@ -4,15 +4,41 @@ from __future__ import annotations
 
 import hashlib
 import platform
+import re
 import socket
 import uuid
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 from core.logging_json import configure_logging
 
 
 log = configure_logging("core.xiaozhi.device")
+
+
+def normalize_mac(raw_mac: Optional[str]) -> str:
+    """Приводит MAC‑адрес к каноничному виду AA:BB:CC:DD:EE:FF.
+
+    Сервер Xiaozhi строго валидирует MAC, поэтому мы:
+    - удаляем разделители (двоеточия/тире/точки),
+    - проверяем, что осталось ровно 12 шестнадцатеричных символов,
+    - возвращаем строку в верхнем регистре, разделённую двоеточиями.
+
+    При некорректном вводе выбрасываем ValueError, чтобы вызывающий код мог
+    сообщить пользователю о необходимости поправить конфиг.
+    """
+
+    if not raw_mac:
+        raise ValueError("MAC отсутствует")
+    # Удаляем все типичные разделители, чтобы унифицировать строку.
+    cleaned = re.sub(r"[^0-9A-Fa-f]", "", raw_mac)
+    if len(cleaned) != 12 or not re.fullmatch(r"[0-9A-Fa-f]{12}", cleaned):
+        raise ValueError(f"некорректный MAC '{raw_mac}'")
+    # Разбиваем на пары и приводим к верхнему регистру для строгой проверки OTA.
+    pairs = [cleaned[i : i + 2].upper() for i in range(0, 12, 2)]
+    normalized = ":".join(pairs)
+    log.debug("нормализован MAC", extra={"ctx": {"mac": normalized}})
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -42,6 +68,8 @@ class XiaozhiDeviceInfo:
     """
 
     def __init__(self) -> None:
+        # Сбор идентификаторов вынесен в конструктор, чтобы значения были
+        # стабильны для всех последующих вызовов и попадали в хэш.
         self._machine_id = self._collect_machine_id()
         self._mac_address = self._collect_mac()
         self._ip_address = self._collect_ip()
@@ -85,7 +113,14 @@ class XiaozhiDeviceInfo:
         mac = uuid.getnode()
         if (mac >> 40) % 2:
             log.warning("uuid.getnode() вернул локальный MAC, использую заглушку")
-        normalized = ":".join(f"{(mac >> ele) & 0xFF:02x}" for ele in range(40, -8, -8))
+        normalized_raw = ":".join(f"{(mac >> ele) & 0xFF:02x}" for ele in range(40, -8, -8))
+        try:
+            normalized = normalize_mac(normalized_raw)
+        except ValueError:
+            # Даже если нормализация сломалась, лучше сохранить исходное значение
+            # и позволить пользователю поправить конфиг руками.
+            log.error("не удалось нормализовать MAC, возвращаю исходный", extra={"ctx": {"mac": normalized_raw}})
+            return normalized_raw
         log.debug("mac выбран", extra={"ctx": {"mac": normalized}})
         return normalized
 
