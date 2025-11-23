@@ -581,6 +581,19 @@ class XiaozhiClient:
         """
 
         if self._ws and not self._ws.closed:
+            # Подробно фиксируем состояние кэша, чтобы понимать, почему мы не
+            # открываем новое соединение. Это поможет отличить «живой» сокет
+            # от залипшего состояния, когда очередь пуста, а hello не пришёл.
+            log.debug(
+                "использую уже открытый WebSocket",
+                extra={
+                    "ctx": {
+                        "url": getattr(self._ws, "host", None),
+                        "closed": getattr(self._ws, "closed", None),
+                        "close_code": getattr(self._ws, "close_code", None),
+                    }
+                },
+            )
             return self._ws
 
         if ensure_config:
@@ -602,7 +615,14 @@ class XiaozhiClient:
         ssl_context = ssl._create_unverified_context()
         log.info(
             "открываю WebSocket с Xiaozhi",
-            extra={"ctx": {"url": url, "token_tail": token[-6:] if token else None}},
+            extra={
+                "ctx": {
+                    "url": url,
+                    "token_tail": token[-6:] if token else None,
+                    "device_id": headers.get("Device-Id"),
+                    "client_id": headers.get("Client-Id"),
+                }
+            },
         )
         try:
             connect_kwargs = {
@@ -613,6 +633,7 @@ class XiaozhiClient:
                 "compression": None,
                 "ssl": ssl_context,
             }
+            log.debug("параметры подключения WebSocket", extra={"ctx": connect_kwargs})
             try:
                 # Websockets 12+ использует additional_headers
                 self._ws = await websockets.connect(
@@ -668,6 +689,10 @@ class XiaozhiClient:
         # Стартуем фоновую задачу чтения, чтобы не потерять server hello и
         # чтобы последующие ответы появлялись в очереди без гонок.
         self._message_task = asyncio.create_task(self._message_loop())
+        log.info(
+            "создал фоновую задачу чтения WebSocket",
+            extra={"ctx": {"task": id(self._message_task)}},
+        )
 
         # Сразу фиксируем детали рукопожатия в INFO, чтобы пользователь видел,
         # какой ответ дал сервер (в оригинальном клиенте помогает ловить 4xx).
@@ -710,7 +735,7 @@ class XiaozhiClient:
                 "frame_duration": 20,
             },
         }
-        log.debug("отправляю hello в Xiaozhi", extra={"ctx": hello_message})
+        log.info("отправляю hello в Xiaozhi", extra={"ctx": hello_message})
         await self._ws.send(json.dumps(hello_message))
 
     async def _wait_for_server_hello(self, timeout: float = 10.0) -> None:
@@ -725,6 +750,16 @@ class XiaozhiClient:
             raise RuntimeError("WebSocket не инициализирован")
 
         try:
+            log.info(
+                "жду server hello от Xiaozhi",
+                extra={
+                    "ctx": {
+                        "timeout": timeout,
+                        "url": getattr(self._ws, "host", None),
+                        "has_reader": bool(self._message_task),
+                    }
+                },
+            )
             await asyncio.wait_for(self._hello_confirmed.wait(), timeout=timeout)
             log.info(
                 "сервер подтвердил hello",
