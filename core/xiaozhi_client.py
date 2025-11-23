@@ -13,6 +13,8 @@ import json
 import logging
 import socket
 import wave
+import platform
+import uuid
 from dataclasses import dataclass
 import re
 from typing import Any, Dict, Optional
@@ -66,8 +68,17 @@ class XiaozhiClient:
         # Чтобы не опрашивать manager-api перед каждым запросом, запоминаем,
         # что проверка привязки уже выполнялась в рамках жизни объекта.
         self._binding_checked = False
-        # Клиент/устройство часто совпадают, поэтому задаём падение до device_id
-        # чтобы заголовок Client-Id всегда присутствовал, как в прошивке ESP32.
+        # Если устройство не указано в конфиге, пытаемся определить MAC-адрес
+        # реального сетевого адаптера. Это повторяет подход py-xiaozhi и
+        # официальной прошивки: сервер ожидает узнаваемый идентификатор, а
+        # рандомные строки ("jarvis-client") приводят к закрытию соединения
+        # без hello. MAC дополнительно используется как client_id.
+        if not self.settings.device_id or self.settings.device_id == "jarvis-client":
+            self.settings.device_id = self._get_mac_address()
+
+        # Клиент/устройство часто совпадают, поэтому задаём падение до
+        # device_id, чтобы заголовок Client-Id всегда присутствовал, как в
+        # прошивке ESP32 и py-xiaozhi.
         if not self.settings.client_id:
             self.settings.client_id = self.settings.device_id
 
@@ -98,6 +109,23 @@ class XiaozhiClient:
         logger.debug("Библиотека opuslib загружена лениво", extra={"encoder": str(self._opus_encoder_cls)})
         return self._opus_encoder_cls, self._opus_decoder_cls
 
+    @staticmethod
+    def _get_mac_address() -> str:
+        """Получить MAC-адрес устройства в формате XX:XX:XX:XX:XX:XX.
+
+        Используем `uuid.getnode()`, который стабильно работает без внешних
+        зависимостей. Если MAC не удаётся извлечь (редко на виртуалках),
+        возвращаем безопасный fallback, но логируем предупреждение, чтобы
+        администратор мог вручную прописать device_id в конфиге.
+        """
+
+        mac_int = uuid.getnode()
+        if (mac_int >> 40) % 2:
+            logger.warning("uuid.getnode() вернул локально сгенерированный MAC, используем как fallback")
+        mac_str = ":".join(f"{(mac_int >> ele) & 0xFF:02x}" for ele in range(40, -1, -8))
+        logger.info("Определён MAC-адрес устройства", extra={"device_id": mac_str})
+        return mac_str
+
     def _build_auth_headers(self) -> Dict[str, str]:
         """Собрать авторизационные заголовки с безопасной обработкой префикса.
 
@@ -116,6 +144,12 @@ class XiaozhiClient:
         return {
             "Authorization": token,
             "X-Share-Code": self.settings.agent_code,
+            # Совместимость с py-xiaozhi: сервер читает идентификаторы из
+            # заголовков, поэтому дублируем здесь, чтобы handshake совпал.
+            "Device-Id": self.settings.device_id,
+            "Client-Id": self.settings.client_id or self.settings.device_id,
+            "Protocol-Version": "1",
+            "User-Agent": f"Jarvis-xiaozhi/{platform.system()}-{platform.release()}",
         }
 
     def _request_bind_code(self, trace_id: str = "") -> Optional[str]:

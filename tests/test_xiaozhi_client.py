@@ -44,6 +44,17 @@ def dummy_opus(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def deterministic_mac(monkeypatch):
+    """Фиксированный MAC, чтобы заголовки device/client были предсказуемыми."""
+
+    monkeypatch.setattr(
+        "core.xiaozhi_client.XiaozhiClient._get_mac_address",
+        lambda self=None: "aa:bb:cc:dd:ee:ff",
+        raising=False,
+    )
+
+
 def _build_dummy_wav() -> bytes:
     import io
     import wave
@@ -72,6 +83,8 @@ class DummyResponse:
 def test_extracts_text_and_headers(monkeypatch):
     captured = SimpleNamespace(payload=None, headers=None)
 
+    monkeypatch.setattr("core.xiaozhi_client.XiaozhiClient._get_mac_address", lambda self=None: "aa:bb:cc:dd:ee:ff")
+
     def fake_post(url, json=None, headers=None, timeout=None):  # noqa: A002
         captured.payload = json
         captured.headers = headers
@@ -86,9 +99,10 @@ def test_extracts_text_and_headers(monkeypatch):
     assert reply == "ok"
     assert captured.payload == {"share_code": "abc", "input": "ping", "stream": False}
     assert captured.headers["X-Trace-Id"] == "trace-1"
-    assert captured.headers["device-id"] == "jarvis-client"
-    assert captured.headers["client-id"] == "jarvis-client"
+    assert captured.headers["device-id"] == "aa:bb:cc:dd:ee:ff"
+    assert captured.headers["client-id"] == "aa:bb:cc:dd:ee:ff"
     assert captured.headers["Authorization"] == "Bearer abc"
+    assert "User-Agent" in captured.headers
 
 
 def test_bind_code_is_raised(monkeypatch):
@@ -182,8 +196,8 @@ def test_http_404_triggers_ws_autoconversion(monkeypatch):
                 # Заголовки должны содержать авторизацию, device/client и версию
                 assert additional_headers["Authorization"] == "Bearer abc"
                 assert additional_headers["Protocol-Version"] == "1"
-                assert additional_headers["device-id"] == "jarvis-client"
-                assert additional_headers["client-id"] == "jarvis-client"
+                assert additional_headers["device-id"] == "aa:bb:cc:dd:ee:ff"
+                assert additional_headers["client-id"] == "aa:bb:cc:dd:ee:ff"
                 return self
 
             def __exit__(self, exc_type, exc, tb):  # noqa: D401
@@ -267,8 +281,8 @@ def test_audio_websocket(monkeypatch, dummy_opus):
 
         class DummyWs:
             def __enter__(self):
-                assert additional_headers["device-id"] == "jarvis-client"
-                assert additional_headers["client-id"] == "jarvis-client"
+                assert additional_headers["device-id"] == "aa:bb:cc:dd:ee:ff"
+                assert additional_headers["client-id"] == "aa:bb:cc:dd:ee:ff"
                 return self
 
             def __exit__(self, exc_type, exc, tb):

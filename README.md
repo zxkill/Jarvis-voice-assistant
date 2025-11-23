@@ -834,12 +834,11 @@ Promtail читает файлы из каталога `./logs` и отправ�
 [LLM]
 provider = xiaozhi           ; local для Ollama, xiaozhi для облака
 xiaozhi_url = wss://api.tenclass.net/xiaozhi/v1/     ; можно указать https://... или wss://...
-xiaozhi_device_id = jarvis-client                   ; попадёт в заголовок device-id WebSocket-сессии
-xiaozhi_client_id = jarvis-client                   ; client-id для manager-api и WebSocket, по умолчанию = device_id
+xiaozhi_device_id =                                 ; если пусто, клиент подставит MAC-адрес устройства
+xiaozhi_client_id =                                 ; client-id для manager-api и WebSocket, по умолчанию = device_id
 xiaozhi_manager_url = https://api.tenclass.net/xiaozhi ; опциональный manager-api для кода привязки
 xiaozhi_manager_secret =                             ; токен из консоли Xiaozhi для запросов к manager-api
 xiaozhi_agent_code = yj3GmNYZw0  ; share code/токен из личного кабинета Xiaozhi
-xiaozhi_device_id = jarvis-client ; идентификатор клиента, передаётся в HTTP/WebSocket и аудио-канале
 xiaozhi_timeout = 40             ; таймаут запроса в секундах
 ```
 
