@@ -6,6 +6,7 @@
 команд, не затрагивая тяжёлые внешние пакеты.
 """
 
+import os
 import sys
 import asyncio
 from types import SimpleNamespace
@@ -21,6 +22,13 @@ from core.request_source import (
 
 def _load_cp(monkeypatch):
     """Импортировать ``command_processing`` с подменой зависимостей."""
+
+    # Подставляем фиктивные ключи и параметры окружения, чтобы импорт LLM и
+    # конфигурации проходил без ошибок даже при отсутствии реальных секретов.
+    monkeypatch.setenv("INTEL_API_KEY", "test")
+    monkeypatch.setenv("XIAOZHI_URL", "https://example.com")
+    monkeypatch.setenv("XIAOZHI_AGENT", "demo")
+    monkeypatch.setenv("TELEGRAM_TOKEN", "test-token")
 
     dummy_skills = SimpleNamespace(handle_utterance=lambda cmd: False)
     dummy_nlp = SimpleNamespace(normalize=lambda x: x)
@@ -192,8 +200,8 @@ def test_exit_conversation(monkeypatch):
     assert is_awaiting_response() is False
 
 
-def test_va_respond_unknown(monkeypatch):
-    """Неизвестная команда должна возвращать вежливый запрос повтора."""
+def test_va_respond_unknown_goes_to_llm(monkeypatch):
+    """При отсутствии совпадений навык→LLM должно вернуть осмысленный ответ."""
 
     cp = _load_cp(monkeypatch)
 
@@ -206,6 +214,42 @@ def test_va_respond_unknown(monkeypatch):
     async def fake_recognize(text: str) -> dict:
         return {"cmd": "", "percent": 0}
     monkeypatch.setattr(cp, "recognize_cmd", fake_recognize)
+
+    llm_calls: list[tuple[str, str]] = []
+
+    def fake_think(text: str, *, trace_id: str) -> str:
+        llm_calls.append((text, trace_id))
+        return "это ответ нейросети"
+
+    monkeypatch.setattr(cp, "llm_engine", SimpleNamespace(think=fake_think))
+
+    async def run() -> None:
+        assert await cp.va_respond("джарвис непонятно") is True
+
+    asyncio.run(run())
+    assert spoken[-1] == "это ответ нейросети"
+    assert llm_calls and llm_calls[0][0] == "непонятно"
+
+
+def test_va_respond_llm_failure_falls_back(monkeypatch):
+    """Если LLM недоступна, возвращаем вежливый запрос повтора."""
+
+    cp = _load_cp(monkeypatch)
+
+    spoken: list[str] = []
+
+    async def fake_speak(text: str, *a, **k) -> None:
+        spoken.append(text)
+
+    monkeypatch.setattr(cp, "speak_async", fake_speak)
+    async def fake_recognize(text: str) -> dict:
+        return {"cmd": "", "percent": 0}
+    monkeypatch.setattr(cp, "recognize_cmd", fake_recognize)
+
+    def fake_think(*_, **__):
+        raise RuntimeError("llm down")
+
+    monkeypatch.setattr(cp, "llm_engine", SimpleNamespace(think=fake_think))
 
     short_items: list[dict] = []
     monkeypatch.setitem(

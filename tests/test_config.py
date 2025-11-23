@@ -14,6 +14,16 @@ telegram_user_id = 1
 api_key = key
 absent_after_sec = 5
 
+[LLM]
+provider = local
+xiaozhi_url = https://example.com/chat
+xiaozhi_device_id = jarvis-bot
+xiaozhi_client_id = jarvis-client
+xiaozhi_manager_url = https://manager.example.com
+xiaozhi_manager_secret = supersecret
+xiaozhi_agent_code = demo
+xiaozhi_timeout = 15
+
 [TELEGRAM]
 token = t
 
@@ -33,6 +43,14 @@ def test_load_config_success(tmp_path, monkeypatch):
     cfg = load_config(write_cfg(tmp_path))
     assert cfg.user.name == "Jarvis"
     assert cfg.telegram.token == "t"
+    assert cfg.llm.provider == "local"
+    assert cfg.llm.xiaozhi_url == "https://example.com/chat"
+    assert cfg.llm.xiaozhi_device_id == "jarvis-bot"
+    assert cfg.llm.xiaozhi_client_id == "jarvis-client"
+    assert cfg.llm.xiaozhi_manager_url == "https://manager.example.com"
+    assert cfg.llm.xiaozhi_manager_secret == "supersecret"
+    assert cfg.llm.xiaozhi_agent_code == "demo"
+    assert cfg.llm.xiaozhi_timeout == 15
 
 def test_missing_section(tmp_path):
     text = BASE_CFG.replace("[TELEGRAM]\n" "token = t\n\n", "")

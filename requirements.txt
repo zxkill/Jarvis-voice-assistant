@@ -33,4 +33,5 @@ pyserial==3.5
 # Шифрование конфиденциальных данных
 cryptography
 websockets==11.0.3
+opuslib==3.0.1
 pytest-asyncio==0.21.1
