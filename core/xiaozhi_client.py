@@ -48,10 +48,16 @@ class XiaozhiClient:
             return self.config.data
 
         payload = {
+            # Блок ``application`` строго повторяет структуру py-xiaozhi:
+            # версия приложения уходит в серверные логи и помогает
+            # сопоставить клиентскую сборку с используемым протоколом.
             "application": {
-                "version": "jarvis-integration",
+                "version": self.config.get("app_version") or "2.0.0",
                 "elf_sha256": self.device_info.profile().hardware_hash,
             },
+            # Описание платы: тип и имя можно оставить как есть, сервер
+            # опирается на MAC/серийник, поэтому важно передать отпечаток
+            # устройства из ``DeviceInfo``.
             "board": {
                 "type": "linux",
                 "name": "jarvis",
@@ -62,10 +68,17 @@ class XiaozhiClient:
             "Device-Id": self._ensure_device_id(),
             "Client-Id": self._ensure_client_id(),
             "Content-Type": "application/json",
-            "User-Agent": "jarvis-xiaozhi",
-            "Accept-Language": "ru-RU",
-            "Activation-Version": "2",
+            # User-Agent повторяет оригинальный клиент: <board>/<name>-<version>.
+            "User-Agent": f"linux/jarvis-{self.config.get('app_version') or '2.0.0'}",
+            # Язык ответов на стороне сервера: по умолчанию zh-CN для
+            # совместимости с XiaoZhi, но поле настраиваемое в конфиге.
+            "Accept-Language": self.config.get("accept_language") or "zh-CN",
         }
+        # Заголовок Activation-Version нужен только для протокола v2 — его
+        # значение должно совпадать с версией приложения, иначе сервер
+        # вернёт 400. Храним флаг в конфиге, чтобы можно было форсировать v1.
+        if (self.config.get("activation_version") or "v2").lower() == "v2":
+            headers["Activation-Version"] = self.config.get("app_version") or "2.0.0"
 
         log.info("запрашиваю OTA конфигурацию Xiaozhi", extra={"ctx": {"url": self.config.get("ota_url")}})
         try:
@@ -82,8 +95,13 @@ class XiaozhiClient:
             raise
 
         if response.status_code != 200:
-            log.error("OTA вернула ошибку", extra={"ctx": {"status": response.status_code, "body": response.text}})
-            raise RuntimeError(f"OTA status {response.status_code}")
+            log.error(
+                "OTA вернула ошибку",
+                extra={"ctx": {"status": response.status_code, "body": response.text, "headers": headers}},
+            )
+            # Подробное сообщение помогает понять, что именно не понравилось
+            # серверу (например, неверная Activation-Version).
+            raise RuntimeError(f"OTA status {response.status_code}: {response.text}")
 
         data = response.json()
         activation = data.get("activation") or {}

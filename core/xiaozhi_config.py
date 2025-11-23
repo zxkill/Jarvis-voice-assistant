@@ -79,6 +79,12 @@ class XiaozhiConfigManager:
             "hardware_hash": None,
             "websocket_url": None,
             "websocket_token": None,
+            # Версия протокола активации и номер приложения для заголовка
+            # Activation-Version (совместимость с официальным клиентом).
+            "activation_version": "v2",
+            "app_version": "2.0.0",
+            # Предпочтительный язык для серверных ответов.
+            "accept_language": "zh-CN",
             "ota_url": "https://api.tenclass.net/xiaozhi/ota/",
             "authorization_url": "https://xiaozhi.me/",
             "activation": {

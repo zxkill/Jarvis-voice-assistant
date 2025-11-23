@@ -63,7 +63,10 @@ async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.
         "activation": {"code": "1234", "message": "msg", "challenge": "c"},
     }
 
+    captured_headers: dict[str, Any] = {}
+
     def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        captured_headers.update(__.get("headers", {}))
         return DummyResponse(payload)
 
     monkeypatch.setattr("requests.post", fake_post)
@@ -73,6 +76,54 @@ async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.
     assert data["websocket_url"] == "ws://example"
     assert data["websocket_token"] == "secret-token"
     assert data["activation"]["code"] == "1234"
+    assert captured_headers.get("Activation-Version") == cfg.get("app_version")
+    assert captured_headers.get("Accept-Language") == cfg.get("accept_language")
+
+
+@pytest.mark.asyncio
+async def test_ensure_remote_config_respects_activation_version_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Для протокола v1 заголовок Activation-Version не добавляется."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(activation_version="v1", app_version="3.1.4")
+    client = XiaozhiClient(cfg)
+
+    payload = {"websocket": {"url": "ws://example", "token": "secret-token"}}
+    captured_headers: dict[str, Any] = {}
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        captured_headers.update(__.get("headers", {}))
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    await client.ensure_remote_config()
+
+    assert "Activation-Version" not in captured_headers
+    assert captured_headers.get("User-Agent") == "linux/jarvis-3.1.4"
+
+
+@pytest.mark.asyncio
+async def test_ensure_remote_config_raises_on_bad_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """При ответе не 200 поднимается понятная ошибка с телом ответа."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    client = XiaozhiClient(cfg)
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        return DummyResponse({"error": "bad request"}, status_code=400)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    with pytest.raises(RuntimeError) as err:
+        await client.ensure_remote_config()
+
+    assert "OTA status 400" in str(err.value)
+    assert "bad request" in str(err.value)
 
 
 @pytest.mark.asyncio
