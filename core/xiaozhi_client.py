@@ -40,6 +40,13 @@ class XiaozhiClient:
         # Флаг, показывающий что сервер ответил hello и готов принимать команды
         # (py-xiaozhi ждёт этот ответ перед началом диалога).
         self._hello_confirmed = asyncio.Event()
+        # Фоновый слушатель сообщений WebSocket, чтобы максимально повторить
+        # протокол py-xiaozhi: он непрерывно читает кадры и уведомляет об
+        # «hello», а также складывает все остальные JSON в очередь для
+        # дальнейшей обработки.
+        self._message_task: asyncio.Task[None] | None = None
+        self._incoming_messages: asyncio.Queue[Any] = asyncio.Queue()
+        self._ws_close_reason: str | None = None
         # Отдельная задача для активации: запускается при получении challenge,
         # чтобы автоматически завершить привязку после ввода кода на портале.
         self._activation_task: asyncio.Task[bool] | None = None
@@ -369,7 +376,22 @@ class XiaozhiClient:
             websocket_token=None,
             network={"websocket": {"url": None, "token": None}},
         )
+        # Останавливаем фоновые задачи чтения, чтобы новая попытка подключиться
+        # стартовала «с чистого листа» и не столкнулась с оставшимся генератором.
+        if self._message_task and not self._message_task.done():
+            self._message_task.cancel()
+        self._message_task = None
+        # Перед закрытием подчёркиваем причину, чтобы видеть её в логах при
+        # повторном подключении.
+        self._ws_close_reason = reason
         self._ws = None
+        # Отправляем служебный маркер в очередь сообщений, чтобы ожидающие
+        # ответы корутины могли завершиться без таймаута.
+        try:
+            self._incoming_messages.put_nowait(None)
+        except Exception:
+            # Очередь может быть неинициализирована при раннем фейле подключения.
+            pass
         log.warning(
             "сбросил кэш WebSocket после обрыва",
             extra={"ctx": {"reason": reason, "close_code": code}},
@@ -583,20 +605,41 @@ class XiaozhiClient:
             extra={"ctx": {"url": url, "token_tail": token[-6:] if token else None}},
         )
         try:
-            self._ws = await websockets.connect(
-                url,
-                extra_headers=headers,
-                ping_interval=20,
-                ping_timeout=20,
-                ssl=ssl_context,
-            )
+            connect_kwargs = {
+                "ping_interval": 20,
+                "ping_timeout": 20,
+                "close_timeout": 10,
+                "max_size": 10 * 1024 * 1024,
+                "compression": None,
+                "ssl": ssl_context,
+            }
+            try:
+                # Websockets 12+ использует additional_headers
+                self._ws = await websockets.connect(
+                    url,
+                    additional_headers=headers,
+                    **connect_kwargs,
+                )
+            except TypeError:
+                # Более старые версии принимают extra_headers
+                self._ws = await websockets.connect(
+                    url,
+                    extra_headers=headers,
+                    **connect_kwargs,
+                )
         except Exception as err:
             # При ошибке подключения сразу обнуляем кэш, чтобы следующая
             # попытка запросила свежие параметры OTA.
             self._invalidate_cached_websocket(reason=str(err))
             raise
 
-        self._hello_confirmed.clear()
+        # Обновляем очередь и служебные события для свежего подключения.
+        self._incoming_messages = asyncio.Queue()
+        self._hello_confirmed = asyncio.Event()
+        # Стартуем фоновую задачу чтения, чтобы не потерять server hello и
+        # чтобы последующие ответы появлялись в очереди без гонок.
+        self._message_task = asyncio.create_task(self._message_loop())
+
         await self._send_hello()
         await self._wait_for_server_hello()
         return self._ws
@@ -637,36 +680,14 @@ class XiaozhiClient:
             raise RuntimeError("WebSocket не инициализирован")
 
         try:
-            while not self._hello_confirmed.is_set():
-                try:
-                    message = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    self._invalidate_cached_websocket(reason="hello timeout", code=None)
-                    raise RuntimeError("не дождались hello от сервера Xiaozhi") from None
-
-                if isinstance(message, bytes):
-                    log.debug("получено бинарное сообщение до hello", extra={"ctx": {"size": len(message)}})
-                    continue
-
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    log.debug("получен не‑JSON до hello", extra={"ctx": {"message": message}})
-                    continue
-
-                log.debug("получено сообщение при ожидании hello", extra={"ctx": data})
-                if data.get("type") == "hello":
-                    self._hello_confirmed.set()
-                    log.info("сервер подтвердил hello", extra={"ctx": {"transport": data.get("transport")}})
-                    break
-
-                # Если пришло что-то иное — буферизуем его для дальнейшего чтения
-                # ответов, чтобы не потерять реальные данные, пришедшие раньше
-                # hello. Это редко, но помогает при нестабильной сети.
-                await self._prepend_message(json.dumps(data))
-        except ConnectionClosed as err:
-            self._invalidate_cached_websocket(reason=str(err), code=err.code)
-            raise RuntimeError("WebSocket закрыт до получения hello") from err
+            await asyncio.wait_for(self._hello_confirmed.wait(), timeout=timeout)
+            log.info(
+                "сервер подтвердил hello",
+                extra={"ctx": {"transport": "websocket", "url": getattr(self._ws, "host", None)}},
+            )
+        except asyncio.TimeoutError:
+            self._invalidate_cached_websocket(reason="hello timeout", code=None)
+            raise RuntimeError("не дождались hello от сервера Xiaozhi") from None
 
     async def _prepend_message(self, message: str) -> None:
         """Возвращает сообщение обратно в поток чтения.
@@ -678,16 +699,63 @@ class XiaozhiClient:
 
         if not self._ws:
             return
-        # websockets не предоставляет публичного API для возврата сообщения,
-        # поэтому используем небольшой трюк: создаём таск, который немедленно
-        # отправит сообщение в сторону клиента, где оно будет считано как
-        # очередной кадр. Для тестов DummyWebSocket реализует feed.
-        if hasattr(self._ws, "feed"):
-            await self._ws.feed(message)  # type: ignore[attr-defined]
-        else:
-            # В бою просто логируем — сервер обычно не шлёт лишних сообщений
-            # до hello, поэтому потеря одного пакета маловероятна.
-            log.debug("не удалось буферизовать сообщение", extra={"ctx": {"message": message}})
+            # websockets не предоставляет публичного API для возврата сообщения,
+            # поэтому используем небольшой трюк: создаём таск, который немедленно
+            # отправит сообщение в сторону клиента, где оно будет считано как
+            # очередной кадр. Для тестов DummyWebSocket реализует feed.
+            if hasattr(self._ws, "feed"):
+                await self._ws.feed(message)  # type: ignore[attr-defined]
+            else:
+                # В бою просто логируем — сервер обычно не шлёт лишних сообщений
+                # до hello, поэтому потеря одного пакета маловероятна.
+                log.debug("не удалось буферизовать сообщение", extra={"ctx": {"message": message}})
+
+    async def _message_loop(self) -> None:
+        """Постоянно читает WebSocket и складывает JSON в очередь.
+
+        Эта корутина копирует подход py-xiaozhi: отдельный обработчик сообщений
+        поднимается сразу после подключения, фиксирует server hello, складывает
+        полезные ответы в очередь `_incoming_messages` и реагирует на обрывы,
+        сбрасывая кэш токена. Так мы исключаем гонки между hello и listen/detect
+        и получаем более детальные логи по причинам закрытия соединения.
+        """
+
+        if not self._ws:
+            return
+
+        try:
+            async for message in self._ws:
+                if isinstance(message, bytes):
+                    log.debug(
+                        "получен бинарный кадр от Xiaozhi", extra={"ctx": {"size": len(message)}}
+                    )
+                    continue
+
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    log.debug("получен не‑JSON от Xiaozhi", extra={"ctx": {"message": message}})
+                    await self._incoming_messages.put(message)
+                    continue
+
+                msg_type = data.get("type")
+                if msg_type == "hello":
+                    self._hello_confirmed.set()
+                    log.debug("поймал server hello в фоне", extra={"ctx": data})
+                    continue
+
+                log.debug("положил входящее сообщение в очередь", extra={"ctx": data})
+                await self._incoming_messages.put(data)
+
+        except ConnectionClosed as err:
+            self._invalidate_cached_websocket(reason=str(err), code=err.code)
+        except Exception:
+            log.exception("ошибка при чтении WebSocket")
+            self._invalidate_cached_websocket(reason="message loop crash")
+        finally:
+            # Служебный маркер завершения, чтобы все ожидающие ответы сразу
+            # прекратили ожидание и инициировали переподключение при необходимости.
+            await self._incoming_messages.put(None)
 
     async def ask_text(self, text: str, trace_id: str | None = None, timeout: float = 20.0) -> str | None:
         """Отправляет текст на сервер Xiaozhi и возвращает первый текстовый ответ.
@@ -742,57 +810,52 @@ class XiaozhiClient:
                 extra={"ctx": {"text": text, "trace_id": trace_id, "session_id": self._session_id}},
             )
             await ws.send(json.dumps(payload))
+            return await self._wait_text_reply(ws, timeout=timeout)
+
+    async def _wait_text_reply(self, ws: websockets.WebSocketClientProtocol, timeout: float = 20.0) -> str | None:
+        """Ждёт первый текстовый ответ и возвращает его контент."""
+
+        while True:
             try:
-                return await asyncio.wait_for(self._wait_text_reply(ws), timeout=timeout)
+                message = await asyncio.wait_for(self._incoming_messages.get(), timeout=timeout)
             except asyncio.TimeoutError:
                 log.warning("не дождался ответа Xiaozhi вовремя")
                 return None
 
-    async def _wait_text_reply(self, ws: websockets.WebSocketClientProtocol) -> str | None:
-        """Ждёт первый текстовый ответ и возвращает его контент."""
+            if message is None:
+                log.warning(
+                    "получен сигнал о закрытии сокета до ответа",
+                    extra={"ctx": {"reason": self._ws_close_reason}},
+                )
+                return None
 
-        try:
-            async for message in ws:
-                if isinstance(message, bytes):
-                    log.debug("получены бинарные данные от Xiaozhi, пропускаю")
-                    continue
+            if isinstance(message, bytes):
+                log.debug("получены бинарные данные от Xiaozhi, пропускаю")
+                continue
+
+            if isinstance(message, str):
                 try:
                     data = json.loads(message)
                 except json.JSONDecodeError:
                     log.debug("получил не‑JSON, вернул как есть")
                     return message
+            else:
+                data = message
 
-                log.debug("получено сообщение от Xiaozhi", extra={"ctx": data})
-                text_fields = [
-                    data.get("text"),
-                    data.get("response"),
-                    (data.get("message") or {}).get("text") if isinstance(data.get("message"), dict) else None,
-                ]
-                for entry in text_fields:
-                    if entry:
-                        log.info("получен ответ Xiaozhi", extra={"ctx": {"text": entry}})
-                        # Раз ответ пришёл, можно считать устройство успешно
-                        # активированным: фиксируем флаг, чтобы больше не дёргать OTA.
-                        efuse = self.config.get("efuse") or {}
-                        if not efuse.get("activation_status"):
-                            self.config.update(efuse={**efuse, "activation_status": True})
-                        return entry
-                log.debug("получено промежуточное сообщение без текста", extra={"ctx": data})
-        except ConnectionClosed as err:
-            # Если соединение закрыли без текста, сбрасываем токен, чтобы
-            # следующая попытка запросила новую конфигурацию OTA.
-            try:
-                reason_text = str(err)
-            except Exception:
-                # На всякий случай защищаемся от нестандартных объектов err,
-                # у которых __str__ может падать.
-                reason_text = getattr(err, "reason", "WebSocket closed")
-            self._invalidate_cached_websocket(reason=reason_text, code=err.code)
-            log.error(
-                "WebSocket закрыт до получения ответа", extra={"ctx": {"code": err.code, "reason": err.reason}}
-            )
-            return None
-        return None
+            log.debug("получено сообщение от Xiaozhi", extra={"ctx": data})
+            text_fields = [
+                data.get("text") if isinstance(data, dict) else None,
+                data.get("response") if isinstance(data, dict) else None,
+                (data.get("message") or {}).get("text") if isinstance(data, dict) and isinstance(data.get("message"), dict) else None,
+            ]
+            for entry in text_fields:
+                if entry:
+                    log.info("получен ответ Xiaozhi", extra={"ctx": {"text": entry}})
+                    efuse = self.config.get("efuse") or {}
+                    if not efuse.get("activation_status"):
+                        self.config.update(efuse={**efuse, "activation_status": True})
+                    return entry
+            log.debug("получено промежуточное сообщение без текста", extra={"ctx": data})
 
 
 def build_client(factory: Callable[[], XiaozhiClient] | None = None) -> XiaozhiClient:

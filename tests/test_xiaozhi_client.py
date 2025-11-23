@@ -16,6 +16,27 @@ from core.xiaozhi_config import XiaozhiConfigManager
 from core.xiaozhi_device import normalize_mac
 
 
+@pytest.fixture(autouse=True)
+def cleanup_background_tasks(event_loop: asyncio.AbstractEventLoop) -> None:
+    """Автоматически гасит фоновые задачи активации после тестов.
+
+    В противном случае долгая корутина `_activate_device` может остаться висеть
+    после завершения теста и выдавать предупреждение о разрушенной задаче.
+    """
+
+    yield
+
+    pending = [
+        task
+        for task in asyncio.all_tasks(event_loop)
+        if not task.done() and getattr(task.get_coro(), "__name__", "") == "_activate_device"
+    ]
+    for task in pending:
+        task.cancel()
+    if pending:
+        event_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+
+
 class DummyResponse:
     """Ответ, имитирующий requests.Response."""
 
