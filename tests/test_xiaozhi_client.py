@@ -154,9 +154,11 @@ async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.
     }
 
     captured_headers: dict[str, Any] = {}
+    captured_payload: dict[str, Any] = {}
 
     def fake_post(*_: Any, **__: Any) -> DummyResponse:
         captured_headers.update(__.get("headers", {}))
+        captured_payload.update(__.get("json", {}))
         return DummyResponse(payload)
 
     monkeypatch.setattr("requests.post", fake_post)
@@ -168,9 +170,10 @@ async def test_ensure_remote_config_updates(tmp_path: Path, monkeypatch: pytest.
     assert data["network"]["websocket"]["url"] == "ws://example"
     assert data["network"]["mqtt"]["endpoint"] == "mqtt.example"
     assert data["activation"]["code"] == "1234"
-    assert captured_headers.get("Activation-Version") == "v2"
+    assert captured_headers.get("Activation-Version") == cfg.get("app_version")
     assert captured_headers.get("Accept-Language") == cfg.get("accept_language")
     assert data["efuse"]["mac_address"]
+    assert captured_payload.get("application", {}).get("elf_sha256") == cfg.get("efuse")["hmac_key"]
 
 
 @pytest.mark.asyncio
@@ -309,6 +312,94 @@ async def test_ensure_remote_config_respects_activation_version_flag(
 
     assert "Activation-Version" not in captured_headers
     assert captured_headers.get("User-Agent") == "linux/jarvis-3.1.4"
+
+
+@pytest.mark.asyncio
+async def test_start_activation_if_needed_triggers_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Активация запускается в фоне, когда есть challenge и код."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        efuse={"serial_number": "SN-1", "hmac_key": "0" * 64, "activation_status": False},
+        activation={},
+    )
+    client = XiaozhiClient(cfg)
+
+    started: list[str] = []
+
+    async def fake_activate(**kwargs: Any) -> bool:
+        started.append(kwargs["challenge"])
+        return True
+
+    monkeypatch.setattr(client, "_activate_device", fake_activate)
+
+    await client._start_activation_if_needed(
+        activation={"challenge": "abc", "code": "123456"},
+        efuse=cfg.get("efuse"),
+        ota_url="https://api.tenclass.net/xiaozhi/ota/",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="client",
+    )
+
+    assert client._activation_task is not None
+    await client._activation_task
+
+    # Повторный вызов не создаёт новую задачу, пока старая не завершилась.
+    await client._start_activation_if_needed(
+        activation={"challenge": "abc", "code": "123456"},
+        efuse=cfg.get("efuse"),
+        ota_url="https://api.tenclass.net/xiaozhi/ota/",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="client",
+    )
+
+    assert started == ["abc"]
+
+
+@pytest.mark.asyncio
+async def test_activate_device_posts_hmac_and_sets_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /activate формируется по образцу py-xiaozhi и фиксирует активацию."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        efuse={"serial_number": "SN-XYZ", "hmac_key": "a" * 64, "activation_status": False},
+        websocket_url="ws://cached",
+        websocket_token="token",
+    )
+    client = XiaozhiClient(cfg)
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_post(*_: Any, **kwargs: Any) -> DummyResponse:
+        calls.append({"headers": kwargs.get("headers", {}), "json": kwargs.get("json", {})})
+        # Первый ответ 202 имитирует ожидание ввода кода, второй — успешную активацию.
+        status = 200 if len(calls) > 1 else 202
+        return DummyResponse({}, status_code=status)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    result = await client._activate_device(
+        activate_url="https://api.tenclass.net/xiaozhi/ota/activate",
+        challenge="challenge-1",
+        serial_number="SN-XYZ",
+        hmac_key="a" * 64,
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="client-1",
+        code="123456",
+        max_attempts=2,
+        retry_interval=0,
+    )
+
+    assert result is True
+    assert calls[0]["headers"]["Activation-Version"] == "2"
+    assert calls[0]["json"]["Payload"]["serial_number"] == "SN-XYZ"
+    assert cfg.get("efuse")["activation_status"] is True
+    assert cfg.get("activation")["code"] is None
+    assert cfg.get("websocket_url") is None
 
 
 @pytest.mark.asyncio

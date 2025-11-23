@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import uuid
+from hashlib import sha256
 from typing import Any, Callable, Dict, Optional
 
 import requests
@@ -34,6 +36,9 @@ class XiaozhiClient:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._lock = asyncio.Lock()
         self._session_id = str(uuid.uuid4())
+        # Отдельная задача для активации: запускается при получении challenge,
+        # чтобы автоматически завершить привязку после ввода кода на портале.
+        self._activation_task: asyncio.Task[bool] | None = None
         # Память для текстового уведомления о привязке устройства, которое надо
         # отдать пользователю один раз и не спамить в чат при каждом запросе.
         self._activation_prompt: str | None = None
@@ -189,6 +194,10 @@ class XiaozhiClient:
         # Перезаписываем MAC внутри board_payload на нормализованный, чтобы не
         # было расхождений между efuse и полем board.mac.
         board_payload["mac"] = mac
+        # Сервер py-xiaozhi ожидает, что в поле elf_sha256 прилетит hmac_key,
+        # сохранённый в efuse. Это ключевой идентификатор устройства, поэтому
+        # подставляем его, а не аппаратный хэш.
+        elf_sha = efuse_block.get("hmac_key") or profile.hardware_hash
 
         payload = {
             # Блок ``application`` строго повторяет структуру py-xiaozhi:
@@ -196,7 +205,7 @@ class XiaozhiClient:
             # сопоставить клиентскую сборку с используемым протоколом.
             "application": {
                 "version": app_version,
-                "elf_sha256": profile.hardware_hash,
+                "elf_sha256": elf_sha,
             },
             # Описание платы: тип и имя можно оставить как есть, сервер
             # опирается на MAC/серийник, поэтому важно передать отпечаток
@@ -230,7 +239,9 @@ class XiaozhiClient:
         # значение должно совпадать с версией приложения, иначе сервер
         # вернёт 400. Храним флаг в конфиге, чтобы можно было форсировать v1.
         if activation_version.lower() == "v2":
-            headers["Activation-Version"] = activation_version
+            # Оригинальный клиент отправляет версию приложения в этом заголовке,
+            # поэтому подставляем app_version, иначе сервер отвечает 400.
+            headers["Activation-Version"] = app_version
 
         ota_url = network_cfg.get("ota_url") or self.config.get("ota_url")
         log.info("запрашиваю OTA конфигурацию Xiaozhi", extra={"ctx": {"url": ota_url}})
@@ -305,6 +316,16 @@ class XiaozhiClient:
         # Запоминаем код активации, если он пришёл, чтобы потом показать его
         # пользователю в чате и не заставлять искать сообщение в логах.
         self._capture_activation_prompt(activation)
+        # Если есть challenge и устройство ещё не активировано, запускаем
+        # фоновую процедуру подтверждения (POST /activate) — так py-xiaozhi
+        # завершает привязку после ввода кода на портале.
+        await self._start_activation_if_needed(
+            activation=activation,
+            efuse=efuse_block,
+            ota_url=ota_url,
+            device_id=self._ensure_device_id(mac),
+            client_id=self._ensure_client_id(),
+        )
         if not activation.get("code"):
             log.info("сервер не вернул код активации, устройство вероятно уже привязано")
         log.debug(
@@ -376,6 +397,143 @@ class XiaozhiClient:
         self.config.update(device_id=fallback_mac)
         log.info("задал новый device_id", extra={"ctx": {"device_id": fallback_mac}})
         return fallback_mac
+
+    async def _start_activation_if_needed(
+        self,
+        *,
+        activation: Dict[str, Any],
+        efuse: Dict[str, Any],
+        ota_url: str,
+        device_id: str,
+        client_id: str,
+    ) -> None:
+        """Запускает асинхронный цикл активации, если сервер прислал challenge.
+
+        Процедура полностью повторяет логику py-xiaozhi: вычисляем HMAC по
+        challenge и efuse.hmac_key, затем регулярно стучимся на /activate до
+        тех пор, пока сервер не вернёт 200. Это необходимо, иначе после ввода
+        кода на портале WebSocket не отдаёт ответы.
+        """
+
+        # Если устройство уже активировано — ничего делать не нужно.
+        if efuse.get("activation_status"):
+            return
+        challenge = activation.get("challenge")
+        code = activation.get("code")
+        serial = efuse.get("serial_number")
+        hmac_key = efuse.get("hmac_key")
+
+        if not (challenge and serial and hmac_key and ota_url):
+            return
+
+        if self._activation_task and not self._activation_task.done():
+            return
+
+        # Запускаем долгоживущий таск — он сам запишет результат в конфиг.
+        self._activation_task = asyncio.create_task(
+            self._activate_device(
+                activate_url=f"{ota_url.rstrip('/')}/activate",
+                challenge=str(challenge),
+                serial_number=str(serial),
+                hmac_key=str(hmac_key),
+                device_id=device_id,
+                client_id=client_id,
+                code=str(code) if code else None,
+            )
+        )
+
+    async def _activate_device(
+        self,
+        *,
+        activate_url: str,
+        challenge: str,
+        serial_number: str,
+        hmac_key: str,
+        device_id: str,
+        client_id: str,
+        code: str | None,
+        max_attempts: int = 60,
+        retry_interval: float = 5.0,
+    ) -> bool:
+        """Отправляет HMAC-подписанный challenge на эндпоинт активации."""
+
+        try:
+            key_bytes = bytes.fromhex(hmac_key)
+        except ValueError:
+            log.error(
+                "hmac_key невалиден: ожидается hex-строка", extra={"ctx": {"hmac_key": hmac_key}}
+            )
+            return False
+
+        signature = hmac.new(key_bytes, challenge.encode("utf-8"), sha256).hexdigest()
+        payload = {
+            "Payload": {
+                "algorithm": "hmac-sha256",
+                "serial_number": serial_number,
+                "challenge": challenge,
+                "hmac": signature,
+            }
+        }
+        headers = {
+            # Официальный клиент отправляет число 2, а не версию приложения.
+            "Activation-Version": "2",
+            "Device-Id": device_id,
+            "Client-Id": client_id,
+            "Content-Type": "application/json",
+        }
+
+        for attempt in range(max_attempts):
+            log.info(
+                "пытаюсь завершить активацию Xiaozhi",
+                extra={"ctx": {"attempt": attempt + 1, "max_attempts": max_attempts}},
+            )
+            try:
+                response = await asyncio.to_thread(
+                    requests.post,
+                    activate_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=10,
+                    verify=False,
+                )
+            except Exception as err:
+                log.warning(
+                    "сбой при запросе активации, повторю позже",
+                    extra={"ctx": {"error": str(err)}},
+                )
+                await asyncio.sleep(retry_interval)
+                continue
+
+            if response.status_code == 200:
+                log.info("устройство успешно активировано на сервере Xiaozhi")
+                efuse = self.config.get("efuse") or {}
+                self.config.update(
+                    efuse={**efuse, "activation_status": True},
+                    activation={"code": None, "challenge": None},
+                )
+                # Сбрасываем WebSocket токен, чтобы получить свежий после активации.
+                self._invalidate_cached_websocket(reason="activation complete")
+                return True
+
+            if response.status_code == 202:
+                log.info("сервер ждёт ввода кода, продолжаю опрос", extra={"ctx": {"code": code}})
+                await asyncio.sleep(retry_interval)
+                continue
+
+            log.warning(
+                "сервер вернул ошибку при активации",
+                extra={
+                    "ctx": {
+                        "status": response.status_code,
+                        "body": response.text,
+                        "attempt": attempt + 1,
+                    }
+                },
+            )
+            await asyncio.sleep(retry_interval)
+
+        log.error("не удалось активировать устройство: превышен лимит попыток")
+        return False
 
     async def _connect(self, *, ensure_config: bool = True) -> websockets.WebSocketClientProtocol:
         """Открывает WebSocket‑соединение, если его ещё нет.
