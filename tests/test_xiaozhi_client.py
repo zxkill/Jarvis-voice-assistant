@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.exceptions import ConnectionClosed
+from websockets.frames import Close
 
 from core.xiaozhi_client import XiaozhiClient
 from core.xiaozhi_config import XiaozhiConfigManager
@@ -382,6 +384,28 @@ async def test_ensure_remote_config_fails_fast_on_invalid_mac(
 
 
 @pytest.mark.asyncio
+async def test_marks_activated_when_code_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Если код был и пропал, ставим activation_status=True для кэша."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(activation={"code": "999111"}, efuse={"activation_status": False})
+
+    payload = {"websocket": {"url": "ws://example", "token": "secret-token"}, "activation": {}}
+
+    def fake_post(*_: Any, **__: Any) -> DummyResponse:
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    client = XiaozhiClient(cfg)
+    await client.ensure_remote_config()
+
+    assert cfg.get("efuse")["activation_status"] is True
+
+
+@pytest.mark.asyncio
 async def test_ask_text_uses_websocket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Клиент отправляет hello и читает текстовый ответ."""
 
@@ -408,3 +432,45 @@ async def test_ask_text_uses_websocket(tmp_path: Path, monkeypatch: pytest.Monke
     assert reply == "привет от Xiaozhi"
     assert any("hello" in sent for sent in ws.sent)
     assert any("hi" in sent for sent in ws.sent)
+
+
+@pytest.mark.asyncio
+async def test_connection_close_invalidates_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Обрыв WebSocket сбрасывает токены и форсирует повторный OTA."""
+
+    cfg = XiaozhiConfigManager(tmp_path / "xiaozhi.json")
+    cfg.update(
+        websocket_url="ws://example",
+        websocket_token="stale-token",
+        device_id="AA:BB:CC:DD:EE:FF",
+        client_id="cli",
+    )
+
+    class ClosingWebSocket(DummyWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.exc = ConnectionClosed(
+                Close(4401, "unauthorized"), Close(4401, "unauthorized"), rcvd_then_sent=True
+            )
+
+        def __aiter__(self) -> "ClosingWebSocket":
+            return self
+
+        async def __anext__(self) -> str:
+            raise self.exc
+
+    ws = ClosingWebSocket()
+
+    async def fake_connect(*_: Any, **__: Any) -> ClosingWebSocket:
+        return ws
+
+    monkeypatch.setattr("websockets.connect", fake_connect)
+
+    client = XiaozhiClient(cfg)
+    reply = await client.ask_text("hi", trace_id="trace", timeout=1)
+
+    assert reply is None
+    assert cfg.get("websocket_token") is None
+    assert cfg.get("network")["websocket"]["token"] is None

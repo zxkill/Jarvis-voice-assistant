@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, Optional
 
 import requests
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from core.logging_json import configure_logging
 from core.xiaozhi_config import XiaozhiConfigManager
@@ -266,6 +267,16 @@ class XiaozhiClient:
             or (data.get("efuse") or {}).get("activationStatus")
             or data.get("activation_status")
         )
+        # В некоторых ответах, уже после привязки устройства, сервер перестаёт
+        # присылать явный activation_status и код. Если ранее код был, но теперь
+        # пропал, считаем активацию подтверждённой, чтобы не застрять в режиме
+        # «ожидания привязки» и сразу использовать финальный токен.
+        if activation_status is None and activation_block.get("code") and not activation.get("code"):
+            activation_status = True
+            log.info(
+                "код ввели на портале: помечаю устройство активированным",
+                extra={"ctx": {"previous_code": activation_block.get("code")}},
+            )
         if activation_status is not None:
             efuse_block = {**efuse_block, "activation_status": bool(activation_status)}
             self.config.update(efuse=efuse_block)
@@ -307,6 +318,26 @@ class XiaozhiClient:
             },
         )
         return updated
+
+    def _invalidate_cached_websocket(self, *, reason: str, code: int | None = None) -> None:
+        """Сбрасывает сохранённые параметры WebSocket при обрыве соединения.
+
+        Это помогает автоматически перезапросить OTA при следующей попытке и
+        получить свежий токен, если предыдущий оказался протухшим или сервер
+        отклонил подключение. Логирование оставляем подробным, чтобы понять,
+        почему связь оборвалась на реальном устройстве.
+        """
+
+        self.config.update(
+            websocket_url=None,
+            websocket_token=None,
+            network={"websocket": {"url": None, "token": None}},
+        )
+        self._ws = None
+        log.warning(
+            "сбросил кэш WebSocket после обрыва",
+            extra={"ctx": {"reason": reason, "close_code": code}},
+        )
 
     def _ensure_client_id(self) -> str:
         """Генерирует и сохраняет клиентский идентификатор при отсутствии."""
@@ -372,7 +403,16 @@ class XiaozhiClient:
             "Client-Id": self._ensure_client_id(),
         }
         log.info("открываю WebSocket с Xiaozhi", extra={"ctx": {"url": url}})
-        self._ws = await websockets.connect(url, extra_headers=headers, ping_interval=20, ping_timeout=20)
+        try:
+            self._ws = await websockets.connect(
+                url, extra_headers=headers, ping_interval=20, ping_timeout=20
+            )
+        except Exception as err:
+            # При ошибке подключения сразу обнуляем кэш, чтобы следующая
+            # попытка запросила свежие параметры OTA.
+            self._invalidate_cached_websocket(reason=str(err))
+            raise
+
         await self._send_hello()
         return self._ws
 
@@ -415,30 +455,47 @@ class XiaozhiClient:
     async def _wait_text_reply(self, ws: websockets.WebSocketClientProtocol) -> str | None:
         """Ждёт первый текстовый ответ и возвращает его контент."""
 
-        async for message in ws:
-            if isinstance(message, bytes):
-                continue
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                log.debug("получил не‑JSON, вернул как есть")
-                return message
+        try:
+            async for message in ws:
+                if isinstance(message, bytes):
+                    log.debug("получены бинарные данные от Xiaozhi, пропускаю")
+                    continue
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    log.debug("получил не‑JSON, вернул как есть")
+                    return message
 
-            text_fields = [
-                data.get("text"),
-                data.get("response"),
-                (data.get("message") or {}).get("text") if isinstance(data.get("message"), dict) else None,
-            ]
-            for entry in text_fields:
-                if entry:
-                    log.info("получен ответ Xiaozhi", extra={"ctx": {"text": entry}})
-                    # Раз ответ пришёл, можно считать устройство успешно
-                    # активированным: фиксируем флаг, чтобы больше не дёргать OTA.
-                    efuse = self.config.get("efuse") or {}
-                    if not efuse.get("activation_status"):
-                        self.config.update(efuse={**efuse, "activation_status": True})
-                    return entry
-            log.debug("получено промежуточное сообщение", extra={"ctx": data})
+                log.debug("получено сообщение от Xiaozhi", extra={"ctx": data})
+                text_fields = [
+                    data.get("text"),
+                    data.get("response"),
+                    (data.get("message") or {}).get("text") if isinstance(data.get("message"), dict) else None,
+                ]
+                for entry in text_fields:
+                    if entry:
+                        log.info("получен ответ Xiaozhi", extra={"ctx": {"text": entry}})
+                        # Раз ответ пришёл, можно считать устройство успешно
+                        # активированным: фиксируем флаг, чтобы больше не дёргать OTA.
+                        efuse = self.config.get("efuse") or {}
+                        if not efuse.get("activation_status"):
+                            self.config.update(efuse={**efuse, "activation_status": True})
+                        return entry
+                log.debug("получено промежуточное сообщение без текста", extra={"ctx": data})
+        except ConnectionClosed as err:
+            # Если соединение закрыли без текста, сбрасываем токен, чтобы
+            # следующая попытка запросила новую конфигурацию OTA.
+            try:
+                reason_text = str(err)
+            except Exception:
+                # На всякий случай защищаемся от нестандартных объектов err,
+                # у которых __str__ может падать.
+                reason_text = getattr(err, "reason", "WebSocket closed")
+            self._invalidate_cached_websocket(reason=reason_text, code=err.code)
+            log.error(
+                "WebSocket закрыт до получения ответа", extra={"ctx": {"code": err.code, "reason": err.reason}}
+            )
+            return None
         return None
 
 
