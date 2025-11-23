@@ -20,6 +20,7 @@ from core.nlp import normalize
 # частичной подмене в тестах.
 import working_tts as _working_tts
 speak_async = _working_tts.speak_async  # удобный псевдоним для вызова
+from core.xiaozhi_client import build_client as build_xiaozhi_client
 from core.logging_json import configure_logging, TRACE_ID, new_trace_id
 from core import events as core_events
 from core.request_source import get_request_source
@@ -38,6 +39,7 @@ from context import daily_memory  # Дневная память для конс�
 log = configure_logging("app.command_processing")
 
 _TELEGRAM_USER_ID: str | int | None = None
+_XIAOZHI_CLIENT = None
 
 
 def _resolve_default_user(channel: str) -> str | int:
@@ -73,6 +75,20 @@ def _ensure_trace_id() -> tuple[str, Token | None]:
         token = TRACE_ID.set(trace)
         log.debug("generated trace id for command", extra={"ctx": {"trace_id": trace}})
     return trace, token
+
+
+def _xiaozhi_client():
+    """Ленивое создание клиента Xiaozhi.
+
+    Выделено в отдельную функцию для удобства подмены в тестах и повторного
+    использования без дорогостоящей инициализации при каждом обращении.
+    """
+
+    global _XIAOZHI_CLIENT
+    if _XIAOZHI_CLIENT is None:
+        _XIAOZHI_CLIENT = build_xiaozhi_client()
+        log.debug("инициализировал клиента Xiaozhi")
+    return _XIAOZHI_CLIENT
 
 
 def _log_dialog(
@@ -450,7 +466,15 @@ async def va_respond(voice: str) -> bool:
         raw_norm = normalize(raw)
         cmd_info = await recognize_cmd(raw_norm)
         if not cmd_info["cmd"] or cmd_info["percent"] < CMD_CONFIDENCE_THRESHOLD:
-            reply = "можете повторить?"
+            xiaozhi_reply = None
+            try:
+                # Отправляем текст в Xiaozhi, если навыки не нашли совпадения.
+                xiaozhi_reply = await _xiaozhi_client().ask_text(cmd, trace_id=trace_id)
+            except Exception:
+                log.exception(
+                    "не удалось запросить ответ у Xiaozhi", extra={"ctx": {"trace_id": trace_id}}
+                )
+            reply = xiaozhi_reply or "можете повторить?"
             await speak_async(reply)
             log.info(
                 "fallback reply",
