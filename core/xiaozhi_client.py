@@ -669,11 +669,10 @@ class XiaozhiClient:
         # чтобы последующие ответы появлялись в очереди без гонок.
         self._message_task = asyncio.create_task(self._message_loop())
 
-        # Фиксируем детали рукопожатия от сервера: полезно видеть, какие
-        # заголовки он вернул и какой сабпротокол выбрал. Это помогает
-        # расследовать странные ответы или несоответствие протокола.
+        # Сразу фиксируем детали рукопожатия в INFO, чтобы пользователь видел,
+        # какой ответ дал сервер (в оригинальном клиенте помогает ловить 4xx).
         try:
-            log.debug(
+            log.info(
                 "рукопожатие WebSocket успешно",
                 extra={
                     "ctx": {
@@ -732,12 +731,24 @@ class XiaozhiClient:
                 extra={"ctx": {"transport": "websocket", "url": getattr(self._ws, "host", None)}},
             )
         except asyncio.TimeoutError:
+            # При таймауте достанем внутренний буфер очереди, чтобы показать,
+            # приходили ли какие-либо пакеты от сервера (даже не-JSON). Это
+            # помогает понять, зависает ли сервер на hello или вовсе не шлёт
+            # никаких кадров (как в текущих логах пользователя).
+            pending_messages = []
+            try:
+                raw_queue = getattr(self._incoming_messages, "_queue", [])
+                pending_messages = list(raw_queue)
+            except Exception:
+                pending_messages = []
+
             log.error(
                 "таймаут ожидания server hello",
                 extra={
                     "ctx": {
                         "pending_queue": getattr(self._incoming_messages, "qsize", lambda: None)(),
                         "url": getattr(self._ws, "host", None),
+                        "pending_preview": pending_messages[:3],
                     }
                 },
             )
@@ -779,6 +790,10 @@ class XiaozhiClient:
             return
 
         try:
+            log.info(
+                "запустил фоновый слушатель WebSocket",
+                extra={"ctx": {"url": getattr(self._ws, "host", None)}},
+            )
             async for message in self._ws:
                 if isinstance(message, bytes):
                     log.debug(
@@ -789,17 +804,17 @@ class XiaozhiClient:
                 try:
                     data = json.loads(message)
                 except json.JSONDecodeError:
-                    log.debug("получен не‑JSON от Xiaozhi", extra={"ctx": {"message": message}})
+                    log.info("получен не‑JSON от Xiaozhi", extra={"ctx": {"message": message}})
                     await self._incoming_messages.put(message)
                     continue
 
                 msg_type = data.get("type")
                 if msg_type == "hello":
                     self._hello_confirmed.set()
-                    log.debug("поймал server hello в фоне", extra={"ctx": data})
+                    log.info("поймал server hello в фоне", extra={"ctx": data})
                     continue
 
-                log.debug("положил входящее сообщение в очередь", extra={"ctx": data})
+                log.info("положил входящее сообщение в очередь", extra={"ctx": data})
                 await self._incoming_messages.put(data)
 
         except ConnectionClosed as err:
