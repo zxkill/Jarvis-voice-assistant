@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import sys
 import types
+import wave
+from pathlib import Path
 
+import pytest
 import numpy as np
 
 
@@ -143,3 +146,22 @@ def test_resample_for_stream_passthrough_same_rate() -> None:
 
     assert out_rate == working_tts.STREAM_SAMPLE_RATE
     assert out_pcm == pcm_src
+
+
+def test_save_wav_resamples_to_stream_rate(tmp_path: Path) -> None:
+    """WAV, сохранённый для отладки, конвертируется в 16 кГц PCM16 LE."""
+
+    src_rate = 22050
+    pcm_src = np.arange(0, 1000, dtype=np.int16)
+    wav_path = tmp_path / "tts.wav"
+
+    working_tts._save_wav(str(wav_path), pcm_src, sample_rate=src_rate)
+
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getframerate() == working_tts.STREAM_SAMPLE_RATE
+        assert wf.getnchannels() == 1
+        frames = wf.readframes(wf.getnframes())
+
+    expected_frames = int(round(pcm_src.size * working_tts.STREAM_SAMPLE_RATE / src_rate))
+    assert wf.getnframes() in {expected_frames, max(1, expected_frames - 1), expected_frames + 1}
+    assert len(frames) > 0, "Ресемплированный WAV не должен быть пустым"
