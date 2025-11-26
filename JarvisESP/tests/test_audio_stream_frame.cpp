@@ -50,7 +50,9 @@ void test_binary_frame_encoding() {
   diag.confidence = 0.78f;
 
   const uint32_t sequence = 42;
-  const auto frame = RemoteControl::build_audio_stream_frame(chunk, diag, sequence);
+  RemoteControl::AudioStreamConfig cfg{};
+  cfg.xiaoZhiCompat = false; // тестируем внутренний формат AF
+  const auto frame = RemoteControl::build_audio_stream_frame(cfg, chunk, diag, sequence, 60, 16000, 2);
 
   const size_t pcmBytes = chunk.interleaved.size() * sizeof(int16_t);
   const size_t expectedHeader = 52;

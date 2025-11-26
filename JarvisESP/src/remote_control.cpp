@@ -1,4 +1,5 @@
 #include "remote_control.h"
+#include "xiaozhi_protocol.h"
 #include "config_store.h"
 #include "audio_capture.h"
 #include "audio_playback.h"
@@ -88,9 +89,13 @@ std::vector<std::string> build_audio_stream_summary(const AudioStreamConfig& cfg
 }
 } // namespace detail
 
-std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
+std::vector<uint8_t> build_audio_stream_frame(const AudioStreamConfig& cfg,
+                                              const Audio::PcmChunk& chunk,
                                               const Audio::Diagnostics& diag,
-                                              uint32_t sequence);
+                                              uint32_t sequence,
+                                              uint16_t serverFrameDurationMs,
+                                              uint32_t serverSampleRate,
+                                              uint16_t serverChannels);
 
 namespace {
   // --- Общие (кроссплатформенные) данные ---
@@ -108,6 +113,13 @@ namespace {
   unsigned long gLastTelemetryBroadcastMs = 0; ///< Время последней рассылки статуса по WebSocket.
   unsigned long gLastTelemetryLogMs = 0;        ///< Таймер периодического логирования состояния телеметрии.
   unsigned long gLastWsWaitLogMs = 0;            ///< Таймер логирования ожидания подключения WebSocket.
+  unsigned long gLastHelloLogMs = 0;             ///< Таймер логирования отправленного hello.
+
+  // --- Служебные поля для совместимости с протоколом XiaoZhi ---
+  uint32_t gXiaoZhiServerSampleRate = 16000; ///< Частота, которую прислал сервер в hello.
+  uint16_t gXiaoZhiServerChannels = 1;       ///< Каналы сервера из приветствия.
+  uint16_t gXiaoZhiServerFrameDuration = 60; ///< Длительность кадра из приветствия.
+  bool gXiaoZhiHelloAcknowledged = false;    ///< Получили ли ответ hello от сервера.
 
 #ifdef ARDUINO
   constexpr size_t AUDIO_STREAM_QUEUE_DEPTH = 6;      ///< Глубина очереди фоновой отправки аудио.
@@ -209,6 +221,138 @@ namespace {
     lock_status_dirty();
     gStatusDirty = true;
     unlock_status_dirty();
+  }
+
+  XiaoZhi::HelloConfig make_xiaozhi_config(const AudioStreamConfig& cfg) {
+    XiaoZhi::HelloConfig hello{};
+    hello.version = cfg.xiaoZhiVersion;
+    hello.format = cfg.xiaoZhiFormat.empty() ? std::string("opus") : cfg.xiaoZhiFormat;
+    hello.sampleRate = cfg.xiaoZhiSampleRate;
+    hello.channels = cfg.xiaoZhiChannels;
+    hello.frameDurationMs = cfg.xiaoZhiFrameDurationMs;
+    return hello;
+  }
+
+  std::vector<int16_t> downmix_to_mono(const std::vector<int16_t>& interleaved) {
+    std::vector<int16_t> mono;
+    if (interleaved.empty()) {
+      return mono;
+    }
+    mono.reserve(interleaved.size() / 2 + 1);
+    for (size_t i = 0; i + 1 < interleaved.size(); i += 2) {
+      // Усредняем каналы, чтобы избежать клиппинга при сложении стерео потока в моно.
+      const int32_t mixed = static_cast<int32_t>(interleaved[i]) + static_cast<int32_t>(interleaved[i + 1]);
+      mono.push_back(static_cast<int16_t>(mixed / 2));
+    }
+    if (interleaved.size() % 2 == 1) {
+      mono.push_back(interleaved.back());
+    }
+    return mono;
+  }
+
+  uint32_t extract_uint(const std::string& text, const char* key) {
+    const size_t pos = text.find(key);
+    if (pos == std::string::npos) {
+      return 0;
+    }
+    size_t numPos = text.find_first_of("0123456789", pos);
+    if (numPos == std::string::npos) {
+      return 0;
+    }
+    size_t endPos = numPos;
+    while (endPos < text.size() && isdigit(static_cast<unsigned char>(text[endPos]))) {
+      ++endPos;
+    }
+    return static_cast<uint32_t>(strtoul(text.substr(numPos, endPos - numPos).c_str(), nullptr, 10));
+  }
+
+  bool forward_xiaozhi_audio_to_playback(const std::vector<uint8_t>& pcm,
+                                         uint32_t sampleRate,
+                                         uint16_t channels,
+                                         uint16_t frameDurationMs) {
+    if (pcm.empty()) {
+      return false;
+    }
+    const size_t samples = pcm.size() / (channels * sizeof(int16_t));
+    const size_t headerSize = 36;
+    std::vector<uint8_t> apFrame(headerSize + pcm.size());
+    auto write_u16 = [&apFrame](size_t offset, uint16_t v) {
+      apFrame[offset] = static_cast<uint8_t>(v & 0xFF);
+      apFrame[offset + 1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    };
+    auto write_u32 = [&apFrame](size_t offset, uint32_t v) {
+      for (int i = 0; i < 4; ++i) {
+        apFrame[offset + i] = static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
+      }
+    };
+    auto write_f32 = [&apFrame, &write_u32](size_t offset, float value) {
+      static_assert(sizeof(float) == sizeof(uint32_t), "float32");
+      uint32_t raw;
+      std::memcpy(&raw, &value, sizeof(raw));
+      write_u32(offset, raw);
+    };
+
+    apFrame[0] = 'A';
+    apFrame[1] = 'P';
+    apFrame[2] = 1;       // версия
+    apFrame[3] = 0;       // флаги
+    write_u32(4, 0);      // sequence неизвестен
+    write_u32(8, 0);      // timestamp
+    write_u32(12, sampleRate);
+    write_u16(16, channels);
+    write_u16(18, 16);    // bitsPerSample
+    write_u32(20, static_cast<uint32_t>(samples));
+    write_u32(24, static_cast<uint32_t>(pcm.size()));
+    write_f32(28, 1.0f);  // volume
+    write_f32(32, static_cast<float>(frameDurationMs));
+
+    std::copy(pcm.begin(), pcm.end(), apFrame.begin() + headerSize);
+    const bool accepted = AudioPlayback::handle_server_frame(apFrame.data(), apFrame.size());
+    if (!accepted) {
+#ifdef ARDUINO
+      Serial.println(F("[AUDIO] не удалось воспроизвести кадр XiaoZhi — проверяем частоту/каналы"));
+#endif
+    }
+    return accepted;
+  }
+
+  bool handle_xiaozhi_binary(const AudioStreamConfig& cfg, const uint8_t* payload, size_t length) {
+    if (!cfg.xiaoZhiCompat) {
+      return false;
+    }
+    XiaoZhi::FrameView frame{};
+    std::string error;
+    if (!XiaoZhi::parse_frame(payload, length, cfg.xiaoZhiVersion, frame, error)) {
+#ifdef ARDUINO
+      Serial.printf("[AUDIO] неверный бинарный кадр XiaoZhi: %s\n", error.c_str());
+#endif
+      return false;
+    }
+    if (frame.type != 0) {
+      // Оставляем текстовые сообщения обработчику WStype_TEXT.
+      return false;
+    }
+
+    const uint32_t sr = gXiaoZhiServerSampleRate == 0 ? cfg.xiaoZhiSampleRate : gXiaoZhiServerSampleRate;
+    const uint16_t ch = gXiaoZhiServerChannels == 0 ? cfg.xiaoZhiChannels : gXiaoZhiServerChannels;
+    forward_xiaozhi_audio_to_playback(frame.payload, sr, ch, gXiaoZhiServerFrameDuration);
+    return true;
+  }
+
+  void parse_xiaozhi_server_hello(const AudioStreamConfig& cfg, const std::string& text) {
+    if (!cfg.xiaoZhiCompat) {
+      return;
+    }
+    gXiaoZhiServerSampleRate = extract_uint(text, "sample_rate");
+    gXiaoZhiServerFrameDuration = static_cast<uint16_t>(extract_uint(text, "frame_duration"));
+    gXiaoZhiServerChannels = static_cast<uint16_t>(extract_uint(text, "channels"));
+    gXiaoZhiHelloAcknowledged = true;
+#ifdef ARDUINO
+    Serial.printf("[AUDIO] hello сервера XiaoZhi: rate=%u frame=%ums ch=%u\n",
+                  static_cast<unsigned>(gXiaoZhiServerSampleRate),
+                  static_cast<unsigned>(gXiaoZhiServerFrameDuration),
+                  static_cast<unsigned>(gXiaoZhiServerChannels));
+#endif
   }
 
   void update_queue_depth_metric() {
@@ -1627,6 +1771,7 @@ loadParams();
   }
 
   void handle_websocket_event(WStype_t type, uint8_t* payload, size_t length) {
+    const auto cfg = snapshot_audio_stream_config();
     switch (type) {
       case WStype_CONNECTED: {
         const char* info = (payload && length > 0) ? reinterpret_cast<const char*>(payload) : "";
@@ -1640,6 +1785,18 @@ loadParams();
         gAudioStreamStats.lastError.clear();
         unlock_stream_stats();
         mark_status_dirty();
+
+        if (cfg.xiaoZhiCompat) {
+          const auto helloCfg = make_xiaozhi_config(cfg);
+          const std::string helloJson = XiaoZhi::build_hello_json(helloCfg);
+          gWebsocketClient.sendTXT(helloJson.c_str(), helloJson.size());
+          gLastHelloLogMs = millis();
+          Serial.printf("[AUDIO] отправлен hello XiaoZhi v%u (%s, %u Гц, %u мс)\n",
+                        static_cast<unsigned>(helloCfg.version),
+                        helloCfg.format.c_str(),
+                        static_cast<unsigned>(helloCfg.sampleRate),
+                        static_cast<unsigned>(helloCfg.frameDurationMs));
+        }
         break;
       }
       case WStype_DISCONNECTED:
@@ -1664,9 +1821,11 @@ loadParams();
         mark_status_dirty();
         break;
       case WStype_BIN: {
-        const bool accepted = AudioPlayback::handle_server_frame(payload, length);
-        if (!accepted) {
-          Serial.println(F("[PLAYBACK] предупреждение: сервер прислал кадр, который не удалось воспроизвести"));
+        if (!handle_xiaozhi_binary(cfg, payload, length)) {
+          const bool accepted = AudioPlayback::handle_server_frame(payload, length);
+          if (!accepted) {
+            Serial.println(F("[PLAYBACK] предупреждение: сервер прислал кадр, который не удалось воспроизвести"));
+          }
         }
         break;
       }
@@ -1675,6 +1834,7 @@ loadParams();
           Serial.printf("[AUDIO] текстовое сообщение от сервера: %.*s\n",
                         static_cast<int>(length),
                         reinterpret_cast<const char*>(payload));
+          parse_xiaozhi_server_hello(cfg, std::string(reinterpret_cast<const char*>(payload), length));
         }
         break;
       case WStype_PONG:
@@ -1972,7 +2132,9 @@ loadParams();
     item->sequence = gAudioStreamStats.nextSequence++;
     unlock_stream_stats();
 
-    item->payload = build_audio_stream_frame(chunk, diag, item->sequence);
+    item->payload =
+        build_audio_stream_frame(cfg, chunk, diag, item->sequence, gXiaoZhiServerFrameDuration,
+                                 gXiaoZhiServerSampleRate, gXiaoZhiServerChannels);
     item->pcmBytes = chunk.interleaved.size() * sizeof(int16_t);
     item->diag = diag;
     item->enqueueMs = now;
@@ -2174,6 +2336,12 @@ void set_audio_stream_config(const AudioStreamConfig& cfg) {
   overwrite_audio_stream_stats(resetStats);
   mark_status_dirty();
 
+  // Сброс кеша приветствия XiaoZhi, чтобы новое подключение обязательно договорилось о параметрах.
+  gXiaoZhiServerSampleRate = cfg.xiaoZhiSampleRate;
+  gXiaoZhiServerFrameDuration = cfg.xiaoZhiFrameDurationMs;
+  gXiaoZhiServerChannels = cfg.xiaoZhiChannels;
+  gXiaoZhiHelloAcknowledged = false;
+
 #ifdef ARDUINO
   gLastQueueSaturationLogMs = 0; // Сбрасываем таймер предупреждений при смене конфигурации.
   if (cfg.endpoint.empty()) {
@@ -2203,9 +2371,30 @@ TelemetryStreamStats telemetry_stream_stats() {
   return snapshot_telemetry_stats();
 }
 
-std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
+std::vector<uint8_t> build_audio_stream_frame(const AudioStreamConfig& cfg,
+                                              const Audio::PcmChunk& chunk,
                                               const Audio::Diagnostics& diag,
-                                              uint32_t sequence) {
+                                              uint32_t sequence,
+                                              uint16_t serverFrameDurationMs,
+                                              uint32_t serverSampleRate,
+                                              uint16_t serverChannels) {
+  // Если активирован режим совместимости XiaoZhi, собираем BinaryProtocol2/3 с объявленным форматом.
+  if (cfg.xiaoZhiCompat) {
+    const auto hello = make_xiaozhi_config(cfg);
+    const auto mono = downmix_to_mono(chunk.interleaved);
+    const uint32_t timestampMs = static_cast<uint32_t>(chunk.timestampUs / 1000ULL);
+
+    // Упаковываем моно PCM как есть; если сервер ожидает Opus, формат в hello подскажет декодеру.
+    std::vector<uint8_t> payload;
+    payload.reserve(mono.size() * sizeof(int16_t));
+    for (int16_t sample : mono) {
+      payload.push_back(static_cast<uint8_t>(sample & 0xFF));
+      payload.push_back(static_cast<uint8_t>((sample >> 8) & 0xFF));
+    }
+    return XiaoZhi::build_audio_frame(hello, payload, timestampMs);
+  }
+
+  // Иначе используем внутренний формат AF (PCM + расширенный заголовок для диагностик).
   const size_t pcmBytes = chunk.interleaved.size() * sizeof(int16_t);
   const uint32_t frameSamples = diag.frameSamples != 0
                                    ? diag.frameSamples

@@ -79,6 +79,12 @@ struct AudioStreamConfig {
   uint32_t handshakeTimeoutMs = 5000;   ///< Максимальная длительность рукопожатия перед попыткой переподключения.
   uint32_t reconnectIntervalMs = 3000;  ///< Интервал между автоматическими переподключениями, мс.
   uint32_t pingIntervalMs = 15000;      ///< Частота отправки ping для поддержания соединения, мс.
+  bool xiaoZhiCompat = true;            ///< Включает проводной протокол XiaoZhi (hello + BinaryProtocol2/3).
+  uint16_t xiaoZhiVersion = 3;          ///< Версия бинарного протокола XiaoZhi (2 или 3).
+  uint16_t xiaoZhiFrameDurationMs = 60; ///< Длительность кадра, используемая в hello.
+  uint32_t xiaoZhiSampleRate = 16000;   ///< Частота дискретизации для приветствия и расчёта размеров кадра.
+  uint16_t xiaoZhiChannels = 1;         ///< Количество каналов (xiaozhi использует моно).
+  std::string xiaoZhiFormat = "opus";   ///< Кодек, объявляемый в hello (opus или pcm16 для отладки).
 };
 
 /**
@@ -124,9 +130,13 @@ struct TelemetryStreamStats {
 };
 
 #ifndef ARDUINO
-std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
+std::vector<uint8_t> build_audio_stream_frame(const AudioStreamConfig& cfg,
+                                              const Audio::PcmChunk& chunk,
                                               const Audio::Diagnostics& diag,
-                                              uint32_t sequence);
+                                              uint32_t sequence,
+                                              uint16_t serverFrameDurationMs,
+                                              uint32_t serverSampleRate,
+                                              uint16_t serverChannels);
 #endif
 
 namespace detail {
