@@ -25,6 +25,25 @@ _PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
 
 
 @dataclasses.dataclass(slots=True)
+class PlaybackClientCaps:
+    """Описание возможностей конкретного подключённого клиента.
+
+    Поля завязаны на протокол XiaoZhi, так как теперь сервер может работать в
+    двух режимах: наш старый ``AF`` и совместимый ``BinaryProtocol2/3``.
+    Храним параметры, полученные из hello-сообщения, чтобы формировать
+    корректные ответы (sample_rate, channels, frame_duration) и понимать,
+    как декодировать входящие бинарные кадры.
+    """
+
+    mode: str = "af"  # ``af`` либо ``xiaozhi``
+    xiaozhi_version: int = 3
+    sample_rate: int = 16_000
+    channels: int = 1
+    frame_duration_ms: int = 60
+    format: str = "pcm16"
+
+
+@dataclasses.dataclass(slots=True)
 class PlaybackQueueItem:
     """Элемент очереди отправки аудио роботу.
 
@@ -50,6 +69,20 @@ class PlaybackStats:
     max_queue_depth: int = 0
     max_latency_ms: float = 0.0
     last_payload_bytes: int = 0
+
+
+@dataclasses.dataclass(slots=True)
+class RobotClientSession:
+    """Сессионное состояние одного клиента робота.
+
+    Каждое подключение хранит свою очередь отправки, статистику, параметры
+    hello-обмена XiaoZhi и читаемое имя пира для логов.
+    """
+
+    queue: asyncio.Queue[PlaybackQueueItem]
+    stats: PlaybackStats
+    caps: PlaybackClientCaps
+    peer: str
 
 
 @dataclasses.dataclass(slots=True)
@@ -118,13 +151,9 @@ class RobotAudioStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
-        # Каждое подключение робота получает собственную очередь исходящих кадров
-        # и счётчик статистики. Это позволяет детально логировать проблемы,
-        # связанные с переполнением, задержками и неожиданным закрытием канала.
-        self._send_queues: Set[asyncio.Queue["PlaybackQueueItem"]] = set()
-        self._playback_stats: Dict[
-            asyncio.Queue["PlaybackQueueItem"], "PlaybackStats"
-        ] = {}
+        # Список активных сессий клиентов: каждая хранит очередь исходящих
+        # кадров, статистику и параметры hello XiaoZhi.
+        self._sessions: list[RobotClientSession] = []
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
@@ -146,6 +175,10 @@ class RobotAudioStream:
         # Таймстамп последнего предупреждения о принудительном дропе кадра,
         # чтобы не засорять логи при bursts.
         self._last_drop_warning = 0.0
+        # Локальный счётчик входящих кадров, когда клиент присылает XiaoZhi
+        # без явного sequence: помогает проставлять понятные номера в ack и
+        # логах сервера.
+        self._rx_sequence = 0
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -245,26 +278,22 @@ class RobotAudioStream:
             maxsize=self._playback_queue_max
         )
         stats = PlaybackStats(connected_at=time.time())
-        sender_task = asyncio.create_task(
-            self._send_loop(websocket, send_queue, stats, peer)
+        session = RobotClientSession(
+            queue=send_queue,
+            stats=stats,
+            caps=PlaybackClientCaps(),
+            peer=peer,
         )
-        self._send_queues.add(send_queue)
-        self._playback_stats[send_queue] = stats
+        sender_task = asyncio.create_task(
+            self._send_loop(websocket, session)
+        )
+        self._sessions.append(session)
         try:
             async for message in websocket:
                 if isinstance(message, str):
-                    self.log.debug(
-                        "Текстовое сообщение от робота",
-                        extra={"attrs": {"text": message}},
-                    )
+                    self._handle_text_message(message, websocket, session)
                     continue
-                if len(message) < _HEADER_STRUCT.size:
-                    self.log.warning(
-                        "Получен слишком короткий пакет",
-                        extra={"attrs": {"length": len(message)}},
-                    )
-                    continue
-                frame = self._decode_frame(message)
+                frame = self._decode_incoming_frame(message, session)
                 if frame is None:
                     continue
                 if self._queue.full():
@@ -304,25 +333,24 @@ class RobotAudioStream:
             if task is not None:
                 self._client_tasks.discard(task)
             sender_task.cancel()
-            self._send_queues.discard(send_queue)
-            self._playback_stats.pop(send_queue, None)
+            if session in self._sessions:
+                self._sessions.remove(session)
             self.log.info("Соединение с роботом завершено", extra={"attrs": {"peer": peer}})
 
     async def _send_loop(
         self,
         websocket: WebSocketServerProtocol,
-        queue: asyncio.Queue["PlaybackQueueItem"],
-        stats: "PlaybackStats",
-        peer: str,
+        session: RobotClientSession,
     ) -> None:
         """Отправляет накопленные чанки озвучки на робота."""
 
         self.log.debug(
-            "Запущен цикл отправки TTS", extra={"attrs": {"peer": peer}}
+            "Запущен цикл отправки TTS",
+            extra={"attrs": {"peer": session.peer, "mode": session.caps.mode}},
         )
         try:
             while True:
-                item = await queue.get()
+                item = await session.queue.get()
                 send_started = time.monotonic()
                 await websocket.send(item.payload)
                 try:
@@ -344,7 +372,8 @@ class RobotAudioStream:
                     seq = -1
                     pcm_bytes = len(item.payload)
 
-                queue_depth = queue.qsize()
+                queue_depth = session.queue.qsize()
+                stats = session.stats
                 stats.sent_frames += 1
                 stats.sent_bytes += pcm_bytes
                 stats.max_queue_depth = max(stats.max_queue_depth, queue_depth)
@@ -355,32 +384,42 @@ class RobotAudioStream:
                     "Отправлен аудиокадр роботу",
                     extra={
                         "attrs": {
-                            "peer": peer,
+                            "peer": session.peer,
                             "size": len(item.payload),
                             "sequence": seq,
                             "pcm_bytes": pcm_bytes,
                             "queue_depth": queue_depth,
                             "latency_ms": round(latency_ms, 2),
                             "purpose": item.purpose,
+                            "caps": session.caps.mode,
                         }
                     },
                 )
         except asyncio.CancelledError:
-            self.log.debug("Цикл отправки TTS остановлен", extra={"attrs": {"peer": peer}})
+            self.log.debug(
+                "Цикл отправки TTS остановлен",
+                extra={"attrs": {"peer": session.peer, "mode": session.caps.mode}},
+            )
         except ConnectionClosedError as exc:
             # Соединение могло быть закрыто роботом при перезагрузке или потере Wi‑Fi,
             # поэтому возвращаем понятный лог и завершаем цикл без пробрасывания
             # исключения в event loop.
             self.log.warning(
                 "Отправка аудио прекращена: WebSocket закрыт",
-                extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
+                extra={
+                    "attrs": {
+                        "peer": session.peer,
+                        "code": exc.code,
+                        "reason": exc.reason,
+                    }
+                },
             )
             if exc.code == 1009:
                 self.log.warning(
                     "Робот закрыл канал из-за размера кадра; уменьшите max_playback_payload",
                     extra={
                         "attrs": {
-                            "peer": peer,
+                            "peer": session.peer,
                             "suggested": max(256, self._max_playback_payload // 2),
                         }
                     },
@@ -388,12 +427,19 @@ class RobotAudioStream:
         except ConnectionClosedOK as exc:
             # Робот сам закрыл соединение штатно — фиксируем событие для мониторинга.
             self.log.info(
-                "Робот штатно закрыл аудиоканал", 
-                extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
+                "Робот штатно закрыл аудиоканал",
+                extra={
+                    "attrs": {
+                        "peer": session.peer,
+                        "code": exc.code,
+                        "reason": exc.reason,
+                    }
+                },
             )
         except Exception:
             self.log.exception(
-                "Ошибка отправки аудио роботу", extra={"attrs": {"peer": peer}}
+                "Ошибка отправки аудио роботу",
+                extra={"attrs": {"peer": session.peer, "mode": session.caps.mode}},
             )
         finally:
             # Дополнительно сигнализируем о завершении цикла, чтобы понимать
@@ -402,15 +448,16 @@ class RobotAudioStream:
                 "Цикл отправки TTS завершён",
                 extra={
                     "attrs": {
-                        "peer": peer,
-                        "sent_frames": stats.sent_frames,
-                        "sent_bytes": stats.sent_bytes,
-                        "dropped_frames": stats.dropped_frames,
-                        "dropped_bytes": stats.dropped_bytes,
-                        "max_queue_depth": stats.max_queue_depth,
-                        "max_latency_ms": round(stats.max_latency_ms, 2),
-                        "last_payload_bytes": stats.last_payload_bytes,
-                        "connected_sec": round(time.time() - stats.connected_at, 2),
+                        "peer": session.peer,
+                        "mode": session.caps.mode,
+                        "sent_frames": session.stats.sent_frames,
+                        "sent_bytes": session.stats.sent_bytes,
+                        "dropped_frames": session.stats.dropped_frames,
+                        "dropped_bytes": session.stats.dropped_bytes,
+                        "max_queue_depth": session.stats.max_queue_depth,
+                        "max_latency_ms": round(session.stats.max_latency_ms, 2),
+                        "last_payload_bytes": session.stats.last_payload_bytes,
+                        "connected_sec": round(time.time() - session.stats.connected_at, 2),
                     }
                 },
             )
@@ -421,6 +468,170 @@ class RobotAudioStream:
         self._playback_sequence = (self._playback_sequence + 1) & 0xFFFFFFFF
         return self._playback_sequence
 
+    def _next_rx_sequence(self) -> int:
+        """Простая монотонная нумерация входящих кадров XiaoZhi для ack."""
+
+        self._rx_sequence = (self._rx_sequence + 1) & 0xFFFFFFFF
+        return self._rx_sequence
+
+    def _handle_text_message(
+        self,
+        message: str,
+        websocket: WebSocketServerProtocol,
+        session: RobotClientSession,
+    ) -> None:
+        """Обрабатывает текстовые сообщения (hello XiaoZhi, отладка)."""
+
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            self.log.warning(
+                "Невалидный JSON от робота",
+                extra={"attrs": {"peer": session.peer, "text": message[:200]}},
+            )
+            return
+
+        msg_type = data.get("type")
+        if msg_type != "hello":
+            self.log.debug(
+                "Текстовое сообщение от робота",
+                extra={"attrs": {"peer": session.peer, "text": message}},
+            )
+            return
+
+        audio_params = data.get("audio_params", {})
+        session.caps.mode = "xiaozhi"
+        session.caps.xiaozhi_version = int(data.get("version", 3) or 3)
+        session.caps.format = audio_params.get("format", "pcm16")
+        session.caps.sample_rate = int(audio_params.get("sample_rate", self._expected_sample_rate))
+        session.caps.channels = int(audio_params.get("channels", 1))
+        session.caps.frame_duration_ms = int(audio_params.get("frame_duration", 60))
+
+        self.log.info(
+            "Получен hello XiaoZhi от робота",
+            extra={
+                "attrs": {
+                    "peer": session.peer,
+                    "version": session.caps.xiaozhi_version,
+                    "format": session.caps.format,
+                    "sample_rate": session.caps.sample_rate,
+                    "channels": session.caps.channels,
+                    "frame_duration_ms": session.caps.frame_duration_ms,
+                }
+            },
+        )
+
+        server_hello = json.dumps(
+            {
+                "type": "hello",
+                "version": session.caps.xiaozhi_version,
+                "transport": "websocket",
+                "audio_params": {
+                    "format": "pcm16",
+                    "sample_rate": self._expected_sample_rate,
+                    "channels": 1,
+                    "frame_duration": session.caps.frame_duration_ms,
+                },
+            }
+        )
+        asyncio.create_task(websocket.send(server_hello))
+
+    def _decode_incoming_frame(
+        self, payload: bytes, session: RobotClientSession
+    ) -> RobotAudioFrame | None:
+        """Определяет тип кадра и разбирает его согласно настройкам сессии."""
+
+        if session.caps.mode == "xiaozhi":
+            frame = self._decode_xiaozhi_frame(payload, session.caps)
+            if frame is not None:
+                return frame
+
+        if len(payload) < _HEADER_STRUCT.size:
+            self.log.warning(
+                "Получен слишком короткий пакет",
+                extra={"attrs": {"length": len(payload), "peer": session.peer}},
+            )
+            return None
+        return self._decode_frame(payload)
+
+    def _decode_xiaozhi_frame(
+        self, payload: bytes, caps: PlaybackClientCaps
+    ) -> RobotAudioFrame | None:
+        """Разбирает BinaryProtocol2/3 из XiaoZhi и приводит к RobotAudioFrame."""
+
+        if caps.xiaozhi_version == 2:
+            if len(payload) < 16:
+                self.log.warning(
+                    "Короткий кадр XiaoZhi v2",
+                    extra={"attrs": {"size": len(payload)}},
+                )
+                return None
+            version = _be_u16(payload[:2])
+            msg_type = _be_u16(payload[2:4])
+            if version != 2 or msg_type != 0:
+                return None
+            size = _be_u32(payload[12:16])
+            if size + 16 > len(payload):
+                self.log.warning(
+                    "Неверный размер кадра XiaoZhi v2",
+                    extra={"attrs": {"declared": size, "actual": len(payload)}},
+                )
+                return None
+            ts_ms = _be_u32(payload[8:12])
+            pcm_payload = payload[16 : 16 + size]
+        else:
+            if len(payload) < 4:
+                return None
+            msg_type = payload[0]
+            if msg_type != 0:
+                return None
+            size = _be_u16(payload[2:4])
+            if size + 4 > len(payload):
+                return None
+            pcm_payload = payload[4 : 4 + size]
+            ts_ms = int(time.time() * 1000)
+
+        if len(pcm_payload) % 2 != 0:
+            self.log.warning(
+                "Нечётный размер PCM XiaoZhi", extra={"attrs": {"size": len(pcm_payload)}}
+            )
+            return None
+
+        channels = max(1, caps.channels)
+        frame_samples = len(pcm_payload) // (2 * channels)
+        pcm_mono = downmix_to_mono(pcm_payload, channels)
+        sequence = self._next_rx_sequence()
+
+        self.log.debug(
+            "Получен аудиокадр XiaoZhi",
+            extra={
+                "attrs": {
+                    "sequence": sequence,
+                    "ts_ms": ts_ms,
+                    "channels": channels,
+                    "bytes": len(pcm_payload),
+                    "frame_samples": frame_samples,
+                }
+            },
+        )
+
+        return RobotAudioFrame(
+            sequence=sequence,
+            timestamp_us=ts_ms * 1000,
+            sample_rate=caps.sample_rate,
+            frame_samples=frame_samples,
+            channels=channels,
+            sample_bits=16,
+            pcm_stereo=pcm_payload,
+            pcm_mono=pcm_mono,
+            rms_left=0.0,
+            rms_right=0.0,
+            mic_spacing_m=0.0,
+            direction_deg=0.0,
+            confidence=0.0,
+            localization_enabled=False,
+        )
+
     def _prepare_playback_payload(
         self,
         pcm: bytes,
@@ -428,14 +639,9 @@ class RobotAudioStream:
         *,
         channels: int,
         volume: float,
+        caps: PlaybackClientCaps,
     ) -> tuple[bytes, dict] | None:
-        """Готовит бинарный пакет ``AP`` и возвращает полезные метрики.
-
-        Возвращаем словарь со статистикой, чтобы логи TTS и фоновых эффектов
-        содержали одинаковые поля: длительность, пики и RMS.  В случае ошибки
-        (например, некорректного числа каналов) метод возвращает ``None`` и
-        соответствующий вызов прерывается.
-        """
+        """Готовит бинарный пакет под конкретного клиента и возвращает метрики."""
 
         if not pcm:
             self.log.warning("Попытка отправить пустой PCM-чанк на робота")
@@ -462,7 +668,15 @@ class RobotAudioStream:
             )
             return None
 
-        if channels != 1:
+        if caps.mode == "xiaozhi":
+            if caps.channels == 1 and channels != 1:
+                self.log.debug(
+                    "Конвертирую аудио в моно под XiaoZhi",
+                    extra={"attrs": {"input_channels": channels, "peer_channels": caps.channels}},
+                )
+                pcm = downmix_to_mono(pcm, channels)
+                channels = 1
+        elif channels != 1:
             self.log.debug(
                 "Конвертирую аудио в моно перед отправкой",
                 extra={"attrs": {"input_channels": channels}},
@@ -483,6 +697,18 @@ class RobotAudioStream:
             math.sqrt(squares_sum / total_samples) / 32768.0 if total_samples else 0.0
         )
         peak = max((abs(val) for val in samples), default=0) / 32768.0
+
+        if caps.mode == "xiaozhi":
+            timestamp_ms = int(time.time() * 1000)
+            payload = _build_xiaozhi_audio_frame(caps, pcm, timestamp_ms)
+            return payload, {
+                "sequence": timestamp_ms,
+                "duration_ms": round(duration_ms, 2),
+                "peak": round(peak, 3),
+                "rms": round(rms_mono, 3),
+                "pcm_bytes": len(pcm),
+                "sample_rate": sample_rate,
+            }
 
         sequence = self._next_playback_sequence()
         timestamp_us = int(time.time() * 1_000_000) & 0xFFFFFFFF
@@ -511,8 +737,13 @@ class RobotAudioStream:
             "sample_rate": sample_rate,
         }
 
-    def _broadcast_payload(self, payload: bytes, *, purpose: str) -> None:
-        """Отправляет подготовленный пакет во все очереди клиентов."""
+    def _broadcast_payload(self, builder, *, purpose: str) -> None:
+        """Отправляет подготовленный пакет во все очереди клиентов.
+
+        ``builder`` — функция, получающая ``PlaybackClientCaps`` и возвращающая
+        готовый байтовый буфер либо ``None``, если отправка в конкретную сессию
+        невозможна (например, не совпадают параметры аудиоформата).
+        """
 
         if self._loop is None:
             self.log.warning("Event loop сервера ещё не готов, %s не отправлен", purpose)
@@ -522,7 +753,7 @@ class RobotAudioStream:
             # Если на момент отправки нет подключений, логируем предупреждение
             # не чаще раза в секунду и выходим, чтобы не засорять консоль при
             # длинных очередях TTS.
-            if not self._send_queues:
+            if not self._sessions:
                 now = time.monotonic()
                 if now - self._last_no_client_warning > 1.0:
                     self._last_no_client_warning = now
@@ -532,8 +763,16 @@ class RobotAudioStream:
                     )
                 return
 
-            for queue in list(self._send_queues):
-                stats = self._playback_stats.get(queue)
+            for session in list(self._sessions):
+                payload = builder(session.caps)
+                if not payload:
+                    self.log.debug(
+                        "Пропускаю отправку: нет полезной нагрузки для сессии",
+                        extra={"attrs": {"peer": session.peer, "purpose": purpose}},
+                    )
+                    continue
+                queue = session.queue
+                stats = session.stats
                 if queue.full():
                     # Когда кадры приходят быстрее, чем робот их подтверждает,
                     # аккуратно освобождаем место и логируем агрегированно,
@@ -559,12 +798,12 @@ class RobotAudioStream:
                                     "bytes": dropped_bytes,
                                     "purpose": purpose,
                                     "queue_max": self._playback_queue_max,
+                                    "peer": session.peer,
                                 }
                             },
                         )
-                    if stats:
-                        stats.dropped_frames += dropped_frames
-                        stats.dropped_bytes += dropped_bytes
+                    stats.dropped_frames += dropped_frames
+                    stats.dropped_bytes += dropped_bytes
                 queue.put_nowait(
                     PlaybackQueueItem(
                         payload=payload,
@@ -572,8 +811,7 @@ class RobotAudioStream:
                         enqueued_at=time.monotonic(),
                     )
                 )
-                if stats:
-                    stats.max_queue_depth = max(stats.max_queue_depth, queue.qsize())
+                stats.max_queue_depth = max(stats.max_queue_depth, queue.qsize())
 
         self._loop.call_soon_threadsafe(_enqueue)
 
@@ -599,7 +837,7 @@ class RobotAudioStream:
         # Если нет подключённого робота, сразу фиксируем предупреждение и
         # выходим, чтобы не раздувать логи одинаковыми сообщениями на каждый
         # субкадр. При появлении клиента последующие вызовы отправят звук.
-        if not self._send_queues:
+        if not self._sessions:
             now = time.monotonic()
             if now - self._last_no_client_warning > 1.0:
                 self._last_no_client_warning = now
@@ -614,7 +852,7 @@ class RobotAudioStream:
                     "preset": preset,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
-                    "clients": len(self._send_queues),
+                    "clients": len(self._sessions),
                     "queue_max": self._playback_queue_max,
                 }
             },
@@ -661,11 +899,13 @@ class RobotAudioStream:
         )
 
         for sub_idx, frame in enumerate(frames, start=1):
+            example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
             prepared = self._prepare_playback_payload(
                 frame,
                 sample_rate,
                 channels=channels,
                 volume=volume,
+                caps=example_caps,
             )
             if prepared is None:
                 self.log.warning(
@@ -680,7 +920,18 @@ class RobotAudioStream:
                 continue
 
             payload, stats = prepared
-            self._broadcast_payload(payload, purpose="TTS")
+
+            def _builder(caps: PlaybackClientCaps) -> bytes | None:
+                prepared_caps = self._prepare_playback_payload(
+                    frame,
+                    sample_rate,
+                    channels=channels,
+                    volume=volume,
+                    caps=caps,
+                )
+                return prepared_caps[0] if prepared_caps else None
+
+            self._broadcast_payload(_builder, purpose="TTS")
 
             self.log.debug(
                 "Сформирован TTS-кадр",
@@ -715,25 +966,38 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, эффект не отправлен")
             return
 
-        if not self._send_queues:
+        if not self._sessions:
             now = time.monotonic()
             if now - self._last_no_client_warning > 1.0:
                 self._last_no_client_warning = now
                 self.log.warning("Нет активных подключений робота для отправки эффекта")
             return
 
+        example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
         prepared = self._prepare_playback_payload(
             pcm,
             sample_rate,
             channels=channels,
             volume=volume,
+            caps=example_caps,
         )
         if prepared is None:
             return
         payload, stats = prepared
 
         purpose = f"эффекта {name}"
-        self._broadcast_payload(payload, purpose=purpose)
+
+        def _builder(caps: PlaybackClientCaps) -> bytes | None:
+            prepared_caps = self._prepare_playback_payload(
+                pcm,
+                sample_rate,
+                channels=channels,
+                volume=volume,
+                caps=caps,
+            )
+            return prepared_caps[0] if prepared_caps else None
+
+        self._broadcast_payload(_builder, purpose=purpose)
 
         self.log.debug(
             "Сформирован аудиокадр фонового эффекта",
@@ -903,3 +1167,58 @@ def downmix_to_mono(pcm: bytes, channels: int) -> bytes:
         mono.append(avg)
     # Конвертируем усреднённые значения обратно в байтовую форму PCM16.
     return struct.pack("<" + "h" * len(mono), *mono)
+
+
+def _be_u16(data: bytes) -> int:
+    """Читает 16-битное целое в big-endian для протокола XiaoZhi."""
+
+    return (data[0] << 8) | data[1]
+
+
+def _be_u32(data: bytes) -> int:
+    """Читает 32-битное целое в big-endian для протокола XiaoZhi."""
+
+    return (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
+
+
+def _build_xiaozhi_audio_frame(
+    caps: PlaybackClientCaps, payload: bytes, timestamp_ms: int | None = None
+) -> bytes:
+    """Упаковывает аудиоданные в BinaryProtocol2/3.
+
+    Версия 2 содержит таймстамп, версия 3 — только тип и размер. Мы оставляем
+    payload неизменным (PCM16 little-endian), чтобы прошивка могла передавать
+    его напрямую в I2S без дополнительного декодирования.
+    """
+
+    if caps.xiaozhi_version == 2:
+        ts = timestamp_ms or int(time.time() * 1000)
+        frame = bytearray(16 + len(payload))
+        # version
+        frame[0] = (2 >> 8) & 0xFF
+        frame[1] = 2 & 0xFF
+        # type=audio
+        frame[2] = 0
+        frame[3] = 0
+        # reserved (4..7) оставляем нулями
+        frame[8] = (ts >> 24) & 0xFF
+        frame[9] = (ts >> 16) & 0xFF
+        frame[10] = (ts >> 8) & 0xFF
+        frame[11] = ts & 0xFF
+        size = len(payload)
+        frame[12] = (size >> 24) & 0xFF
+        frame[13] = (size >> 16) & 0xFF
+        frame[14] = (size >> 8) & 0xFF
+        frame[15] = size & 0xFF
+        frame[16:] = payload
+        return bytes(frame)
+
+    # Версия 3: [type u8][reserved u8][size u16][payload]
+    size = len(payload)
+    frame = bytearray(4 + size)
+    frame[0] = 0  # type=audio
+    frame[1] = 0  # reserved
+    frame[2] = (size >> 8) & 0xFF
+    frame[3] = size & 0xFF
+    frame[4:] = payload
+    return bytes(frame)
