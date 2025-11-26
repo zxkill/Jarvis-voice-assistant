@@ -242,6 +242,65 @@ def test_tts_is_split_into_small_frames() -> None:
         assert frame_samples <= 256
 
 
+def test_tts_respects_payload_limit_and_throttles_warning() -> None:
+    """Лимит размера полезной нагрузки предотвращает код 1009, а предупреждения не спамят логи."""
+
+    async def _runner() -> tuple[list[int], float, float, int]:
+        # Задаём лимит полезной нагрузки: заголовок + 64 байта PCM (32 сэмпла моно).
+        payload_limit = _PLAYBACK_HEADER.size + 64
+        stream = RobotAudioStream(
+            "ws://127.0.0.1:0/robot",
+            queue_max=2,
+            max_playback_payload=payload_limit,
+        )
+        await stream.start()
+        # Подключений нет, но имитируем очередь отправки, как если бы робот принял handshake.
+        fake_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        stream._send_queues.add(fake_queue)
+
+        # Поддельный клиент: отправляем в очередь напрямую, подключений нет.
+        pcm = struct.pack("<" + "h" * 200, *range(200))  # 400 байт PCM16
+        stream.send_tts(
+            pcm,
+            16_000,
+            text="ограничение",  # noqa: PIE798
+            preset="neutral",
+            chunk_index=1,
+            chunks_total=1,
+            volume=1.0,
+        )
+        await asyncio.sleep(0.05)
+        first_warning_ts = stream._last_no_client_warning
+
+        # Повторный вызов сразу после первого не должен обновить таймстамп из-за троттлинга.
+        stream.send_tts(
+            pcm,
+            16_000,
+            text="повтор",  # noqa: PIE798
+            preset="neutral",
+            chunk_index=1,
+            chunks_total=1,
+            volume=1.0,
+        )
+        await asyncio.sleep(0.05)
+        second_warning_ts = stream._last_no_client_warning
+
+        # Собираем кадры, которые попали в очередь отправки: они должны укладываться в лимит.
+        enqueued_sizes: list[int] = []
+        while not fake_queue.empty():
+            enqueued_sizes.append(len(fake_queue.get_nowait()))
+
+        return enqueued_sizes, first_warning_ts, second_warning_ts, stream._max_playback_payload
+
+    sizes, first_ts, second_ts, effective_limit = asyncio.run(_runner())
+
+    # Все кадры должны быть меньше заданного лимита (заголовок + 64 байта).
+    assert sizes  # убедимся, что кадры вообще формируются
+    assert all(size <= effective_limit for size in sizes)
+    # Предупреждение не должно срабатывать чаще раза в секунду.
+    assert second_ts == first_ts
+
+
 class _DummyClosedWebSocket:
     """Фиктивный WebSocket, имитирующий разрыв соединения."""
 

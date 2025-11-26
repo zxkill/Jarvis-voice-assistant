@@ -64,6 +64,7 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
+        max_playback_payload: int = 1024,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
 
@@ -94,6 +95,12 @@ class RobotAudioStream:
         self.log = configure_logging("audio.robot_stream")
         # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
         self._playback_sequence = 0
+        # Жёсткий лимит полезной нагрузки одного кадра, чтобы не получить ошибку
+        # 1009 (frame too large) от прошивки ESP32 или прокси на пути.
+        self._max_playback_payload = max(256, max_playback_payload)
+        # Таймстамп последнего предупреждения об отсутствии подключений, чтобы
+        # не засорять логи сотнями одинаковых записей за одно событие TTS.
+        self._last_no_client_warning = 0.0
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -421,10 +428,13 @@ class RobotAudioStream:
 
         def _enqueue() -> None:
             if not self._send_queues:
-                self.log.warning(
-                    "Нет активных подключений робота для отправки %s",
-                    purpose,
-                )
+                now = time.time()
+                if now - self._last_no_client_warning > 1.0:
+                    self._last_no_client_warning = now
+                    self.log.warning(
+                        "Нет активных подключений робота для отправки %s",
+                        purpose,
+                    )
                 return
             for queue in list(self._send_queues):
                 if queue.full():
@@ -466,6 +476,16 @@ class RobotAudioStream:
         # Разбиваем большой PCM на управляемые части, чтобы не переполнить
         # буфер на ESP32 и иметь стабильную задержку при воспроизведении.
         frame_bytes = target_frame_samples * channels * 2
+
+        # Дополнительно удерживаем каждый кадр ниже лимита WebSocket (код 1009).
+        max_pcm_bytes = max(
+            2 * channels,
+            self._max_playback_payload - _PLAYBACK_HEADER_STRUCT.size,
+        )
+        frame_bytes = min(frame_bytes, max_pcm_bytes - (max_pcm_bytes % (2 * channels)))
+        if frame_bytes <= 0:
+            frame_bytes = 2 * channels
+
         frames = [
             pcm[i : i + frame_bytes]
             for i in range(0, len(pcm), frame_bytes)
@@ -478,6 +498,9 @@ class RobotAudioStream:
                 "attrs": {
                     "frames": len(frames),
                     "target_frame_samples": target_frame_samples,
+                    "frame_bytes": frame_bytes,
+                    "header_bytes": _PLAYBACK_HEADER_STRUCT.size,
+                    "max_payload_bytes": self._max_playback_payload,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
                     "pcm_bytes_total": len(pcm),
