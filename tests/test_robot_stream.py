@@ -135,33 +135,15 @@ def test_websocket_server_sends_tts_to_robot() -> None:
     payload, pcm_len = asyncio.run(_runner())
 
     assert isinstance(payload, (bytes, bytearray))
-    header = _PLAYBACK_HEADER.unpack_from(payload)
-    (
-        magic,
-        version,
-        flags,
-        sequence,
-        timestamp_us,
-        sample_rate,
-        channels,
-        sample_bits,
-        frame_samples,
-        pcm_bytes,
-        volume,
-        reserved,
-    ) = header
-    assert magic == b"AP"
-    assert version == 1
-    assert flags == 0
-    assert sample_rate == 16_000
-    assert frame_samples == pcm_len // 2
-    assert channels == 1
-    assert sample_bits == 16
-    assert pcm_bytes == pcm_len
-    pcm = payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + pcm_bytes]
-    assert pcm == struct.pack("<hh", 1200, -1200)
-    assert volume == pytest.approx(1.0)
-    assert reserved == pytest.approx(0.0)
+    # По умолчанию сервер сразу использует XiaoZhi-заголовок (4 байта), чтобы не
+    # получать треск от AF/обрезки. Проверяем, что длина полезной нагрузки
+    # соответствует исходному PCM и что кадр не урезан до 512 байт.
+    assert payload[0] == 0  # type=audio
+    assert payload[1] == 0  # reserved
+    size = (payload[2] << 8) | payload[3]
+    assert size == pcm_len
+    assert len(payload) == 4 + pcm_len
+    assert payload[4:] == struct.pack("<hh", 1200, -1200)
 
 
 def test_websocket_server_sends_effect_to_robot() -> None:
@@ -189,32 +171,18 @@ def test_websocket_server_sends_effect_to_robot() -> None:
 
     payload, pcm_len = asyncio.run(_runner())
 
-    header = _PLAYBACK_HEADER.unpack_from(payload)
-    (
-        magic,
-        version,
-        flags,
-        sequence,
-        timestamp_us,
-        sample_rate,
-        channels,
-        sample_bits,
-        frame_samples,
-        pcm_bytes,
-        volume,
-        reserved,
-    ) = header
-    assert magic == b"AP"
-    assert version == 1
-    assert flags == 0
-    # PCM ресемплируется до частоты hello робота (16 кГц), чтобы не было артефактов.
-    assert sample_rate == 16_000
-    assert channels == 1
-    assert sample_bits == 16
-    assert frame_samples == 3  # 4 исходных сэмпла -> 3 после ресемплинга 22.05→16 кГц
-    assert pcm_bytes == 6
-    assert volume == pytest.approx(0.75)
-    assert reserved == pytest.approx(0.0)
+    # Проверяем XiaoZhi-заголовок (4 байта) и длину полезной нагрузки после
+    # ресемплинга 22.05→16 кГц: из 4 сэмплов остаётся 3, итого 6 байт PCM.
+    assert payload[0] == 0
+    assert payload[1] == 0
+    size = (payload[2] << 8) | payload[3]
+    assert size == 6
+    assert len(payload) == 10
+    # Проверяем, что полезная нагрузка не обрезана и содержит 3 сэмпла после
+    # ресемплинга. Значения могут немного отличаться из-за интерполяции,
+    # поэтому фиксируем только длину и первый сэмпл.
+    first_sample = struct.unpack_from("<h", payload, 4)[0]
+    assert first_sample == 500
 
 
 def test_effect_is_split_for_xiaozhi_client() -> None:
@@ -337,7 +305,10 @@ def test_tts_is_split_into_small_frames() -> None:
         session = RobotClientSession(
             queue=queue,
             stats=PlaybackStats(connected_at=time.time()),
-            caps=PlaybackClientCaps(),
+            # В режиме AF учитываем frame_samples_hint и проверяем нарезку на
+            # субкадры до прихода hello, чтобы поймать регрессии с укороченными
+            # XiaoZhi-кадрами.
+            caps=PlaybackClientCaps(mode="af"),
             peer="dummy",
         )
         stream._sessions.append(session)
@@ -644,6 +615,44 @@ def test_tts_sent_as_xiaozhi_payload() -> None:
     size = (payload[2] << 8) | payload[3]
     assert size == 4
     assert payload[4:8] == struct.pack("<hh", 1200, -1200)
+
+
+def test_default_session_caps_are_xiaozhi_without_hello() -> None:
+    """Если робот не отправил hello, сервер всё равно шлёт совместимый кадр."""
+
+    async def _runner() -> bytes:
+        stream = RobotAudioStream(
+            "ws://127.0.0.1:0/robot",
+            max_playback_payload=2048,
+        )
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            # Отправляем 60 мс PCM16/16 кГц в 1 канал — ровно то, что ждёт XiaoZhi.
+            pcm = b"\x01\x00" * 960
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="auto-caps",
+                preset="neutral",
+                chunk_index=1,
+                chunks_total=1,
+                volume=1.0,
+            )
+            payload = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            return payload
+
+    payload = asyncio.run(_runner())
+    # Заголовок XiaoZhi v3: type=0, reserved=0, size=payload.
+    assert payload[0] == 0
+    assert payload[1] == 0
+    size = (payload[2] << 8) | payload[3]
+    assert size == len(payload) - 4
+    # Полезная нагрузка должна уместиться целиком (1920 байт) без обрезки под
+    # заголовок AF, иначе возникнет треск на роботе.
+    assert size == 1920
 
 
 class _DummyClosedWebSocket:

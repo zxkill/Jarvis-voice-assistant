@@ -34,9 +34,15 @@ class PlaybackClientCaps:
     Храним параметры, полученные из hello-сообщения, чтобы формировать
     корректные ответы (sample_rate, channels, frame_duration) и понимать,
     как декодировать входящие бинарные кадры.
+
+    По умолчанию используем профиль XiaoZhi (PCM16 LE, 16 кГц, 1 канал,
+    длительность кадра 60 мс). Это гарантирует, что даже до получения hello
+    от робота мы будем отправлять совместимый поток, а не устаревший AF
+    с 36-байтовым заголовком и слишком короткими кадрами, которые приводят
+    к треску на MAX98357A.
     """
 
-    mode: str = "af"  # ``af`` либо ``xiaozhi``
+    mode: str = "xiaozhi"  # ``af`` либо ``xiaozhi``
     xiaozhi_version: int = 3
     sample_rate: int = 16_000
     channels: int = 1
@@ -287,16 +293,37 @@ class RobotAudioStream:
             maxsize=self._playback_queue_max
         )
         stats = PlaybackStats(connected_at=time.time())
+        # Инициализируем capabilities сразу в формате XiaoZhi с частотой,
+        # заданной конфигом. Это позволяет стримить роботу корректные 60 мс
+        # кадры даже если hello по каким-то причинам не пришёл (например,
+        # временная потеря пакета при старте).
         session = RobotClientSession(
             queue=send_queue,
             stats=stats,
-            caps=PlaybackClientCaps(),
+            caps=PlaybackClientCaps(
+                sample_rate=self._expected_sample_rate,
+                channels=1,
+                frame_duration_ms=60,
+            ),
             peer=peer,
         )
         sender_task = asyncio.create_task(
             self._send_loop(websocket, session)
         )
         self._sessions.append(session)
+        self.log.debug(
+            "Инициализированы параметры XiaoZhi по умолчанию",
+            extra={
+                "attrs": {
+                    "peer": peer,
+                    "mode": session.caps.mode,
+                    "sample_rate": session.caps.sample_rate,
+                    "channels": session.caps.channels,
+                    "frame_duration_ms": session.caps.frame_duration_ms,
+                    "max_payload": self._max_playback_payload,
+                }
+            },
+        )
         try:
             async for message in websocket:
                 if isinstance(message, str):
