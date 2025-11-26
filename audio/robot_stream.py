@@ -451,6 +451,7 @@ class RobotAudioStream:
         chunks_total: int,
         volume: float,
         channels: int = 1,
+        frame_samples: int | None = None,
     ) -> None:
         """Отправляет подготовленный PCM на робота через WebSocket."""
 
@@ -458,31 +459,69 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
-            pcm,
-            sample_rate,
-            channels=channels,
-            volume=volume,
-        )
-        if prepared is None:
-            return
-        payload, stats = prepared
+        target_frame_samples = frame_samples or self.frame_samples or 512
+        if target_frame_samples <= 0:
+            target_frame_samples = 512
 
-        self._broadcast_payload(payload, purpose="TTS")
+        # Разбиваем большой PCM на управляемые части, чтобы не переполнить
+        # буфер на ESP32 и иметь стабильную задержку при воспроизведении.
+        frame_bytes = target_frame_samples * channels * 2
+        frames = [
+            pcm[i : i + frame_bytes]
+            for i in range(0, len(pcm), frame_bytes)
+            if pcm[i : i + frame_bytes]
+        ]
 
-        self.log.debug(
-            "Сформирован TTS-кадр",
+        self.log.info(
+            "Подготовка TTS к отправке",
             extra={
                 "attrs": {
-                    "text": text,
-                    "preset": preset,
+                    "frames": len(frames),
+                    "target_frame_samples": target_frame_samples,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
+                    "pcm_bytes_total": len(pcm),
                     "volume": round(volume, 3),
-                    **stats,
                 }
             },
         )
+
+        for sub_idx, frame in enumerate(frames, start=1):
+            prepared = self._prepare_playback_payload(
+                frame,
+                sample_rate,
+                channels=channels,
+                volume=volume,
+            )
+            if prepared is None:
+                self.log.warning(
+                    "TTS-кадр пропущен из-за ошибки подготовки",
+                    extra={
+                        "attrs": {
+                            "sub_index": sub_idx,
+                            "frames_total": len(frames),
+                        }
+                    },
+                )
+                continue
+
+            payload, stats = prepared
+            self._broadcast_payload(payload, purpose="TTS")
+
+            self.log.debug(
+                "Сформирован TTS-кадр",
+                extra={
+                    "attrs": {
+                        "text": text,
+                        "preset": preset,
+                        "chunk_index": chunk_index,
+                        "chunks_total": chunks_total,
+                        "sub_frame": sub_idx,
+                        "sub_frames_total": len(frames),
+                        **stats,
+                    }
+                },
+            )
 
     def send_effect(
         self,

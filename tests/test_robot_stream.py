@@ -198,6 +198,50 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert reserved == pytest.approx(0.0)
 
 
+def test_tts_is_split_into_small_frames() -> None:
+    """Крупный PCM должен резаться на небольшие фреймы, чтобы не валить ESP32."""
+
+    async def _runner() -> list[bytes]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        await stream.start()
+        # Создаём поддельную очередь отправки, имитирующую подключение робота.
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        stream._send_queues.add(queue)
+
+        # Генерируем ~100 мс моно PCM (1600 сэмплов при 16 кГц).
+        pcm = struct.pack("<" + "h" * 1600, *range(1600))
+        # Просим делить звук на фреймы по 256 сэмплов.
+        stream.send_tts(
+            pcm,
+            16_000,
+            text="тест",  # noqa: PIE798 — важно видеть в логах
+            preset="neutral",
+            chunk_index=1,
+            chunks_total=1,
+            volume=1.0,
+            frame_samples=256,
+        )
+
+        await asyncio.sleep(0.05)
+        collected: list[bytes] = []
+        while not queue.empty():
+            collected.append(queue.get_nowait())
+        return collected
+
+    payloads = asyncio.run(_runner())
+
+    # 1600 / 256 = 6.25 → ожидаем 7 фреймов, чтобы последний включал остаток.
+    assert len(payloads) == 7
+    for payload in payloads:
+        header = _PLAYBACK_HEADER.unpack_from(payload)
+        assert header[0] == b"AP"
+        # Убеждаемся, что размер pcm_bytes не превышает порог и совпадает с frameSamples.
+        pcm_bytes = header[9]
+        frame_samples = header[8]
+        assert pcm_bytes == frame_samples * 2  # mono => 2 байта на сэмпл
+        assert frame_samples <= 256
+
+
 class _DummyClosedWebSocket:
     """Фиктивный WebSocket, имитирующий разрыв соединения."""
 
