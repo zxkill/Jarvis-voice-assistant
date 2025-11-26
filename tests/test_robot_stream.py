@@ -505,6 +505,29 @@ def test_default_playback_payload_matches_xiaozhi_frame() -> None:
     assert meta["pcm_bytes"] == len(frames[0])
 
 
+def test_prepare_payload_resamples_to_caps_rate() -> None:
+    """TTS/эффекты приводятся к частоте 16 кГц, чтобы робот не трещал."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:0/robot", max_playback_payload=4096)
+    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=16_000, channels=1, frame_duration_ms=60)
+
+    # Формируем 60 мс моно-сигнал 44.1 кГц и проверяем, что он ресемплируется в 16 кГц.
+    src_rate = 44_100
+    src_frames = int(src_rate * 0.06)
+    pcm = struct.pack("<" + "h" * src_frames, *([500] * src_frames))
+
+    prepared = stream._prepare_playback_payload(pcm, src_rate, channels=1, volume=1.0, caps=caps)
+    assert prepared is not None, "Кадр должен быть сформирован после ресемплинга"
+
+    payload, meta = prepared
+    expected_frames = int(round(src_frames * caps.sample_rate / src_rate))
+    expected_bytes = expected_frames * 2  # 16 бит на сэмпл
+
+    # Заголовок XiaoZhi v3 занимает 4 байта, полезная нагрузка — пересчитанный PCM.
+    assert len(payload) == 4 + expected_bytes
+    assert meta["sample_rate"] == caps.sample_rate
+
+
 def test_resample_and_downmix_aligns_with_caps() -> None:
     """Ресемплинг и перевод в моно приводят PCM к формату XiaoZhi без артефактов."""
 

@@ -693,6 +693,30 @@ class RobotAudioStream:
             pcm = downmix_to_mono(pcm, channels)
             channels = 1
 
+        # Принудительно подгоняем частоту дискретизации под параметры робота
+        # из hello. Это устраняет ситуацию, когда TTS или эффект пришёл в
+        # 44.1 кГц, а XiaoZhi/ESP32 ждёт ровно 16 кГц PCM16 LE (256 кбит/с).
+        if caps.sample_rate and sample_rate != caps.sample_rate:
+            self._resample_log.info(
+                "Привожу частоту аудио к формату робота",
+                extra={
+                    "attrs": {
+                        "from_rate": sample_rate,
+                        "to_rate": caps.sample_rate,
+                        "channels": channels,
+                        "mode": caps.mode,
+                    }
+                },
+            )
+            pcm = _resample_pcm(
+                pcm,
+                sample_rate,
+                caps.sample_rate,
+                max(1, channels),
+                log=self._resample_log,
+            )
+            sample_rate = caps.sample_rate
+
         samples = array("h")
         samples.frombytes(pcm)
         total_samples = len(samples)
