@@ -3,6 +3,8 @@
 import threading
 import logging
 
+import numpy as np
+
 import emotion.sounds as sounds
 
 
@@ -22,7 +24,9 @@ def test_play_effect_logs_caller(monkeypatch, caplog):
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
     monkeypatch.setattr(sounds, "is_quiet_now", lambda: False)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     monkeypatch.setattr(sounds, "_EFFECTS", {"WAKE": sounds._Effect(files=["wake.wav"], gain=0.0, cooldown=0.0)})
     monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
     monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")
@@ -46,7 +50,9 @@ def test_driver_logs_caller(monkeypatch, caplog):
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
     monkeypatch.setattr(sounds, "is_quiet_now", lambda: False)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     monkeypatch.setattr(threading.Thread, "start", lambda self: None)
     monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
     monkeypatch.setattr(sounds, "_CURRENT_PALETTE", "")

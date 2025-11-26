@@ -1,3 +1,5 @@
+import numpy as np
+
 import emotion.sounds as sounds
 from emotion.state import Emotion
 from core import events as core_events
@@ -20,7 +22,9 @@ def test_sound_stops_on_emotion_change(monkeypatch):
 
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
 
     effects = {
         "SLEEPY": sounds._Effect(files=["sleep.wav"], gain=0.0, cooldown=0.0),

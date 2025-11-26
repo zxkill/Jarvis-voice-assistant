@@ -1,5 +1,8 @@
 import time
 import concurrent.futures
+
+import numpy as np
+
 import emotion.sounds as sounds
 
 
@@ -24,7 +27,9 @@ def test_play_effect_thread_safe(monkeypatch):
     dummy_sd = SlowSD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
     # Возвращаем простые данные, пригодные для умножения на громкость
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (1.0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([1.0], dtype=np.float32), 44100, 1)
+    )
     effect = sounds._Effect(files=["sigh.wav"], gain=0.0, cooldown=10.0)
     # Подменяем глобальный кеш эффектов тестовым экземпляром
     monkeypatch.setattr(sounds, "_EFFECTS", {"SIGH": effect})

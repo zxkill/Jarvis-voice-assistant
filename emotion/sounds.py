@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import audioop
 import random
 import time
 import wave
@@ -221,15 +222,91 @@ def _get_effects() -> Dict[str, _Effect]:
     return _EFFECTS
 
 
-def _read_wav(path: str) -> tuple[np.ndarray, int]:
-    """Возвращает аудиоданные и частоту дискретизации."""
+def _read_wav(path: str) -> tuple[np.ndarray, int, int]:
+    """Читает WAV и приводит его к плавающему формату в диапазоне [-1; 1].
+
+    Возвращает нормализованные сэмплы, частоту дискретизации и количество
+    каналов в файле. Дополнительно устраняет частые причины треска при
+    передаче на робота: конвертирует 8-бит unsigned и стерео-файлы, а также
+    понижает нестандартную разрядность до 16 бит перед дальнейшей обработкой.
+    """
+
     if np is None:  # pragma: no cover - зависит от внешней зависимости
         raise RuntimeError("numpy is required to load WAV files")
+
     with wave.open(path, "rb") as wf:
+        sample_width = wf.getsampwidth() or 2
+        channels = wf.getnchannels() or 1
+        rate = wf.getframerate() or 16_000
         frames = wf.readframes(wf.getnframes())
-        data = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
-        data /= 32768.0  # нормализуем в диапазон [-1;1]
-        return data, wf.getframerate()
+
+    if sample_width == 1:
+        raw = np.frombuffer(frames, dtype=np.uint8).astype(np.float32)
+        data = (raw - 128.0) / 128.0
+        log.debug(
+            "WAV: конвертирую 8-битный unsigned в float32",  # noqa: TRY400
+            extra={"attrs": {"path": path, "channels": channels, "rate": rate}},
+        )
+    elif sample_width == 2:
+        data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    else:
+        try:
+            converted = audioop.lin2lin(frames, sample_width, 2)
+            data = np.frombuffer(converted, dtype="<i2").astype(np.float32)
+            data /= 32768.0
+            log.debug(
+                "WAV: понижаю разрядность до 16 бит",  # noqa: TRY400
+                extra={
+                    "attrs": {
+                        "path": path,
+                        "sample_width": sample_width,
+                        "channels": channels,
+                        "rate": rate,
+                    }
+                },
+            )
+        except Exception:
+            log.exception(
+                "WAV: не удалось сконвертировать нестандартную разрядность",  # noqa: TRY400
+                extra={
+                    "attrs": {
+                        "path": path,
+                        "sample_width": sample_width,
+                        "channels": channels,
+                        "rate": rate,
+                    }
+                },
+            )
+            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+    if channels > 1:
+        try:
+            reshaped = data.reshape(-1, channels)
+            data = reshaped.mean(axis=1)
+            log.debug(
+                "WAV: привожу стерео к моно перед отправкой",  # noqa: TRY400
+                extra={
+                    "attrs": {
+                        "path": path,
+                        "input_channels": channels,
+                        "rate": rate,
+                    }
+                },
+            )
+        except Exception:
+            log.exception(
+                "WAV: не удалось свести каналы — оставляю как есть",  # noqa: TRY400
+                extra={
+                    "attrs": {
+                        "path": path,
+                        "input_channels": channels,
+                        "rate": rate,
+                        "len": len(data),
+                    }
+                },
+            )
+
+    return data, rate, channels
 
 
 def _float32_to_pcm16(samples: np.ndarray) -> bytes:
@@ -346,7 +423,18 @@ def play_effect(name: str | Emotion) -> None:
         caller = _caller_name()
         log.info("play %s (%s) by %s x%d", eff_key, file, caller, effect.repeat)
         try:
-            data, rate = _read_wav(file)
+            data, rate, src_channels = _read_wav(file)
+            log.debug(
+                "Загружен WAV для эффекта",  # noqa: TRY400
+                extra={
+                    "attrs": {
+                        "file": file,
+                        "rate": rate,
+                        "source_channels": src_channels,
+                        "frames": len(data),
+                    }
+                },
+            )
             volume = 10 ** (effect.gain / 20)
             scaled = np.clip(data * volume, -1.0, 1.0)
             pcm_bytes = _float32_to_pcm16(scaled)

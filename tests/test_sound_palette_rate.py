@@ -1,4 +1,6 @@
 import types
+import numpy as np
+
 import emotion.sounds as sounds
 from utils.rate_limiter import RateLimiter
 
@@ -24,7 +26,7 @@ def test_palette_selection(monkeypatch):
 
     def fake_read(path: str):  # pragma: no cover - фиксация пути
         paths.append(path)
-        return 0, 44100
+        return np.array([0.0], dtype=np.float32), 44100, 1
 
     monkeypatch.setattr(sounds, "_read_wav", fake_read)
     effect_bright = sounds._Effect(files=["bright.wav"], gain=0.0, cooldown=0.0)
@@ -49,7 +51,9 @@ def test_global_rate_limit(monkeypatch):
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
     monkeypatch.setattr(sounds, "is_quiet_now", lambda: False)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     effect_a = sounds._Effect(files=["a.wav"], gain=0.0, cooldown=0.0)
     effect_b = sounds._Effect(files=["b.wav"], gain=0.0, cooldown=0.0)
     monkeypatch.setattr(sounds, "_EFFECTS", {"A": effect_a, "B": effect_b})

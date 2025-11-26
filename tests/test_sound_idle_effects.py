@@ -1,5 +1,7 @@
 """Тесты коротких "дыханий" драйвера звуковых эмоций."""
 
+import numpy as np
+
 import emotion.sounds as sounds
 
 
@@ -24,13 +26,14 @@ def test_idle_effect_with_cooldown(monkeypatch, capsys):  # type: ignore[no-unty
     def fake_read(path: str):  # type: ignore[no-untyped-def]
         """Сохраняем путь для проверки и возвращаем заглушку аудио."""
         selected.append(path)
-        return 0.0, 44100
+        return np.array([0.0], dtype=np.float32), 44100, 1
 
     monkeypatch.setattr(sounds, "_read_wav", fake_read)
 
     driver = sounds.EmotionSoundDriver()
     # Сбрасываем глобальный таймер в прошлое, чтобы первый вызов не пропускался.
     monkeypatch.setattr(sounds, "_idle_breath_last", -sounds.MIN_IDLE_BREATH_COOLDOWN)
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
     driver._effects = {
         "IDLE_BREATH": sounds._Effect(
             files=["breath.wav"],
@@ -39,6 +42,7 @@ def test_idle_effect_with_cooldown(monkeypatch, capsys):  # type: ignore[no-unty
             last_played=-sounds.MIN_IDLE_BREATH_COOLDOWN,
         )
     }
+    sounds._EFFECTS = driver._effects
     driver.log.setLevel("DEBUG")
 
     # фиксируем выбор файла
@@ -50,7 +54,8 @@ def test_idle_effect_with_cooldown(monkeypatch, capsys):  # type: ignore[no-unty
     driver.play_idle_effect()
     driver.play_idle_effect()  # вторая попытка должна быть пропущена
 
-    assert dummy_sd.calls == [(0.0, 44100)]
+    assert len(dummy_sd.calls) == 1
+    assert dummy_sd.calls[0][1] == 44100
     assert selected == ["breath.wav"]
     # проверяем наличие сообщения о пропуске из-за cooldown
     captured = capsys.readouterr()
@@ -66,13 +71,18 @@ def test_idle_effect_repeat(monkeypatch):  # type: ignore[no-untyped-def]
 
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0.0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     driver = sounds.EmotionSoundDriver()
     driver._effects = {
         "IDLE_BREATH": sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=0.0, repeat=2)
     }
+    sounds._EFFECTS = driver._effects
+    monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
 
     driver.play_idle_effect()
 
-    assert dummy_sd.calls == [(0.0, 44100), (0.0, 44100)]
+    assert len(dummy_sd.calls) == 2
+    assert all(call[1] == 44100 for call in dummy_sd.calls)
 

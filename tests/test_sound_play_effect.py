@@ -1,3 +1,5 @@
+import numpy as np
+
 import emotion.sounds as sounds
 
 
@@ -12,7 +14,9 @@ class DummySD:
 def test_play_effect(monkeypatch):
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     effects = {
         "WAKE": sounds._Effect(files=["wake.wav"], gain=0.0, cooldown=0.0),
     }
@@ -29,7 +33,9 @@ def test_play_effect_respects_cooldown(monkeypatch):
 
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     effect = sounds._Effect(files=["sigh.wav"], gain=0.0, cooldown=10.0)
     monkeypatch.setattr(sounds, "_EFFECTS", {"SIGH": effect})
     monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
@@ -46,7 +52,9 @@ def test_play_effect_repeat(monkeypatch):
 
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
     effect = sounds._Effect(files=["breath.wav"], gain=0.0, cooldown=0.0, repeat=3)
     monkeypatch.setattr(sounds, "_EFFECTS", {"BREATH": effect})
     monkeypatch.setattr(sounds, "_GLOBAL_LIMITER", None)
