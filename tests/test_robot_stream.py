@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import struct
+import time
 
 import pytest
 import websockets
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from audio.robot_stream import RobotAudioStream, RobotStreamClosed, downmix_to_mono
+from audio.robot_stream import (
+    PlaybackQueueItem,
+    PlaybackStats,
+    RobotAudioStream,
+    RobotStreamClosed,
+    downmix_to_mono,
+)
 
 _HEADER = struct.Struct("<2sBBIQIIHHIfffff")
 _PLAYBACK_HEADER = struct.Struct("<2sBBIIIHHIIff")
@@ -205,7 +212,7 @@ def test_tts_is_split_into_small_frames() -> None:
         stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
         await stream.start()
         # Создаём поддельную очередь отправки, имитирующую подключение робота.
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        queue: asyncio.Queue[PlaybackQueueItem] = asyncio.Queue()
         stream._send_queues.add(queue)
 
         # Генерируем ~100 мс моно PCM (1600 сэмплов при 16 кГц).
@@ -225,7 +232,7 @@ def test_tts_is_split_into_small_frames() -> None:
         await asyncio.sleep(0.05)
         collected: list[bytes] = []
         while not queue.empty():
-            collected.append(queue.get_nowait())
+            collected.append(queue.get_nowait().payload)
         return collected
 
     payloads = asyncio.run(_runner())
@@ -255,7 +262,7 @@ def test_tts_respects_payload_limit_and_throttles_warning() -> None:
         )
         await stream.start()
         # Подключений нет, но имитируем очередь отправки, как если бы робот принял handshake.
-        fake_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        fake_queue: asyncio.Queue[PlaybackQueueItem] = asyncio.Queue()
         stream._send_queues.add(fake_queue)
 
         # Поддельный клиент: отправляем в очередь напрямую, подключений нет.
@@ -288,7 +295,7 @@ def test_tts_respects_payload_limit_and_throttles_warning() -> None:
         # Собираем кадры, которые попали в очередь отправки: они должны укладываться в лимит.
         enqueued_sizes: list[int] = []
         while not fake_queue.empty():
-            enqueued_sizes.append(len(fake_queue.get_nowait()))
+            enqueued_sizes.append(len(fake_queue.get_nowait().payload))
 
         return enqueued_sizes, first_warning_ts, second_warning_ts, stream._max_playback_payload
 
@@ -346,7 +353,9 @@ def test_broadcast_uses_configured_playback_queue(caplog) -> None:
         )
         await stream.start()
         # Подменяем очередь отправки, как если бы робот уже подключился.
-        fake_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=stream._playback_queue_max)
+        fake_queue: asyncio.Queue[PlaybackQueueItem] = asyncio.Queue(
+            maxsize=stream._playback_queue_max
+        )
         stream._send_queues.add(fake_queue)
 
         payload = b"p" * 64
@@ -392,10 +401,66 @@ def test_send_loop_survives_connection_reset() -> None:
 
     async def _runner() -> None:
         stream = RobotAudioStream("ws://127.0.0.1:0/robot")
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
-        queue.put_nowait(b"pcm")
+        queue: asyncio.Queue[PlaybackQueueItem] = asyncio.Queue()
+        queue.put_nowait(
+            PlaybackQueueItem(payload=b"pcm", purpose="TTS", enqueued_at=time.monotonic())
+        )
 
+        stats = PlaybackStats(connected_at=time.time())
         # Убеждаемся, что ConnectionClosedError обрабатывается и не утекает наружу.
-        await stream._send_loop(_DummyClosedWebSocket(), queue, peer="test-peer")
+        await stream._send_loop(_DummyClosedWebSocket(), queue, stats, peer="test-peer")
 
     asyncio.run(_runner())
+
+
+class _CapturingWebSocket:
+    """WebSocket-заглушка, фиксирующая отправленные байты."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    async def send(self, payload: bytes) -> None:  # pragma: no cover - простая заглушка
+        self.sent.append(payload)
+
+
+def test_send_loop_collects_diagnostics(caplog) -> None:
+    """Цикл отправки накапливает статистику очереди и логирует сводку."""
+
+    async def _runner() -> PlaybackStats:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot")
+        queue: asyncio.Queue[PlaybackQueueItem] = asyncio.Queue()
+        queue.put_nowait(
+            PlaybackQueueItem(
+                payload=b"a" * (_PLAYBACK_HEADER.size + 4),
+                purpose="TTS",
+                enqueued_at=time.monotonic() - 0.01,
+            )
+        )
+        queue.put_nowait(
+            PlaybackQueueItem(
+                payload=b"b" * (_PLAYBACK_HEADER.size + 2),
+                purpose="SFX",
+                enqueued_at=time.monotonic() - 0.02,
+            )
+        )
+
+        ws = _CapturingWebSocket()
+        stats = PlaybackStats(connected_at=time.time())
+        caplog.set_level("DEBUG", logger="audio.robot_stream")
+        task = asyncio.create_task(stream._send_loop(ws, queue, stats, peer="diag"))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return stats
+
+    stats = asyncio.run(_runner())
+    # Два кадра успели отправиться до отмены задачи.
+    assert stats.sent_frames == 2
+    assert stats.sent_bytes > 0
+    assert stats.max_queue_depth >= 0
+    assert stats.max_latency_ms >= 0
+    # Статистика должна зафиксировать хотя бы одну задержку и глубину очереди.
+    assert stats.max_latency_ms >= 0

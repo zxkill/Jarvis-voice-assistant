@@ -10,7 +10,7 @@ import struct
 import time
 from array import array
 from collections import deque
-from typing import Deque, Set
+from typing import Deque, Dict, Set
 from urllib.parse import urlparse
 
 import websockets
@@ -22,6 +22,34 @@ from core.logging_json import configure_logging
 _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
 # Заголовок исходящих кадров TTS, описанный в прошивке ESP32.
 _PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
+
+
+@dataclasses.dataclass(slots=True)
+class PlaybackQueueItem:
+    """Элемент очереди отправки аудио роботу.
+
+    Хранит полезную нагрузку, её назначение (TTS/эффект) и время постановки
+    в очередь, чтобы можно было измерять задержку доставки и понимать, где
+    возникает бутылочное горлышко.
+    """
+
+    payload: bytes
+    purpose: str
+    enqueued_at: float
+
+
+@dataclasses.dataclass(slots=True)
+class PlaybackStats:
+    """Собирает статистику отправки для одного WebSocket-подключения."""
+
+    connected_at: float
+    sent_frames: int = 0
+    sent_bytes: int = 0
+    dropped_frames: int = 0
+    dropped_bytes: int = 0
+    max_queue_depth: int = 0
+    max_latency_ms: float = 0.0
+    last_payload_bytes: int = 0
 
 
 @dataclasses.dataclass(slots=True)
@@ -90,7 +118,13 @@ class RobotAudioStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
-        self._send_queues: Set[asyncio.Queue[bytes]] = set()
+        # Каждое подключение робота получает собственную очередь исходящих кадров
+        # и счётчик статистики. Это позволяет детально логировать проблемы,
+        # связанные с переполнением, задержками и неожиданным закрытием канала.
+        self._send_queues: Set[asyncio.Queue["PlaybackQueueItem"]] = set()
+        self._playback_stats: Dict[
+            asyncio.Queue["PlaybackQueueItem"], "PlaybackStats"
+        ] = {}
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
@@ -129,6 +163,9 @@ class RobotAudioStream:
                     "port": self._port,
                     "path": self._path,
                     "subprotocol": self._subprotocol or "",
+                    "max_playback_payload": self._max_playback_payload,
+                    "playback_queue_max": self._playback_queue_max,
+                    "expected_sample_rate": self._expected_sample_rate,
                 }
             },
         )
@@ -204,13 +241,15 @@ class RobotAudioStream:
         # Очередь исходящих кадров увеличена и задаётся конфигом: это позволяет
         # безопасно складывать все субкадры TTS даже при жёстком лимите полезной
         # нагрузки (например, 600–800 байт на кадр для MAX98357A).
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(
+        send_queue: asyncio.Queue[PlaybackQueueItem] = asyncio.Queue(
             maxsize=self._playback_queue_max
         )
+        stats = PlaybackStats(connected_at=time.time())
         sender_task = asyncio.create_task(
-            self._send_loop(websocket, send_queue, peer)
+            self._send_loop(websocket, send_queue, stats, peer)
         )
         self._send_queues.add(send_queue)
+        self._playback_stats[send_queue] = stats
         try:
             async for message in websocket:
                 if isinstance(message, str):
@@ -266,12 +305,14 @@ class RobotAudioStream:
                 self._client_tasks.discard(task)
             sender_task.cancel()
             self._send_queues.discard(send_queue)
+            self._playback_stats.pop(send_queue, None)
             self.log.info("Соединение с роботом завершено", extra={"attrs": {"peer": peer}})
 
     async def _send_loop(
         self,
         websocket: WebSocketServerProtocol,
-        queue: asyncio.Queue[bytes],
+        queue: asyncio.Queue["PlaybackQueueItem"],
+        stats: "PlaybackStats",
         peer: str,
     ) -> None:
         """Отправляет накопленные чанки озвучки на робота."""
@@ -281,8 +322,9 @@ class RobotAudioStream:
         )
         try:
             while True:
-                payload = await queue.get()
-                await websocket.send(payload)
+                item = await queue.get()
+                send_started = time.monotonic()
+                await websocket.send(item.payload)
                 try:
                     (
                         _magic,
@@ -297,21 +339,32 @@ class RobotAudioStream:
                         pcm_bytes,
                         _volume,
                         _reserved,
-                    ) = _PLAYBACK_HEADER_STRUCT.unpack_from(payload)
+                    ) = _PLAYBACK_HEADER_STRUCT.unpack_from(item.payload)
                 except struct.error:
                     seq = -1
-                    pcm_bytes = len(payload)
+                    pcm_bytes = len(item.payload)
+
+                queue_depth = queue.qsize()
+                stats.sent_frames += 1
+                stats.sent_bytes += pcm_bytes
+                stats.max_queue_depth = max(stats.max_queue_depth, queue_depth)
+                latency_ms = (send_started - item.enqueued_at) * 1000.0
+                stats.max_latency_ms = max(stats.max_latency_ms, latency_ms)
+                stats.last_payload_bytes = pcm_bytes
                 self.log.debug(
                     "Отправлен аудиокадр роботу",
                     extra={
                         "attrs": {
                             "peer": peer,
-                            "size": len(payload),
-                        "sequence": seq,
-                        "pcm_bytes": pcm_bytes,
-                    }
-                },
-            )
+                            "size": len(item.payload),
+                            "sequence": seq,
+                            "pcm_bytes": pcm_bytes,
+                            "queue_depth": queue_depth,
+                            "latency_ms": round(latency_ms, 2),
+                            "purpose": item.purpose,
+                        }
+                    },
+                )
         except asyncio.CancelledError:
             self.log.debug("Цикл отправки TTS остановлен", extra={"attrs": {"peer": peer}})
         except ConnectionClosedError as exc:
@@ -346,7 +399,20 @@ class RobotAudioStream:
             # Дополнительно сигнализируем о завершении цикла, чтобы понимать
             # причину остановки в длинных логах.
             self.log.debug(
-                "Цикл отправки TTS завершён", extra={"attrs": {"peer": peer}}
+                "Цикл отправки TTS завершён",
+                extra={
+                    "attrs": {
+                        "peer": peer,
+                        "sent_frames": stats.sent_frames,
+                        "sent_bytes": stats.sent_bytes,
+                        "dropped_frames": stats.dropped_frames,
+                        "dropped_bytes": stats.dropped_bytes,
+                        "max_queue_depth": stats.max_queue_depth,
+                        "max_latency_ms": round(stats.max_latency_ms, 2),
+                        "last_payload_bytes": stats.last_payload_bytes,
+                        "connected_sec": round(time.time() - stats.connected_at, 2),
+                    }
+                },
             )
 
     def _next_playback_sequence(self) -> int:
@@ -467,6 +533,7 @@ class RobotAudioStream:
                 return
 
             for queue in list(self._send_queues):
+                stats = self._playback_stats.get(queue)
                 if queue.full():
                     # Когда кадры приходят быстрее, чем робот их подтверждает,
                     # аккуратно освобождаем место и логируем агрегированно,
@@ -477,7 +544,7 @@ class RobotAudioStream:
                         while queue.full():
                             dropped = queue.get_nowait()
                             dropped_frames += 1
-                            dropped_bytes += len(dropped)
+                            dropped_bytes += len(dropped.payload)
                     except asyncio.QueueEmpty:  # pragma: no cover - редкий гонк
                         pass
 
@@ -495,7 +562,18 @@ class RobotAudioStream:
                                 }
                             },
                         )
-                queue.put_nowait(payload)
+                    if stats:
+                        stats.dropped_frames += dropped_frames
+                        stats.dropped_bytes += dropped_bytes
+                queue.put_nowait(
+                    PlaybackQueueItem(
+                        payload=payload,
+                        purpose=purpose,
+                        enqueued_at=time.monotonic(),
+                    )
+                )
+                if stats:
+                    stats.max_queue_depth = max(stats.max_queue_depth, queue.qsize())
 
         self._loop.call_soon_threadsafe(_enqueue)
 
@@ -527,6 +605,20 @@ class RobotAudioStream:
                 self._last_no_client_warning = now
                 self.log.warning("Нет активных подключений робота для отправки TTS")
             return
+
+        self.log.debug(
+            "Начало подготовки TTS",
+            extra={
+                "attrs": {
+                    "text": text,
+                    "preset": preset,
+                    "chunk_index": chunk_index,
+                    "chunks_total": chunks_total,
+                    "clients": len(self._send_queues),
+                    "queue_max": self._playback_queue_max,
+                }
+            },
+        )
 
         target_frame_samples = frame_samples or self.frame_samples or 512
         if target_frame_samples <= 0:
