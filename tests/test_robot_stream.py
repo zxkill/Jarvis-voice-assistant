@@ -337,6 +337,48 @@ def test_tts_skipped_without_clients(caplog) -> None:
     stream._loop.close()
 
 
+def test_broadcast_uses_configured_playback_queue(caplog) -> None:
+    """Очередь отправки использует новый лимит и агрегирует предупреждения."""
+
+    async def _runner() -> tuple[int, float, float, int]:
+        stream = RobotAudioStream(
+            "ws://127.0.0.1:0/robot", playback_queue_max=5, max_playback_payload=128
+        )
+        await stream.start()
+        # Подменяем очередь отправки, как если бы робот уже подключился.
+        fake_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=stream._playback_queue_max)
+        stream._send_queues.add(fake_queue)
+
+        payload = b"p" * 64
+        # 20 субкадров при maxsize=5 гарантируют дропы, но лог должен появиться
+        # агрегированно, а конечный размер очереди не превышает лимит.
+        for _ in range(20):
+            stream._broadcast_payload(payload, purpose="TTS")
+        await asyncio.sleep(0.05)
+        first_ts = stream._last_drop_warning
+
+        # Повторный бурст сразу после первого не должен сбрасывать таймстамп
+        # из-за троттлинга в 0.5 секунды.
+        for _ in range(5):
+            stream._broadcast_payload(payload, purpose="TTS")
+        await asyncio.sleep(0.05)
+        second_ts = stream._last_drop_warning
+
+        enqueued = 0
+        while not fake_queue.empty():
+            _ = fake_queue.get_nowait()
+            enqueued += 1
+
+        return enqueued, first_ts, second_ts, stream._playback_queue_max
+
+    enqueued, first_ts, second_ts, queue_limit = asyncio.run(_runner())
+
+    assert enqueued <= queue_limit
+    assert first_ts > 0
+    # Предупреждение о переполнении не должно срабатывать чаще, чем раз в 0.5 с.
+    assert second_ts == first_ts
+
+
 class _DummyClosedWebSocket:
     """Фиктивный WebSocket, имитирующий разрыв соединения."""
 

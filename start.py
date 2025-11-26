@@ -189,6 +189,7 @@ async def start_robot_audio_stream(
     ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
     ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
     max_playback_payload = cfg.getint("ROBOT_AUDIO", "max_playback_payload", fallback=800)
+    playback_queue_max = cfg.getint("ROBOT_AUDIO", "playback_queue_max", fallback=200)
 
     audio_stream = RobotAudioStream(
         endpoint=robot_audio_endpoint,
@@ -200,6 +201,7 @@ async def start_robot_audio_stream(
         ping_interval=ping_interval,
         ping_timeout=ping_timeout,
         max_playback_payload=max_playback_payload,
+        playback_queue_max=playback_queue_max,
     )
 
     try:

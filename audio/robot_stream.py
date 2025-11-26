@@ -65,6 +65,7 @@ class RobotAudioStream:
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
         max_playback_payload: int = 800,
+        playback_queue_max: int = 200,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
 
@@ -100,9 +101,17 @@ class RobotAudioStream:
         # чуть меньше килобайта по умолчанию, потому что часть байт забирает
         # WebSocket‑фрейм, и реальные ограничения прошивки могут отличаться.
         self._max_playback_payload = max(256, max_playback_payload)
+        # Максимальный размер очереди исходящих кадров на клиента: увеличен по
+        # сравнению с прошлой версией, чтобы помещался целый пакет TTS даже при
+        # мелкой нарезке на субкадры. Используем жёсткое ограничение и
+        # перераспределяем старые кадры, если поток закрывается.
+        self._playback_queue_max = max(10, playback_queue_max)
         # Таймстамп последнего предупреждения об отсутствии подключений, чтобы
         # не засорять логи сотнями одинаковых записей за одно событие TTS.
         self._last_no_client_warning = 0.0
+        # Таймстамп последнего предупреждения о принудительном дропе кадра,
+        # чтобы не засорять логи при bursts.
+        self._last_drop_warning = 0.0
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -192,7 +201,12 @@ class RobotAudioStream:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Очередь исходящих кадров увеличена и задаётся конфигом: это позволяет
+        # безопасно складывать все субкадры TTS даже при жёстком лимите полезной
+        # нагрузки (например, 600–800 байт на кадр для MAX98357A).
+        send_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self._playback_queue_max
+        )
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -454,14 +468,33 @@ class RobotAudioStream:
 
             for queue in list(self._send_queues):
                 if queue.full():
+                    # Когда кадры приходят быстрее, чем робот их подтверждает,
+                    # аккуратно освобождаем место и логируем агрегированно,
+                    # чтобы не спамить предупреждениями на каждый субкадр.
+                    dropped_frames = 0
+                    dropped_bytes = 0
                     try:
-                        dropped = queue.get_nowait()
-                        self.log.warning(
-                            "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={"attrs": {"dropped_size": len(dropped), "purpose": purpose}},
-                        )
-                    except asyncio.QueueEmpty:
+                        while queue.full():
+                            dropped = queue.get_nowait()
+                            dropped_frames += 1
+                            dropped_bytes += len(dropped)
+                    except asyncio.QueueEmpty:  # pragma: no cover - редкий гонк
                         pass
+
+                    now = time.monotonic()
+                    if now - self._last_drop_warning > 0.5:
+                        self._last_drop_warning = now
+                        self.log.warning(
+                            "Очередь отправки переполнена, удаляю старые кадры",
+                            extra={
+                                "attrs": {
+                                    "frames": dropped_frames,
+                                    "bytes": dropped_bytes,
+                                    "purpose": purpose,
+                                    "queue_max": self._playback_queue_max,
+                                }
+                            },
+                        )
                 queue.put_nowait(payload)
 
         self._loop.call_soon_threadsafe(_enqueue)
