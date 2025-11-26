@@ -301,6 +301,42 @@ def test_tts_respects_payload_limit_and_throttles_warning() -> None:
     assert second_ts == first_ts
 
 
+def test_tts_skipped_without_clients(caplog) -> None:
+    """Если робота нет на линии, озвучка не должна бесконечно спамить предупреждения."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:0/robot")
+    stream._loop = asyncio.new_event_loop()
+    caplog.set_level("WARNING")
+
+    pcm = struct.pack("<hhhh", 10, -10, 20, -20)
+
+    stream.send_tts(
+        pcm,
+        16_000,
+        text="нет клиента",  # noqa: PIE798 — читается в логах
+        preset="neutral",
+        chunk_index=1,
+        chunks_total=1,
+        volume=1.0,
+    )
+    first_ts = stream._last_no_client_warning
+
+    stream.send_tts(
+        pcm,
+        16_000,
+        text="повтор нет клиента",  # noqa: PIE798
+        preset="neutral",
+        chunk_index=1,
+        chunks_total=1,
+        volume=1.0,
+    )
+
+    assert first_ts > 0
+    assert first_ts == stream._last_no_client_warning
+    # Дополнительный вызов не должен сдвигать таймстамп предупреждения.
+    stream._loop.close()
+
+
 class _DummyClosedWebSocket:
     """Фиктивный WebSocket, имитирующий разрыв соединения."""
 

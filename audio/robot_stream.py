@@ -64,7 +64,7 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
-        max_playback_payload: int = 1024,
+        max_playback_payload: int = 800,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
 
@@ -96,7 +96,9 @@ class RobotAudioStream:
         # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
         self._playback_sequence = 0
         # Жёсткий лимит полезной нагрузки одного кадра, чтобы не получить ошибку
-        # 1009 (frame too large) от прошивки ESP32 или прокси на пути.
+        # 1009 (frame too large) от прошивки ESP32 или прокси на пути. Значение
+        # чуть меньше килобайта по умолчанию, потому что часть байт забирает
+        # WebSocket‑фрейм, и реальные ограничения прошивки могут отличаться.
         self._max_playback_payload = max(256, max_playback_payload)
         # Таймстамп последнего предупреждения об отсутствии подключений, чтобы
         # не засорять логи сотнями одинаковых записей за одно событие TTS.
@@ -303,9 +305,19 @@ class RobotAudioStream:
             # поэтому возвращаем понятный лог и завершаем цикл без пробрасывания
             # исключения в event loop.
             self.log.warning(
-                "Отправка аудио прекращена: WebSocket закрыт", 
+                "Отправка аудио прекращена: WebSocket закрыт",
                 extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
             )
+            if exc.code == 1009:
+                self.log.warning(
+                    "Робот закрыл канал из-за размера кадра; уменьшите max_playback_payload",
+                    extra={
+                        "attrs": {
+                            "peer": peer,
+                            "suggested": max(256, self._max_playback_payload // 2),
+                        }
+                    },
+                )
         except ConnectionClosedOK as exc:
             # Робот сам закрыл соединение штатно — фиксируем событие для мониторинга.
             self.log.info(
@@ -427,8 +439,11 @@ class RobotAudioStream:
             return
 
         def _enqueue() -> None:
+            # Если на момент отправки нет подключений, логируем предупреждение
+            # не чаще раза в секунду и выходим, чтобы не засорять консоль при
+            # длинных очередях TTS.
             if not self._send_queues:
-                now = time.time()
+                now = time.monotonic()
                 if now - self._last_no_client_warning > 1.0:
                     self._last_no_client_warning = now
                     self.log.warning(
@@ -436,6 +451,7 @@ class RobotAudioStream:
                         purpose,
                     )
                 return
+
             for queue in list(self._send_queues):
                 if queue.full():
                     try:
@@ -467,6 +483,16 @@ class RobotAudioStream:
 
         if self._loop is None:
             self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
+            return
+
+        # Если нет подключённого робота, сразу фиксируем предупреждение и
+        # выходим, чтобы не раздувать логи одинаковыми сообщениями на каждый
+        # субкадр. При появлении клиента последующие вызовы отправят звук.
+        if not self._send_queues:
+            now = time.monotonic()
+            if now - self._last_no_client_warning > 1.0:
+                self._last_no_client_warning = now
+                self.log.warning("Нет активных подключений робота для отправки TTS")
             return
 
         target_frame_samples = frame_samples or self.frame_samples or 512
@@ -562,6 +588,13 @@ class RobotAudioStream:
 
         if self._loop is None:
             self.log.warning("Event loop сервера ещё не готов, эффект не отправлен")
+            return
+
+        if not self._send_queues:
+            now = time.monotonic()
+            if now - self._last_no_client_warning > 1.0:
+                self._last_no_client_warning = now
+                self.log.warning("Нет активных подключений робота для отправки эффекта")
             return
 
         prepared = self._prepare_playback_payload(
