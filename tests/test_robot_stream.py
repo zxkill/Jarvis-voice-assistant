@@ -215,6 +215,72 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert reserved == pytest.approx(0.0)
 
 
+def test_effect_is_split_for_xiaozhi_client() -> None:
+    """Большой эффект режется на подкадры под XiaoZhi, но не обрезается."""
+
+    async def _runner() -> tuple[list[bytes], bytes]:
+        stream = RobotAudioStream(
+            "ws://127.0.0.1:0/robot",
+            queue_max=4,
+            max_playback_payload=512,
+        )
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        collected: list[bytes] = []
+        pcm = bytes([0x10, 0x00]) * 4000  # 8000 байт, точно больше лимита
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            hello = json.dumps(
+                {
+                    "type": "hello",
+                    "version": 3,
+                    "transport": "websocket",
+                    "audio_params": {
+                        "format": "pcm16",
+                        "sample_rate": 16_000,
+                        "channels": 1,
+                        "frame_duration": 60,
+                    },
+                }
+            )
+            await ws.send(hello)
+            # Сервер отвечает взаимным hello — прочитаем и проигнорируем.
+            await ws.recv()
+
+            stream.send_effect(
+                pcm,
+                16_000,
+                name="THINKING",
+                source_file="buzz.wav",
+                repeat_index=1,
+                repeat_total=1,
+                volume=1.0,
+            )
+
+            # Считываем кадры, пока не соберём весь объём PCM или не упадём по тайм‑ауту.
+            assembled_len = 0
+            try:
+                while assembled_len < len(pcm):
+                    frame = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    collected.append(frame)
+                    assembled_len += max(0, len(frame) - 4)  # 4 байта занимает заголовок v3
+            except asyncio.TimeoutError:
+                # Закончили читать кадры.
+                pass
+
+        return collected, pcm
+
+    frames, original_pcm = asyncio.run(_runner())
+    assert len(frames) > 1, "Эффект должен быть нарезан на несколько подкадров"
+    assert all(len(frame) <= 512 for frame in frames)
+
+    # Собираем полезную нагрузку BinaryProtocol3: первые 4 байта — заголовок.
+    assembled = b"".join(frame[4:] for frame in frames)
+    assert assembled.startswith(original_pcm[: len(assembled)])
+
+
 def test_xiaozhi_hello_and_frame_delivery() -> None:
     """Сервер отвечает на hello и разбирает XiaoZhi v3 аудио-кадры."""
 

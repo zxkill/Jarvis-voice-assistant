@@ -842,6 +842,53 @@ class RobotAudioStream:
 
         self._loop.call_soon_threadsafe(_enqueue)
 
+    def _split_pcm_for_caps(
+        self,
+        pcm: bytes,
+        *,
+        channels: int,
+        caps: PlaybackClientCaps,
+        frame_samples_hint: int | None = None,
+    ) -> list[bytes]:
+        """Разбивает PCM на части, подходящие под ограничения клиента.
+
+        В XiaoZhi клиент ожидает длительность кадра, совпадающую с ``frame_duration``
+        из hello. Для AF-режима опираемся на ``frame_samples_hint``/``self.frame_samples``.
+        После расчёта желаемой длины дополнительно сжимаем её до лимита WebSocket
+        (``_max_playback_payload``), чтобы не ловить 1009, и выравниваем по размеру
+        сэмпла конкретного числа каналов. Так мы гарантируем, что каждый кадр
+        корректно декодируется на стороне ESP32 и не трещит из-за усечённых
+        сэмплов.
+        """
+
+        # Размер заголовка зависит от протокола: XiaoZhi (4 байта) или AF (36 байт).
+        header_size = 4 if caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size
+        # Максимальный объём полезных данных в одном WebSocket-фрейме.
+        max_pcm_bytes = max(2 * channels, self._max_playback_payload - header_size)
+
+        # Желаемая длительность кадра: для XiaoZhi используем frame_duration_ms
+        # из hello, для AF — hint либо текущее значение frame_samples.
+        if caps.mode == "xiaozhi":
+            samples_per_frame = int(
+                (caps.sample_rate * caps.frame_duration_ms) / 1000
+            ) or frame_samples_hint or self.frame_samples or 512
+        else:
+            samples_per_frame = frame_samples_hint or self.frame_samples or 512
+
+        bytes_per_sample = 2 * channels
+        desired_bytes = max(bytes_per_sample, samples_per_frame * bytes_per_sample)
+        # Упираемся в лимит полезной нагрузки и выравниваем по размеру сэмпла.
+        frame_bytes = min(desired_bytes, max_pcm_bytes)
+        frame_bytes -= frame_bytes % bytes_per_sample
+        if frame_bytes <= 0:
+            frame_bytes = bytes_per_sample
+
+        return [
+            pcm[i : i + frame_bytes]
+            for i in range(0, len(pcm), frame_bytes)
+            if pcm[i : i + frame_bytes]
+        ]
+
     def send_tts(
         self,
         pcm: bytes,
@@ -889,42 +936,30 @@ class RobotAudioStream:
         if target_frame_samples <= 0:
             target_frame_samples = 512
 
-        # Разбиваем большой PCM на управляемые части, чтобы не переполнить
-        # буфер на ESP32 и иметь стабильную задержку при воспроизведении.
-        frame_bytes = target_frame_samples * channels * 2
-
-        # Дополнительно удерживаем каждый кадр ниже лимита WebSocket (код 1009).
-        max_pcm_bytes = max(
-            2 * channels,
-            self._max_playback_payload - _PLAYBACK_HEADER_STRUCT.size,
-        )
-        frame_bytes = min(frame_bytes, max_pcm_bytes - (max_pcm_bytes % (2 * channels)))
-        if frame_bytes <= 0:
-            frame_bytes = 2 * channels
-
-        frames = [
-            pcm[i : i + frame_bytes]
-            for i in range(0, len(pcm), frame_bytes)
-            if pcm[i : i + frame_bytes]
-        ]
-
         example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
+        frames = self._split_pcm_for_caps(
+            pcm,
+            channels=channels,
+            caps=example_caps,
+            frame_samples_hint=target_frame_samples,
+        )
 
+        wire_header = 4 if example_caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size
+        example_frame = len(frames[0]) if frames else 0
         self.log.info(
             "Подготовка TTS к отправке",
             extra={
                 "attrs": {
                     "frames": len(frames),
                     "target_frame_samples": target_frame_samples,
-                    "frame_bytes": frame_bytes,
-                    "header_bytes": _PLAYBACK_HEADER_STRUCT.size,
+                    "frame_bytes": example_frame,
+                    "header_bytes": wire_header,
                     "max_payload_bytes": self._max_playback_payload,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
                     "pcm_bytes_total": len(pcm),
                     "volume": round(volume, 3),
-                    "expected_wire_bytes": frame_bytes
-                    + (4 if example_caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size),
+                    "expected_wire_bytes": example_frame + wire_header,
                 }
             },
         )
@@ -1004,44 +1039,72 @@ class RobotAudioStream:
             return
 
         example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
-        prepared = self._prepare_playback_payload(
+        frames = self._split_pcm_for_caps(
             pcm,
-            sample_rate,
             channels=channels,
-            volume=volume,
             caps=example_caps,
+            frame_samples_hint=None,
         )
-        if prepared is None:
-            return
-        payload, stats = prepared
 
-        purpose = f"эффекта {name}"
-
-        def _builder(caps: PlaybackClientCaps) -> bytes | None:
-            prepared_caps = self._prepare_playback_payload(
-                pcm,
-                sample_rate,
-                channels=channels,
-                volume=volume,
-                caps=caps,
-            )
-            return prepared_caps[0] if prepared_caps else None
-
-        self._broadcast_payload(_builder, purpose=purpose)
-
-        self.log.debug(
-            "Сформирован аудиокадр фонового эффекта",
+        wire_header = 4 if example_caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size
+        self.log.info(
+            "Подготовка эффекта к отправке",
             extra={
                 "attrs": {
+                    "frames": len(frames),
+                    "frame_bytes": len(frames[0]) if frames else 0,
+                    "header_bytes": wire_header,
+                    "max_payload_bytes": self._max_playback_payload,
+                    "pcm_bytes_total": len(pcm),
                     "effect": name,
                     "file": source_file,
-                    "repeat_index": repeat_index,
-                    "repeat_total": repeat_total,
-                    "volume": round(volume, 3),
-                    **stats,
                 }
             },
         )
+
+        for idx, frame in enumerate(frames, start=1):
+            prepared = self._prepare_playback_payload(
+                frame,
+                sample_rate,
+                channels=channels,
+                volume=volume,
+                caps=example_caps,
+            )
+            if prepared is None:
+                self.log.warning(
+                    "Эффектовый кадр пропущен из-за ошибки подготовки",
+                    extra={"attrs": {"effect": name, "sub_frame": idx, "frames_total": len(frames)}},
+                )
+                continue
+            payload, stats = prepared
+
+            def _builder(caps: PlaybackClientCaps) -> bytes | None:
+                prepared_caps = self._prepare_playback_payload(
+                    frame,
+                    sample_rate,
+                    channels=channels,
+                    volume=volume,
+                    caps=caps,
+                )
+                return prepared_caps[0] if prepared_caps else None
+
+            self._broadcast_payload(_builder, purpose=f"эффекта {name}")
+
+            self.log.debug(
+                "Сформирован аудиокадр фонового эффекта",
+                extra={
+                    "attrs": {
+                        "effect": name,
+                        "file": source_file,
+                        "repeat_index": repeat_index,
+                        "repeat_total": repeat_total,
+                        "volume": round(volume, 3),
+                        "sub_frame": idx,
+                        "frames_total": len(frames),
+                        **stats,
+                    }
+                },
+            )
 
     def forward_tts_chunk(
         self,
