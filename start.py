@@ -188,9 +188,9 @@ async def start_robot_audio_stream(
     robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
     ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
     ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
-    # По умолчанию используем консервативный лимит 512 байт, чтобы WebSocket на
-    # ESP32 не рвал соединение кодом 1009 при воспроизведении.
-    max_playback_payload = cfg.getint("ROBOT_AUDIO", "max_playback_payload", fallback=512)
+    # По умолчанию используем лимит 2048 байт: этого хватает на 60 мс PCM16/16 кГц
+    # для XiaoZhi, и кадры не обрезаются, устраняя треск на MAX98357A.
+    max_playback_payload = cfg.getint("ROBOT_AUDIO", "max_playback_payload", fallback=2048)
     playback_queue_max = cfg.getint("ROBOT_AUDIO", "playback_queue_max", fallback=200)
 
     audio_stream = RobotAudioStream(

@@ -125,7 +125,7 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
-        max_playback_payload: int = 512,
+        max_playback_payload: int = 2048,
         playback_queue_max: int = 200,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
@@ -164,9 +164,10 @@ class RobotAudioStream:
         # чуть меньше килобайта по умолчанию, потому что часть байт забирает
         # WebSocket‑фрейм, и реальные ограничения прошивки могут отличаться.
         # Ограничиваем размер полезной нагрузки исходящего кадра. Значение
-        # подобрано консервативно (512 байт), чтобы не вызывать ошибку 1009 на
-        # прошивке ESP32 и иметь запас под заголовки WebSocket.
-        self._max_playback_payload = max(256, max_playback_payload)
+        # подобрано под 60 мс PCM16/16 кГц (около 1920 байт) с запасом на
+        # заголовок, чтобы кадры XiaoZhi не резались и не давали треск. Всё,
+        # что меньше 512, повышаем до безопасного минимума.
+        self._max_playback_payload = max(512, max_playback_payload)
         # Максимальный размер очереди исходящих кадров на клиента: увеличен по
         # сравнению с прошлой версией, чтобы помещался целый пакет TTS даже при
         # мелкой нарезке на субкадры. Используем жёсткое ограничение и
@@ -695,29 +696,26 @@ class RobotAudioStream:
             (per_channel / sample_rate) * 1000.0 if sample_rate > 0 and per_channel else 0.0
         )
 
-        # Жёстко ограничиваем полезную нагрузку под текущий лимит WebSocket,
-        # чтобы не провоцировать ошибку 1009 на прошивке ESP32. Обрезаем PCM по
-        # границе сэмпла и логируем ситуацию для дальнейшей диагностики.
+        # Проверяем, что данные уже вписываются в лимит. На практике сюда должны
+        # попадать кадры после нарезки `_split_pcm_for_caps`, поэтому превышение
+        # означает ошибку конфигурации, а не штатную ситуацию: в таком случае
+        # логируем и прекращаем отправку, чтобы не вносить дополнительные искажения.
         header_size = 4 if caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size
         max_pcm_bytes = max(0, self._max_playback_payload - header_size)
-        if len(pcm) > max_pcm_bytes:
-            trimmed = pcm[: max_pcm_bytes - (max_pcm_bytes % (2 * channels or 1))]
-            self.log.warning(
-                "PCM превышает лимит, обрезаю перед отправкой",
+        if len(pcm) > max_pcm_bytes and max_pcm_bytes > 0:
+            self.log.error(
+                "PCM превышает лимит полезной нагрузки — кадр отклонён",
                 extra={
                     "attrs": {
                         "peer": getattr(caps, "mode", "af"),
                         "pcm_bytes": len(pcm),
-                        "trimmed_to": len(trimmed),
                         "max_payload": self._max_playback_payload,
+                        "header_bytes": header_size,
+                        "channels": channels,
                     }
                 },
             )
-            pcm = trimmed
-            samples = array("h")
-            samples.frombytes(pcm)
-            total_samples = len(samples)
-            per_channel = total_samples // channels if channels else 0
+            return None
 
         squares_sum = sum(val * val for val in samples)
         rms_mono = (
@@ -878,6 +876,19 @@ class RobotAudioStream:
         bytes_per_sample = 2 * channels
         desired_bytes = max(bytes_per_sample, samples_per_frame * bytes_per_sample)
         # Упираемся в лимит полезной нагрузки и выравниваем по размеру сэмпла.
+        if desired_bytes > max_pcm_bytes:
+            self.log.debug(
+                "Нарезаю кадр XiaoZhi под лимит WebSocket",
+                extra={
+                    "attrs": {
+                        "desired_bytes": desired_bytes,
+                        "max_pcm_bytes": max_pcm_bytes,
+                        "channels": channels,
+                        "frame_duration_ms": caps.frame_duration_ms,
+                        "sample_rate": caps.sample_rate,
+                    }
+                },
+            )
         frame_bytes = min(desired_bytes, max_pcm_bytes)
         frame_bytes -= frame_bytes % bytes_per_sample
         if frame_bytes <= 0:

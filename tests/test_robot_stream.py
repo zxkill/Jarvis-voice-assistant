@@ -483,23 +483,24 @@ def test_tts_skipped_without_clients(caplog) -> None:
     stream._loop.close()
 
 
-def test_default_playback_payload_is_conservative() -> None:
-    """Дефолтный лимит 512 байт укладывается в безопасный порог для ESP32."""
+def test_default_playback_payload_matches_xiaozhi_frame() -> None:
+    """Дефолтный лимит покрывает 60 мс PCM16/16кГц без обрезки и треска."""
 
     stream = RobotAudioStream("ws://127.0.0.1:0/robot")
-    # 512 — консервативный размер: позволяет передавать ~238 сэмплов моно PCM
-    # с учётом 36-байтового заголовка AP и остаётся ниже типичных лимитов
-    # WebSocket в прошивке ESP32, предотвращая код 1009.
-    assert stream._max_playback_payload == 512
-    pcm = struct.pack("<" + "h" * 300, *range(300))
-    caps = PlaybackClientCaps()
-    payload = stream._prepare_playback_payload(pcm, 16_000, channels=1, volume=1.0, caps=caps)
+    # 2048 байт позволяют передать 60 мс моно PCM16 (1920 байт) + заголовок XiaoZhi.
+    assert stream._max_playback_payload == 2048
+    # Генерируем ровно 60 мс PCM16 моно: 16_000 * 0.06 = 960 сэмплов.
+    pcm = struct.pack("<" + "h" * 960, *range(960))
+    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=16_000, channels=1, frame_duration_ms=60)
+    frames = stream._split_pcm_for_caps(pcm, channels=1, caps=caps)
+    assert frames, "Должен получиться хотя бы один кадр"
+    assert len(frames) == 1, "60 мс помещаются в один XiaoZhi-фрейм"
+    payload = stream._prepare_playback_payload(frames[0], 16_000, channels=1, volume=1.0, caps=caps)
     assert payload is not None
     packet, meta = payload
-    # Проверяем, что итоговый пакет строго меньше лимита (512 байт).
+    # Итоговая нагрузка укладывается в лимит и сохраняет исходный объём PCM.
     assert len(packet) <= stream._max_playback_payload
-    # Сами PCM-данные тоже укладываются в границы, учитывая заголовок AP.
-    assert meta["pcm_bytes"] + _PLAYBACK_HEADER.size <= stream._max_playback_payload
+    assert meta["pcm_bytes"] == len(frames[0])
 
 
 def test_broadcast_uses_configured_playback_queue(caplog) -> None:
