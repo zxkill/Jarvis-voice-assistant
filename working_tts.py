@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array as _array
+import audioop
 import inspect
 import os
 import re
@@ -57,6 +58,46 @@ def register_stream_listener(listener: Callable[..., None]) -> None:
         if listener not in _STREAM_LISTENERS:
             _STREAM_LISTENERS.append(listener)
     log.info("Добавлен слушатель потоковой озвучки: %s", listener)
+
+
+def _resample_for_stream(pcm: bytes, from_rate: int, to_rate: int) -> tuple[bytes, int]:
+    """Приводит PCM16 LE к нужной частоте перед отправкой роботу.
+
+    Используем ``audioop.ratecv`` из стандартной библиотеки — он лёгкий, не требует
+    внешних зависимостей и даёт достаточно качественный результат для речи. Если
+    ресемплинг невозможен, возвращаем исходные данные, чтобы не рвать поток.
+    """
+
+    if to_rate <= 0 or from_rate <= 0 or not pcm:
+        log.warning(
+            "Пропускаю ресемплинг: некорректные параметры",
+            extra={"attrs": {"from_rate": from_rate, "to_rate": to_rate, "pcm_bytes": len(pcm)}},
+        )
+        return pcm, from_rate
+
+    if from_rate == to_rate:
+        return pcm, from_rate
+
+    try:
+        resampled, _state = audioop.ratecv(pcm, 2, 1, from_rate, to_rate, None)
+        log.debug(
+            "PCM приведён к частоте робота",
+            extra={
+                "attrs": {
+                    "from_rate": from_rate,
+                    "to_rate": to_rate,
+                    "bytes_before": len(pcm),
+                    "bytes_after": len(resampled),
+                }
+            },
+        )
+        return resampled, to_rate
+    except Exception:
+        log.exception(
+            "Ошибка ресемплинга PCM перед отправкой роботу",
+            extra={"attrs": {"from_rate": from_rate, "to_rate": to_rate, "pcm_bytes": len(pcm)}},
+        )
+        return pcm, from_rate
 
 
 def unregister_stream_listener(listener: Callable[..., None]) -> None:
@@ -138,6 +179,9 @@ VOICE_ID: str = "ru_RU-ruslan-medium"  # "ru-RU-irina-medium"  # default voice I
 SEARCH_DIRS: List[str] = ["./models/piper"]
 # Максимальный размер чанка текста для озвучивания
 MAX_CHARS: int = 180
+# Частота, в которую приводим поток для робота (XiaoZhi/ESP32 ожидает 16 кГц моно)
+# Чтобы избежать треска из-за несовпадения форматов, TTS всегда отдаём в 16 кГц.
+STREAM_SAMPLE_RATE: int = 16_000
 # Пауза в секундах, добавляемая в конец каждого чанка, чтобы не обрезать фразу
 TAIL_PAD_SEC: float = 0.3
 # Преднастроенные "эмоции"/тона (громкость, скорость, пауза)
@@ -435,9 +479,14 @@ def working_tts(
 
         playback_rate = max(1, int(SAMPLE_RATE * speed))
         pcm_bytes = np.clip(audio_f32 * 32767.0, -32768, 32767).astype(np.int16)
+
+        # Перед отправкой роботу приводим звук к 16 кГц моно, чтобы совпадать с hello XiaoZhi.
+        stream_pcm, stream_rate = _resample_for_stream(
+            pcm_bytes.tobytes(), playback_rate, STREAM_SAMPLE_RATE
+        )
         _notify_stream_listeners(
-            pcm_bytes.tobytes(),
-            playback_rate,
+            stream_pcm,
+            stream_rate,
             text=chunk,
             preset=emotion or preset,
             chunk_index=i,
