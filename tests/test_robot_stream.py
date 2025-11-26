@@ -8,6 +8,8 @@ import struct
 
 import pytest
 import websockets
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from audio.robot_stream import RobotAudioStream, RobotStreamClosed, downmix_to_mono
 
@@ -194,3 +196,25 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert pcm_bytes == pcm_len
     assert volume == pytest.approx(0.75)
     assert reserved == pytest.approx(0.0)
+
+
+class _DummyClosedWebSocket:
+    """Фиктивный WebSocket, имитирующий разрыв соединения."""
+
+    async def send(self, payload: bytes) -> None:  # pragma: no cover - поведение задаётся тестом
+        # Возвращаем Close-кадр, как если бы его прислал робот, чтобы код ошибки был доступен.
+        raise ConnectionClosedError(Close(1006, "connection reset"), None)
+
+
+def test_send_loop_survives_connection_reset() -> None:
+    """При разрыве соединения цикл отправки должен завершаться без исключений."""
+
+    async def _runner() -> None:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot")
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        queue.put_nowait(b"pcm")
+
+        # Убеждаемся, что ConnectionClosedError обрабатывается и не утекает наружу.
+        await stream._send_loop(_DummyClosedWebSocket(), queue, peer="test-peer")
+
+    asyncio.run(_runner())

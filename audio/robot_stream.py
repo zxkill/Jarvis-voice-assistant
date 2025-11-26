@@ -284,16 +284,36 @@ class RobotAudioStream:
                         "attrs": {
                             "peer": peer,
                             "size": len(payload),
-                            "sequence": seq,
-                            "pcm_bytes": pcm_bytes,
-                        }
-                    },
-                )
+                        "sequence": seq,
+                        "pcm_bytes": pcm_bytes,
+                    }
+                },
+            )
         except asyncio.CancelledError:
             self.log.debug("Цикл отправки TTS остановлен", extra={"attrs": {"peer": peer}})
+        except ConnectionClosedError as exc:
+            # Соединение могло быть закрыто роботом при перезагрузке или потере Wi‑Fi,
+            # поэтому возвращаем понятный лог и завершаем цикл без пробрасывания
+            # исключения в event loop.
+            self.log.warning(
+                "Отправка аудио прекращена: WebSocket закрыт", 
+                extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
+            )
+        except ConnectionClosedOK as exc:
+            # Робот сам закрыл соединение штатно — фиксируем событие для мониторинга.
+            self.log.info(
+                "Робот штатно закрыл аудиоканал", 
+                extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
+            )
         except Exception:
             self.log.exception(
                 "Ошибка отправки аудио роботу", extra={"attrs": {"peer": peer}}
+            )
+        finally:
+            # Дополнительно сигнализируем о завершении цикла, чтобы понимать
+            # причину остановки в длинных логах.
+            self.log.debug(
+                "Цикл отправки TTS завершён", extra={"attrs": {"peer": peer}}
             )
 
     def _next_playback_sequence(self) -> int:
