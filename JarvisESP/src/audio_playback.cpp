@@ -94,6 +94,13 @@ void record_mute_state(bool muted, bool countTransition) {
 
 #ifdef ARDUINO
 
+/**
+ * \brief Проверяет, активирован ли режим встроенного ЦАП, чтобы отличить его от внешнего усилителя MAX98357A.
+ */
+bool is_dac_mode() {
+  return gConfig.mode == OutputMode::InternalDac;
+}
+
 void configure_idle_timing_from_config() {
   if (gConfig.idleMuteDelayMs == 0) {
     // Пользователь отключил автоматический mute: оставляем лишь периодический опрос очереди,
@@ -110,6 +117,56 @@ void configure_idle_timing_from_config() {
   gIdleTimeoutTicks = pdMS_TO_TICKS(clamped);
   gQueuePollTicks = gIdleTimeoutTicks;
   Serial.printf("[PLAYBACK] mute по таймауту активен: %u мс ожидания\n", static_cast<unsigned>(clamped));
+}
+
+/**
+ * \brief Настраивает вывод аудио в зависимости от выбранного режима.
+ *
+ * Для MAX98357A проверяем заполненность пинов и явно отключаем встроенный ЦАП,
+ * чтобы исключить фоновые наводки на GPIO25/26. Для DAC-режима дополнительно
+ * включаем только левый канал, так как LM386 ожидает моно-сигнал.
+ */
+bool configure_i2s_pins_for_mode() {
+  if (is_dac_mode()) {
+    i2s_set_pin(I2S_PORT, nullptr);
+    i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN);
+    dac_output_enable(DAC_CHANNEL_1);
+    dac_output_disable(DAC_CHANNEL_2);
+    Serial.println(F("[PLAYBACK] выбран режим встроенного ЦАП (DAC1 на GPIO25)"));
+    return true;
+  }
+
+  if (gConfig.pinBclk < 0 || gConfig.pinLrc < 0 || gConfig.pinDin < 0) {
+    Serial.println(F("[PLAYBACK] ошибка конфигурации: пины BCLK/LRC/DIN должны быть заданы для MAX98357A"));
+    lock_stats();
+    gStats.lastError = "bad-pins";
+    unlock_stats();
+    return false;
+  }
+
+  i2s_pin_config_t pinConfig = {};
+  pinConfig.mck_io_num = I2S_PIN_NO_CHANGE;
+  pinConfig.bck_io_num = gConfig.pinBclk;
+  pinConfig.ws_io_num = gConfig.pinLrc;
+  pinConfig.data_out_num = gConfig.pinDin;
+  pinConfig.data_in_num = I2S_PIN_NO_CHANGE;
+
+  const esp_err_t pinRc = i2s_set_pin(I2S_PORT, &pinConfig);
+  if (pinRc != ESP_OK) {
+    Serial.printf("[PLAYBACK] ошибка назначения пинов для MAX98357A: rc=%d\n", pinRc);
+    lock_stats();
+    gStats.lastError = "pin-config";
+    unlock_stats();
+    return false;
+  }
+
+  dac_output_disable(DAC_CHANNEL_1);
+  dac_output_disable(DAC_CHANNEL_2);
+  Serial.printf("[PLAYBACK] выбран режим MAX98357A: BCLK=%d, LRC=%d, DIN=%d\n",
+                gConfig.pinBclk,
+                gConfig.pinLrc,
+                gConfig.pinDin);
+  return true;
 }
 
 bool prime_dma_with_silence(const char* context) {
@@ -133,7 +190,7 @@ bool prime_dma_with_silence(const char* context) {
     return false;
   }
 
-  Serial.printf("[PLAYBACK] буфер ЦАП заполнен тишиной (%s): %u сэмплов\n",
+  Serial.printf("[PLAYBACK] буфер I2S заполнен тишиной (%s): %u сэмплов\n",
                 context ? context : "no-context",
                 static_cast<unsigned>(samples));
   lock_stats();
@@ -153,7 +210,9 @@ bool mute_output(const char* reason, bool countTransition) {
   if (stopRc != ESP_OK) {
     Serial.printf("[PLAYBACK] предупреждение: i2s_stop вернул %d\n", stopRc);
   }
-  dac_output_disable(DAC_CHANNEL_1);
+  if (is_dac_mode()) {
+    dac_output_disable(DAC_CHANNEL_1);
+  }
   gOutputMuted = true;
   record_mute_state(true, countTransition);
   return true;
@@ -176,7 +235,9 @@ bool unmute_output(const char* reason) {
     unlock_stats();
     return false;
   }
-  dac_output_enable(DAC_CHANNEL_1);
+  if (is_dac_mode()) {
+    dac_output_enable(DAC_CHANNEL_1);
+  }
   i2s_zero_dma_buffer(I2S_PORT);
   if (!prime_dma_with_silence("пробуждение")) {
     Serial.println(F("[PLAYBACK] ошибка: не удалось подать тишину при выходе из mute"));
@@ -466,10 +527,14 @@ bool init(const Config& cfg) {
 
 #ifdef ARDUINO
   i2s_config_t i2sConfig = {};
-  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
+  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX);
+  if (is_dac_mode()) {
+    // В режиме встроенного ЦАП добавляем соответствующий флаг, чтобы ESP-IDF подключил DAC1.
+    i2sConfig.mode = static_cast<i2s_mode_t>(i2sConfig.mode | I2S_MODE_DAC_BUILT_IN);
+  }
   i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 16000 : cfg.defaultSampleRate;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT; // Используем только левый моно-канал DAC1 (GPIO25).
+  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT; // Привязываем поток к одному каналу (MAX98357A тоже принимает моно).
   i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   i2sConfig.dma_buf_count = 6;
@@ -489,10 +554,11 @@ bool init(const Config& cfg) {
 
   gDriverInstalled = true; // Запоминаем успешный старт, чтобы грамотно гасить порт в shutdown().
 
-  i2s_set_pin(I2S_PORT, nullptr);
-  // Включаем только DAC1 (GPIO25): LM386 работает с моно сигналом, поэтому второй канал не задействуем.
-  i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN);
-  dac_output_enable(DAC_CHANNEL_1);
+  if (!configure_i2s_pins_for_mode()) {
+    i2s_driver_uninstall(I2S_PORT);
+    gDriverInstalled = false;
+    return false;
+  }
 
   const esp_err_t startRc = i2s_start(I2S_PORT);
   if (startRc != ESP_OK) {
@@ -503,7 +569,9 @@ bool init(const Config& cfg) {
     unlock_stats();
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
-    dac_output_disable(DAC_CHANNEL_1);
+    if (is_dac_mode()) {
+      dac_output_disable(DAC_CHANNEL_1);
+    }
     return false;
   }
 
@@ -518,10 +586,17 @@ bool init(const Config& cfg) {
     return false;
   }
 
-  Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=DAC1\n",
-                static_cast<int>(I2S_PORT),
-                static_cast<unsigned>(i2sConfig.sample_rate),
-                static_cast<unsigned>(cfg.queueCapacity));
+  if (is_dac_mode()) {
+    Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=DAC1\n",
+                  static_cast<int>(I2S_PORT),
+                  static_cast<unsigned>(i2sConfig.sample_rate),
+                  static_cast<unsigned>(cfg.queueCapacity));
+  } else {
+    Serial.printf("[PLAYBACK] I2S MAX98357A запущен: порт=%d, %u Гц, очередь=%u, вывод в моно\n",
+                  static_cast<int>(I2S_PORT),
+                  static_cast<unsigned>(i2sConfig.sample_rate),
+                  static_cast<unsigned>(cfg.queueCapacity));
+  }
 #else
   (void)ensure_queue_created;
 #endif
@@ -567,14 +642,16 @@ void shutdown() {
     gQueue = nullptr;
   }
   if (gDriverInstalled) {
-    Serial.printf("[PLAYBACK] останавливаем I2S-ЦАП: порт=%d\n", static_cast<int>(I2S_PORT));
+    Serial.printf("[PLAYBACK] останавливаем I2S тракт вывода: порт=%d\n", static_cast<int>(I2S_PORT));
     i2s_stop(I2S_PORT);
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
   }
-  dac_output_disable(DAC_CHANNEL_1);
-  // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
-  dac_output_disable(DAC_CHANNEL_2);
+  if (is_dac_mode()) {
+    dac_output_disable(DAC_CHANNEL_1);
+    // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
+    dac_output_disable(DAC_CHANNEL_2);
+  }
 #endif
   gOutputMuted = true;
   record_mute_state(true, false);

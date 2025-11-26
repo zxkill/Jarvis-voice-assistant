@@ -230,13 +230,16 @@ void setup() {
   }
 
   AudioPlayback::Config playbackCfg{};
-  playbackCfg.mode = AudioPlayback::OutputMode::InternalDac; // Используем встроенный моно ЦАП на GPIO25 (I2S0).
+  playbackCfg.mode = AudioPlayback::OutputMode::Max98357aI2S; // Переключаем вывод речи на внешний I2S-усилитель MAX98357A.
   playbackCfg.defaultSampleRate = audioCfg.sampleRate;
   playbackCfg.frameSamplesHint = audioCfg.frameSamples;
   playbackCfg.queueCapacity = 6;
   playbackCfg.defaultVolume = 1.0f;
+  playbackCfg.pinBclk = 26; // BCLK модуля MAX98357A.
+  playbackCfg.pinLrc = 27;  // LRC/WS модуля MAX98357A.
+  playbackCfg.pinDin = 25;  // DIN/SD модуля MAX98357A.
   if (AudioPlayback::init(playbackCfg)) {
-    Serial.println("[PLAYBACK] ЦАП готов воспроизводить команды сервера через LM386");
+    Serial.println("[PLAYBACK] MAX98357A готов принимать голосовой ответ Jarvis по WebSocket");
   } else {
     Serial.println("[PLAYBACK] ошибка: не удалось запустить тракт воспроизведения");
   }
