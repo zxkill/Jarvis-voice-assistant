@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import math
+import logging
 import struct
 import time
 from array import array
@@ -183,6 +184,10 @@ class RobotAudioStream:
         # без явного sequence: помогает проставлять понятные номера в ack и
         # логах сервера.
         self._rx_sequence = 0
+        # Отдельный логгер для детализированной отладки ресемплинга, чтобы не
+        # смешивать сообщения с основным потоком логов и при необходимости
+        # повысить уровень именно для преобразований формата.
+        self._resample_log = logging.getLogger("audio.robot_stream.resample")
 
     async def start(self) -> None:
         """Запускает WebSocket-сервер и ожидает подключений робота."""
@@ -948,9 +953,18 @@ class RobotAudioStream:
             target_frame_samples = 512
 
         example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
-        frames = self._split_pcm_for_caps(
+
+        normalized_pcm, normalized_rate, normalized_channels = _normalize_audio_for_caps(
             pcm,
-            channels=channels,
+            sample_rate,
+            channels,
+            example_caps,
+            resample_log=self._resample_log,
+        )
+
+        frames = self._split_pcm_for_caps(
+            normalized_pcm,
+            channels=normalized_channels,
             caps=example_caps,
             frame_samples_hint=target_frame_samples,
         )
@@ -968,9 +982,11 @@ class RobotAudioStream:
                     "max_payload_bytes": self._max_playback_payload,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
-                    "pcm_bytes_total": len(pcm),
+                    "pcm_bytes_total": len(normalized_pcm),
                     "volume": round(volume, 3),
                     "expected_wire_bytes": example_frame + wire_header,
+                    "source_sample_rate": sample_rate,
+                    "normalized_sample_rate": normalized_rate,
                 }
             },
         )
@@ -978,8 +994,8 @@ class RobotAudioStream:
         for sub_idx, frame in enumerate(frames, start=1):
             prepared = self._prepare_playback_payload(
                 frame,
-                sample_rate,
-                channels=channels,
+                normalized_rate,
+                channels=normalized_channels,
                 volume=volume,
                 caps=example_caps,
             )
@@ -998,10 +1014,18 @@ class RobotAudioStream:
             payload, stats = prepared
 
             def _builder(caps: PlaybackClientCaps) -> bytes | None:
-                prepared_caps = self._prepare_playback_payload(
+                per_cap_pcm, per_cap_rate, per_cap_channels = _normalize_audio_for_caps(
                     frame,
-                    sample_rate,
-                    channels=channels,
+                    normalized_rate,
+                    normalized_channels,
+                    caps,
+                    resample_log=self._resample_log,
+                )
+
+                prepared_caps = self._prepare_playback_payload(
+                    per_cap_pcm,
+                    per_cap_rate,
+                    channels=per_cap_channels,
                     volume=volume,
                     caps=caps,
                 )
@@ -1050,9 +1074,17 @@ class RobotAudioStream:
             return
 
         example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
-        frames = self._split_pcm_for_caps(
+        normalized_pcm, normalized_rate, normalized_channels = _normalize_audio_for_caps(
             pcm,
-            channels=channels,
+            sample_rate,
+            channels,
+            example_caps,
+            resample_log=self._resample_log,
+        )
+
+        frames = self._split_pcm_for_caps(
+            normalized_pcm,
+            channels=normalized_channels,
             caps=example_caps,
             frame_samples_hint=None,
         )
@@ -1066,9 +1098,11 @@ class RobotAudioStream:
                     "frame_bytes": len(frames[0]) if frames else 0,
                     "header_bytes": wire_header,
                     "max_payload_bytes": self._max_playback_payload,
-                    "pcm_bytes_total": len(pcm),
+                    "pcm_bytes_total": len(normalized_pcm),
                     "effect": name,
                     "file": source_file,
+                    "source_sample_rate": sample_rate,
+                    "normalized_sample_rate": normalized_rate,
                 }
             },
         )
@@ -1076,8 +1110,8 @@ class RobotAudioStream:
         for idx, frame in enumerate(frames, start=1):
             prepared = self._prepare_playback_payload(
                 frame,
-                sample_rate,
-                channels=channels,
+                normalized_rate,
+                channels=normalized_channels,
                 volume=volume,
                 caps=example_caps,
             )
@@ -1090,10 +1124,18 @@ class RobotAudioStream:
             payload, stats = prepared
 
             def _builder(caps: PlaybackClientCaps) -> bytes | None:
-                prepared_caps = self._prepare_playback_payload(
+                per_cap_pcm, per_cap_rate, per_cap_channels = _normalize_audio_for_caps(
                     frame,
-                    sample_rate,
-                    channels=channels,
+                    normalized_rate,
+                    normalized_channels,
+                    caps,
+                    resample_log=self._resample_log,
+                )
+
+                prepared_caps = self._prepare_playback_payload(
+                    per_cap_pcm,
+                    per_cap_rate,
+                    channels=per_cap_channels,
                     volume=volume,
                     caps=caps,
                 )
@@ -1326,3 +1368,128 @@ def _build_xiaozhi_audio_frame(
     frame[3] = size & 0xFF
     frame[4:] = payload
     return bytes(frame)
+
+
+def _resample_pcm(
+    pcm: bytes, from_rate: int, to_rate: int, channels: int, *, log: logging.Logger
+) -> bytes:
+    """Выполняет линейный ресемплинг PCM16 LE между частотами.
+
+    Нужен, чтобы TTS/эффекты из движка (например, 22.05 кГц) приходили роботу
+    в точной частоте из hello XiaoZhi и не трещали из-за неверной интерпретации
+    длительности кадра. Используем простой линейный интерполяционный алгоритм,
+    чтобы не тянуть тяжёлые зависимости и сохранить работоспособность на ESP.
+    """
+
+    if from_rate <= 0 or to_rate <= 0:
+        log.error(
+            "Некорректные частоты ресемплинга",  # noqa: TRY400 — логируем и возвращаем исходник
+            extra={"attrs": {"from_rate": from_rate, "to_rate": to_rate}},
+        )
+        return pcm
+
+    if from_rate == to_rate or not pcm:
+        return pcm
+
+    if len(pcm) % (2 * max(1, channels)) != 0:
+        log.error(
+            "PCM не выровнен по каналам перед ресемплингом",
+            extra={
+                "attrs": {
+                    "pcm_bytes": len(pcm),
+                    "channels": channels,
+                    "from_rate": from_rate,
+                    "to_rate": to_rate,
+                }
+            },
+        )
+        return pcm
+
+    samples = array("h")
+    samples.frombytes(pcm)
+    frame_count = len(samples) // max(1, channels)
+    if frame_count == 0:
+        return b""
+
+    # Количество кадров после преобразования: масштабируем по отношению частот.
+    target_frames = max(1, int(round(frame_count * (to_rate / from_rate))))
+    ratio = from_rate / to_rate
+
+    resampled = array("h")
+    resampled.extend((0,) * (target_frames * max(1, channels)))
+
+    for i in range(target_frames):
+        src_pos = i * ratio
+        left_index = int(src_pos)
+        frac = src_pos - left_index
+        right_index = min(left_index + 1, frame_count - 1)
+        for ch in range(max(1, channels)):
+            left_sample = samples[left_index * channels + ch]
+            right_sample = samples[right_index * channels + ch]
+            # Линейная интерполяция между соседними сэмплами.
+            interpolated = int(round(left_sample + (right_sample - left_sample) * frac))
+            resampled[i * channels + ch] = interpolated
+
+    log.debug(
+        "PCM отресемплирован",  # noqa: TRY400 — диагностируем качество звука
+        extra={
+            "attrs": {
+                "from_rate": from_rate,
+                "to_rate": to_rate,
+                "channels": channels,
+                "input_frames": frame_count,
+                "output_frames": target_frames,
+            }
+        },
+    )
+
+    return resampled.tobytes()
+
+
+def _normalize_audio_for_caps(
+    pcm: bytes,
+    sample_rate: int,
+    channels: int,
+    caps: PlaybackClientCaps,
+    *,
+    resample_log: logging.Logger,
+) -> tuple[bytes, int, int]:
+    """Приводит PCM к частоте/каналам, заявленным клиентом.
+
+    Сначала ресемплируем к частоте из hello, затем при необходимости переводим
+    в моно, чтобы XiaoZhi/AF тракт получал ожидаемое число каналов и не
+    воспроизводил треск из-за неверной интерпретации кадров.
+    """
+
+    target_rate = caps.sample_rate or sample_rate
+    target_channels = caps.channels or channels or 1
+
+    normalized = pcm
+    current_rate = sample_rate
+    current_channels = channels or 1
+
+    if current_rate != target_rate:
+        normalized = _resample_pcm(
+            normalized,
+            current_rate,
+            target_rate,
+            max(1, current_channels),
+            log=resample_log,
+        )
+        current_rate = target_rate
+
+    if target_channels == 1 and current_channels != 1:
+        resample_log.debug(
+            "Перевожу звук в моно под формат клиента",
+            extra={
+                "attrs": {
+                    "from_channels": current_channels,
+                    "to_channels": target_channels,
+                    "sample_rate": current_rate,
+                }
+            },
+        )
+        normalized = downmix_to_mono(normalized, current_channels)
+        current_channels = 1
+
+    return normalized, current_rate, current_channels

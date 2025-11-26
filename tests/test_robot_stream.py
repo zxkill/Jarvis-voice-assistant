@@ -21,6 +21,7 @@ from audio.robot_stream import (
     RobotStreamClosed,
     RobotClientSession,
     downmix_to_mono,
+    _normalize_audio_for_caps,
 )
 
 _HEADER = struct.Struct("<2sBBIQIIHHIfffff")
@@ -206,11 +207,12 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert magic == b"AP"
     assert version == 1
     assert flags == 0
-    assert sample_rate == 22_050
+    # PCM ресемплируется до частоты hello робота (16 кГц), чтобы не было артефактов.
+    assert sample_rate == 16_000
     assert channels == 1
     assert sample_bits == 16
-    assert frame_samples == pcm_len // 2
-    assert pcm_bytes == pcm_len
+    assert frame_samples == 3  # 4 исходных сэмпла -> 3 после ресемплинга 22.05→16 кГц
+    assert pcm_bytes == 6
     assert volume == pytest.approx(0.75)
     assert reserved == pytest.approx(0.0)
 
@@ -501,6 +503,35 @@ def test_default_playback_payload_matches_xiaozhi_frame() -> None:
     # Итоговая нагрузка укладывается в лимит и сохраняет исходный объём PCM.
     assert len(packet) <= stream._max_playback_payload
     assert meta["pcm_bytes"] == len(frames[0])
+
+
+def test_resample_and_downmix_aligns_with_caps() -> None:
+    """Ресемплинг и перевод в моно приводят PCM к формату XiaoZhi без артефактов."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:0/robot")
+    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=16_000, channels=1, frame_duration_ms=60)
+
+    # Формируем стерео-сигнал 22.05 кГц с постоянной амплитудой, чтобы легко
+    # проверить отсутствие искажений после ресемплинга и downmix.
+    src_rate = 22_050
+    channels = 2
+    frames = 100
+    stereo_samples = [1000 for _ in range(frames * channels)]
+    pcm = struct.pack("<" + "h" * len(stereo_samples), *stereo_samples)
+
+    normalized, rate, out_channels = _normalize_audio_for_caps(
+        pcm, src_rate, channels, caps, resample_log=stream._resample_log
+    )
+
+    expected_frames = max(1, int(round(frames * (caps.sample_rate / src_rate))))
+
+    # Проверяем, что частота и количество каналов соответствуют hello робота.
+    assert rate == caps.sample_rate
+    assert out_channels == caps.channels
+    assert len(normalized) == expected_frames * caps.channels * 2
+
+    mono_samples = struct.unpack("<" + "h" * (len(normalized) // 2), normalized)
+    assert all(val == 1000 for val in mono_samples)
 
 
 def test_broadcast_uses_configured_playback_queue(caplog) -> None:
