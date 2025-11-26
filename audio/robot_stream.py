@@ -125,7 +125,7 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
-        max_playback_payload: int = 800,
+        max_playback_payload: int = 512,
         playback_queue_max: int = 200,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
@@ -163,6 +163,9 @@ class RobotAudioStream:
         # 1009 (frame too large) от прошивки ESP32 или прокси на пути. Значение
         # чуть меньше килобайта по умолчанию, потому что часть байт забирает
         # WebSocket‑фрейм, и реальные ограничения прошивки могут отличаться.
+        # Ограничиваем размер полезной нагрузки исходящего кадра. Значение
+        # подобрано консервативно (512 байт), чтобы не вызывать ошибку 1009 на
+        # прошивке ESP32 и иметь запас под заголовки WebSocket.
         self._max_playback_payload = max(256, max_playback_payload)
         # Максимальный размер очереди исходящих кадров на клиента: увеличен по
         # сравнению с прошлой версией, чтобы помещался целый пакет TTS даже при
@@ -692,6 +695,30 @@ class RobotAudioStream:
             (per_channel / sample_rate) * 1000.0 if sample_rate > 0 and per_channel else 0.0
         )
 
+        # Жёстко ограничиваем полезную нагрузку под текущий лимит WebSocket,
+        # чтобы не провоцировать ошибку 1009 на прошивке ESP32. Обрезаем PCM по
+        # границе сэмпла и логируем ситуацию для дальнейшей диагностики.
+        header_size = 4 if caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size
+        max_pcm_bytes = max(0, self._max_playback_payload - header_size)
+        if len(pcm) > max_pcm_bytes:
+            trimmed = pcm[: max_pcm_bytes - (max_pcm_bytes % (2 * channels or 1))]
+            self.log.warning(
+                "PCM превышает лимит, обрезаю перед отправкой",
+                extra={
+                    "attrs": {
+                        "peer": getattr(caps, "mode", "af"),
+                        "pcm_bytes": len(pcm),
+                        "trimmed_to": len(trimmed),
+                        "max_payload": self._max_playback_payload,
+                    }
+                },
+            )
+            pcm = trimmed
+            samples = array("h")
+            samples.frombytes(pcm)
+            total_samples = len(samples)
+            per_channel = total_samples // channels if channels else 0
+
         squares_sum = sum(val * val for val in samples)
         rms_mono = (
             math.sqrt(squares_sum / total_samples) / 32768.0 if total_samples else 0.0
@@ -881,6 +908,8 @@ class RobotAudioStream:
             if pcm[i : i + frame_bytes]
         ]
 
+        example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
+
         self.log.info(
             "Подготовка TTS к отправке",
             extra={
@@ -894,12 +923,13 @@ class RobotAudioStream:
                     "chunks_total": chunks_total,
                     "pcm_bytes_total": len(pcm),
                     "volume": round(volume, 3),
+                    "expected_wire_bytes": frame_bytes
+                    + (4 if example_caps.mode == "xiaozhi" else _PLAYBACK_HEADER_STRUCT.size),
                 }
             },
         )
 
         for sub_idx, frame in enumerate(frames, start=1):
-            example_caps = next(iter(self._sessions)).caps if self._sessions else PlaybackClientCaps()
             prepared = self._prepare_playback_payload(
                 frame,
                 sample_rate,

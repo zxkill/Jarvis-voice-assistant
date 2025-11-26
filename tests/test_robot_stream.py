@@ -417,6 +417,25 @@ def test_tts_skipped_without_clients(caplog) -> None:
     stream._loop.close()
 
 
+def test_default_playback_payload_is_conservative() -> None:
+    """Дефолтный лимит 512 байт укладывается в безопасный порог для ESP32."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:0/robot")
+    # 512 — консервативный размер: позволяет передавать ~238 сэмплов моно PCM
+    # с учётом 36-байтового заголовка AP и остаётся ниже типичных лимитов
+    # WebSocket в прошивке ESP32, предотвращая код 1009.
+    assert stream._max_playback_payload == 512
+    pcm = struct.pack("<" + "h" * 300, *range(300))
+    caps = PlaybackClientCaps()
+    payload = stream._prepare_playback_payload(pcm, 16_000, channels=1, volume=1.0, caps=caps)
+    assert payload is not None
+    packet, meta = payload
+    # Проверяем, что итоговый пакет строго меньше лимита (512 байт).
+    assert len(packet) <= stream._max_playback_payload
+    # Сами PCM-данные тоже укладываются в границы, учитывая заголовок AP.
+    assert meta["pcm_bytes"] + _PLAYBACK_HEADER.size <= stream._max_playback_payload
+
+
 def test_broadcast_uses_configured_playback_queue(caplog) -> None:
     """Очередь отправки использует новый лимит и агрегирует предупреждения."""
 
