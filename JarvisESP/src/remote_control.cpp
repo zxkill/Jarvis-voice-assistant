@@ -2041,13 +2041,20 @@ loadParams();
             } else {
               const unsigned long nowMs = millis();
               if (nowMs - gLastWsWaitLogMs > 1000UL) {
-                Serial.println(F("[AUDIO] WebSocket недоступен, кадр отброшен"));
+                const auto statsSnapshot = snapshot_audio_stream_stats();
+                const std::string reason = detail::describe_ws_offline_reason(cfg,
+                                                                               statsSnapshot,
+                                                                               WiFi.status() == WL_CONNECTED,
+                                                                               cfg.handshakeTimeoutMs,
+                                                                               static_cast<uint32_t>(nowMs - gLastHandshakeMs));
+                Serial.printf("[AUDIO] WebSocket недоступен, кадр отброшен (%s)\n", reason.c_str());
                 gLastWsWaitLogMs = nowMs;
               }
 
               // Увеличиваем счётчик отброшенных кадров и сообщаем интерфейсу, чтобы оператор видел потерю.
               lock_stream_stats();
               gAudioStreamStats.wsOfflineDrops++;
+              gAudioStreamStats.lastError = "ws-offline";
               unlock_stream_stats();
               mark_status_dirty();
 

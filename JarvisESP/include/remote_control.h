@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <sstream>
 
 #include "audio_capture.h"
 
@@ -147,6 +148,29 @@ namespace detail {
  * \return true, если elapsedMs строго больше timeoutMs и следует перезапустить соединение.
  */
 bool handshake_timeout_elapsed(uint32_t timeoutMs, uint32_t elapsedMs);
+
+/**
+ * \brief Возвращает человеко-читаемое описание причины недоступности WebSocket.
+ *
+ * Логика вынесена в заголовок и не зависит от Arduino, чтобы её можно было тестировать
+ * на хосте. В строку добавляется статус Wi‑Fi, наличие конфигурации, факт подключения,
+ * число переподключений, последняя ошибка и тайминги рукопожатия.
+ */
+inline std::string describe_ws_offline_reason(const AudioStreamConfig& cfg,
+                                              const AudioStreamStats& stats,
+                                              bool wifiConnected,
+                                              uint32_t handshakeTimeoutMs,
+                                              uint32_t elapsedMs) {
+  std::ostringstream ss;
+  ss << "wifi=" << (wifiConnected ? "up" : "down")
+     << " cfg=" << (cfg.endpoint.empty() ? "none" : "ok")
+     << " ws=" << (stats.wsConnected ? "on" : "off")
+     << " reconns=" << stats.wsReconnects
+     << " lastErr=" << (stats.lastError.empty() ? "-" : stats.lastError)
+     << " timeoutMs=" << handshakeTimeoutMs
+     << " elapsedMs=" << elapsedMs;
+  return ss.str();
+}
 
 /**
  * \brief Формирует человеко-читаемое описание статуса аудиопотока.
