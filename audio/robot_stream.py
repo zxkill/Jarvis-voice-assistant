@@ -35,7 +35,7 @@ class PlaybackClientCaps:
     корректные ответы (sample_rate, channels, frame_duration) и понимать,
     как декодировать входящие бинарные кадры.
 
-    По умолчанию используем профиль XiaoZhi (PCM16 LE, 16 кГц, 1 канал,
+    По умолчанию используем профиль XiaoZhi (PCM16 LE, 44,1 кГц, 1 канал,
     длительность кадра 60 мс). Это гарантирует, что даже до получения hello
     от робота мы будем отправлять совместимый поток, а не устаревший AF
     с 36-байтовым заголовком и слишком короткими кадрами, которые приводят
@@ -44,7 +44,7 @@ class PlaybackClientCaps:
 
     mode: str = "xiaozhi"  # ``af`` либо ``xiaozhi``
     xiaozhi_version: int = 3
-    sample_rate: int = 16_000
+    sample_rate: int = 44_100
     channels: int = 1
     frame_duration_ms: int = 60
     format: str = "pcm16"
@@ -126,13 +126,13 @@ class RobotAudioStream:
         endpoint: str,
         queue_max: int = 200,
         *,
-        expected_sample_rate: int = 16_000,
+        expected_sample_rate: int = 44_100,
         expected_channels: int = 2,
         subprotocol: str | None = None,
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
-        max_playback_payload: int = 2048,
+        max_playback_payload: int = 8192,
         playback_queue_max: int = 200,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
@@ -171,9 +171,9 @@ class RobotAudioStream:
         # чуть меньше килобайта по умолчанию, потому что часть байт забирает
         # WebSocket‑фрейм, и реальные ограничения прошивки могут отличаться.
         # Ограничиваем размер полезной нагрузки исходящего кадра. Значение
-        # подобрано под 60 мс PCM16/16 кГц (около 1920 байт) с запасом на
-        # заголовок, чтобы кадры XiaoZhi не резались и не давали треск. Всё,
-        # что меньше 512, повышаем до безопасного минимума.
+        # подобрано под 60 мс PCM16/44.1 кГц (≈5.3 КБ) с запасом на заголовок,
+        # чтобы кадры XiaoZhi не резались и не давали треск. Всё, что меньше
+        # 512, повышаем до безопасного минимума.
         self._max_playback_payload = max(512, max_playback_payload)
         # Максимальный размер очереди исходящих кадров на клиента: увеличен по
         # сравнению с прошлой версией, чтобы помещался целый пакет TTS даже при
@@ -722,7 +722,7 @@ class RobotAudioStream:
 
         # Принудительно подгоняем частоту дискретизации под параметры робота
         # из hello. Это устраняет ситуацию, когда TTS или эффект пришёл в
-        # 44.1 кГц, а XiaoZhi/ESP32 ждёт ровно 16 кГц PCM16 LE (256 кбит/с).
+        # 48 кГц, а XiaoZhi/ESP32 ждёт ровно 44.1 кГц PCM16 LE (~706 кбит/с).
         if caps.sample_rate and sample_rate != caps.sample_rate:
             self._resample_log.info(
                 "Привожу частоту аудио к формату робота",

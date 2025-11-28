@@ -32,7 +32,7 @@ std::vector<int16_t> apply_delay(const std::vector<int16_t>& src, int lagSamples
 }
 
 void test_zero_delay() {
-  const float sampleRate = 16000.0f;
+  const float sampleRate = 44100.0f;
   const float micSpacing = 0.15f;
   const size_t samples = 512;
   const auto base = generate_sine(1200.0f, sampleRate, samples);
@@ -46,7 +46,7 @@ void test_zero_delay() {
 }
 
 void test_positive_delay_left_source() {
-  const float sampleRate = 16000.0f;
+  const float sampleRate = 44100.0f;
   const float micSpacing = 0.15f;
   const size_t samples = 512;
   const auto base = generate_sine(800.0f, sampleRate, samples);
@@ -61,7 +61,7 @@ void test_positive_delay_left_source() {
 }
 
 void test_negative_delay_right_source() {
-  const float sampleRate = 16000.0f;
+  const float sampleRate = 44100.0f;
   const float micSpacing = 0.15f;
   const size_t samples = 512;
   const auto base = generate_sine(1000.0f, sampleRate, samples);
@@ -76,7 +76,7 @@ void test_negative_delay_right_source() {
 }
 
 void test_rms_normalization() {
-  const float sampleRate = 16000.0f;
+  const float sampleRate = 44100.0f;
   const auto base = generate_sine(500.0f, sampleRate, 512);
   const float rms = Audio::compute_rms(base);
   const float expected = 30000.0f / std::sqrt(2.0f) / 32768.0f;

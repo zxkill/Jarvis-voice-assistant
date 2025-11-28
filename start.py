@@ -188,15 +188,15 @@ async def start_robot_audio_stream(
     robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
     ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
     ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
-    # По умолчанию используем лимит 2048 байт: этого хватает на 60 мс PCM16/16 кГц
+    # По умолчанию используем лимит 8192 байта: этого хватает на 60 мс PCM16/44.1 кГц
     # для XiaoZhi, и кадры не обрезаются, устраняя треск на MAX98357A.
-    max_playback_payload = cfg.getint("ROBOT_AUDIO", "max_playback_payload", fallback=2048)
+    max_playback_payload = cfg.getint("ROBOT_AUDIO", "max_playback_payload", fallback=8192)
     playback_queue_max = cfg.getint("ROBOT_AUDIO", "playback_queue_max", fallback=200)
 
     audio_stream = RobotAudioStream(
         endpoint=robot_audio_endpoint,
         queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
-        expected_sample_rate=cfg.getint("AUDIO", "sample_rate", fallback=16000),
+        expected_sample_rate=cfg.getint("AUDIO", "sample_rate", fallback=44100),
         expected_channels=2,
         subprotocol=robot_subprotocol,
         authorization=robot_auth,
@@ -386,7 +386,7 @@ async def main() -> None:
         )
 
     # 2. Распознавание речи (Vosk)
-    expected_sample_rate = cfg.getint("AUDIO", "sample_rate", fallback=16000)
+    expected_sample_rate = cfg.getint("AUDIO", "sample_rate", fallback=44100)
     model = vosk.Model('models/model_small')
     kaldi = vosk.KaldiRecognizer(model, expected_sample_rate)
 

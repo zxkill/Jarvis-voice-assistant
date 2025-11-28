@@ -217,7 +217,7 @@ void setup() {
   audioCfg.pinWs = PIN_I2S_WS;
   audioCfg.pinBclk = PIN_I2S_BCLK;
   audioCfg.pinData = PIN_I2S_SD;
-  audioCfg.sampleRate = 16000;
+  audioCfg.sampleRate = 44100;
   audioCfg.frameSamples = 512;
   audioCfg.microphoneSpacingMeters = MIC_SPACING_M;
   audioCfg.enableLocalization = false; // Угол будет вычисляться на сервере, чтобы не нагружать ESP32.

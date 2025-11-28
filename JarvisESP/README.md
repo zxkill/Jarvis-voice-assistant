@@ -248,9 +248,9 @@ import struct
 HEADER = struct.Struct('<2sBBIIIHHIIff')
 
 async def send_tone(websocket):
-    sample_rate = 16000
+    sample_rate = 44100
     duration_samples = 512
-    pcm = [int(16000 * math.sin(2 * math.pi * 440 * i / sample_rate)) for i in range(duration_samples)]
+    pcm = [int(44100 * math.sin(2 * math.pi * 440 * i / sample_rate)) for i in range(duration_samples)]
     payload = struct.pack('<{}h'.format(len(pcm)), *pcm)
     header = HEADER.pack(b'AP', 1, 0, 1, 0, sample_rate, 1, 16, len(pcm), len(payload), 1.0, 0.0)
     await websocket.send(header + payload)

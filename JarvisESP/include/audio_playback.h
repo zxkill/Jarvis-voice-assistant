@@ -20,7 +20,7 @@ enum class OutputMode : uint8_t {
  */
 struct Config {
   OutputMode mode = OutputMode::InternalDac; ///< Каким способом выводить звук (по умолчанию — встроенный ЦАП на GPIO25).
-  uint32_t defaultSampleRate = 16000;        ///< Частота дискретизации по умолчанию, Гц.
+  uint32_t defaultSampleRate = 44100;        ///< Частота дискретизации по умолчанию, Гц.
   size_t frameSamplesHint = 512;             ///< Оценка длины кадра для расчёта буферов.
   size_t queueCapacity = 6;                  ///< Максимальное количество кадров в очереди.
   float defaultVolume = 1.0f;                ///< Усиление, применяемое при отсутствии указания в кадре.

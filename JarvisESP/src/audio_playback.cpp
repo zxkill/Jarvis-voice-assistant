@@ -342,7 +342,7 @@ bool apply_sample_rate(uint32_t sampleRate) {
     sampleRate = gConfig.defaultSampleRate;
   }
   if (sampleRate == 0) {
-    sampleRate = 16000; // последний рубеж: не позволяем нулевой частоте свалить вывод.
+    sampleRate = 44100; // последний рубеж: не позволяем нулевой частоте свалить вывод.
   }
 
   const i2s_channel_t channelMode = is_dac_mode() ? I2S_CHANNEL_MONO : I2S_CHANNEL_STEREO;
@@ -650,7 +650,7 @@ bool init(const Config& cfg) {
     // В режиме встроенного ЦАП добавляем соответствующий флаг, чтобы ESP-IDF подключил DAC1.
     i2sConfig.mode = static_cast<i2s_mode_t>(i2sConfig.mode | I2S_MODE_DAC_BUILT_IN);
   }
-  i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 16000 : cfg.defaultSampleRate;
+  i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 44100 : cfg.defaultSampleRate;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
   if (is_dac_mode()) {
     // Для DAC оставляем моно и минимальные буферы, чтобы уменьшить задержку отклика.

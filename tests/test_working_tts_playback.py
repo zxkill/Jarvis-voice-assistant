@@ -32,7 +32,7 @@ class _StubPiper(types.ModuleType):
 
     class PiperVoice:  # type: ignore[too-few-public-methods]
         def __init__(self) -> None:
-            self.config = types.SimpleNamespace(sample_rate=16000)
+            self.config = types.SimpleNamespace(sample_rate=44100)
 
         @classmethod
         def load(cls, *_args, **_kwargs):  # type: ignore[no-untyped-def]
@@ -94,7 +94,7 @@ def test_local_playback_enabled_triggers_sounddevice(monkeypatch) -> None:
     working_tts.set_local_playback_enabled(True)
 
     audio = np.zeros(8, dtype=np.float32)
-    working_tts._perform_playback(audio, 16000, 0.0)
+    working_tts._perform_playback(audio, 44100, 0.0)
 
     assert dummy.play_calls, "ожидали вызов sounddevice.play при включённом флаге"
     assert dummy.stop_calls == 1, "ожидали остановку воспроизведения"
@@ -116,7 +116,7 @@ def test_local_playback_disabled_skips_sounddevice(monkeypatch) -> None:
     working_tts.set_local_playback_enabled(False)
 
     audio = np.zeros(8, dtype=np.float32)
-    working_tts._perform_playback(audio, 16000, 0.0)
+    working_tts._perform_playback(audio, 44100, 0.0)
 
     # Отсутствие исключений означает, что ``sounddevice`` не вызывался.
     working_tts.set_local_playback_enabled(True)

@@ -35,7 +35,7 @@ float read_f32(const std::vector<uint8_t>& data, size_t offset) {
 
 void test_binary_frame_encoding() {
   Audio::PcmChunk chunk{};
-  chunk.sampleRate = 16000;
+  chunk.sampleRate = 44100;
   chunk.channels = 2;
   chunk.timestampUs = 987654321ULL;
   chunk.interleaved = {100, -100, 200, -200};
@@ -52,7 +52,7 @@ void test_binary_frame_encoding() {
   const uint32_t sequence = 42;
   RemoteControl::AudioStreamConfig cfg{};
   cfg.xiaoZhiCompat = false; // тестируем внутренний формат AF
-  const auto frame = RemoteControl::build_audio_stream_frame(cfg, chunk, diag, sequence, 60, 16000, 2);
+  const auto frame = RemoteControl::build_audio_stream_frame(cfg, chunk, diag, sequence, 60, 44100, 2);
 
   const size_t pcmBytes = chunk.interleaved.size() * sizeof(int16_t);
   const size_t expectedHeader = 52;

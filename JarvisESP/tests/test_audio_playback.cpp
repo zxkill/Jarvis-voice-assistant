@@ -56,7 +56,7 @@ std::vector<uint8_t> build_playback_frame(uint32_t sequence,
 
 void test_decode_server_frame_success() {
   AudioPlayback::Config cfg{};
-  cfg.defaultSampleRate = 16000;
+  cfg.defaultSampleRate = 44100;
   assert(AudioPlayback::init(cfg));
 
   const auto raw = build_playback_frame(5, 123456, 22050, 2, 4, 0.75f);
@@ -75,7 +75,7 @@ void test_decode_server_frame_success() {
 
 void test_init_primes_silence() {
   AudioPlayback::Config cfg{};
-  cfg.defaultSampleRate = 16000;
+  cfg.defaultSampleRate = 44100;
   cfg.frameSamplesHint = 256;
   assert(AudioPlayback::init(cfg));
   const auto stats = AudioPlayback::stats();
@@ -102,7 +102,7 @@ void test_init_max98357a_mode() {
 }
 
 void test_decode_server_frame_rejects_magic() {
-  const auto raw = build_playback_frame(1, 0, 16000, 1, 2, 1.0f);
+  const auto raw = build_playback_frame(1, 0, 44100, 1, 2, 1.0f);
   std::vector<uint8_t> broken = raw;
   broken[0] = 'X';
   AudioPlayback::Frame frame{};
@@ -113,18 +113,18 @@ void test_decode_server_frame_rejects_magic() {
 
 void test_handle_frame_updates_stats() {
   AudioPlayback::Config cfg{};
-  cfg.defaultSampleRate = 16000;
+  cfg.defaultSampleRate = 44100;
   cfg.queueCapacity = 3;
   assert(AudioPlayback::init(cfg));
   AudioPlayback::reset_stats();
 
-  const auto raw = build_playback_frame(7, 42, 16000, 2, 8, 1.0f);
+  const auto raw = build_playback_frame(7, 42, 44100, 2, 8, 1.0f);
   assert(AudioPlayback::handle_server_frame(raw.data(), raw.size()));
   const auto stats = AudioPlayback::stats();
   assert(stats.framesAccepted == 1);
   assert(stats.queueDepth == 1);
   assert(stats.lastSequence == 7);
-  assert(stats.lastSampleRate == 16000);
+  assert(stats.lastSampleRate == 44100);
   assert(stats.lastVolume > 0.99f && stats.lastVolume < 1.01f);
   AudioPlayback::shutdown();
 }
@@ -132,7 +132,7 @@ void test_handle_frame_updates_stats() {
 void test_handle_requires_init() {
   AudioPlayback::shutdown();
   AudioPlayback::reset_stats();
-  const auto raw = build_playback_frame(1, 0, 16000, 1, 2, 1.0f);
+  const auto raw = build_playback_frame(1, 0, 44100, 1, 2, 1.0f);
   assert(!AudioPlayback::handle_server_frame(raw.data(), raw.size()));
   const auto stats = AudioPlayback::stats();
   assert(stats.framesRejected == 1);

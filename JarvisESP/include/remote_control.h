@@ -82,7 +82,7 @@ struct AudioStreamConfig {
   bool xiaoZhiCompat = true;            ///< Включает проводной протокол XiaoZhi (hello + BinaryProtocol2/3).
   uint16_t xiaoZhiVersion = 3;          ///< Версия бинарного протокола XiaoZhi (2 или 3).
   uint16_t xiaoZhiFrameDurationMs = 60; ///< Длительность кадра, используемая в hello.
-  uint32_t xiaoZhiSampleRate = 16000;   ///< Частота дискретизации для приветствия и расчёта размеров кадра.
+  uint32_t xiaoZhiSampleRate = 44100;   ///< Частота дискретизации для приветствия и расчёта размеров кадра.
   uint16_t xiaoZhiChannels = 1;         ///< Количество каналов (xiaozhi использует моно).
   std::string xiaoZhiFormat = "opus";   ///< Кодек, объявляемый в hello (opus или pcm16 для отладки).
 };

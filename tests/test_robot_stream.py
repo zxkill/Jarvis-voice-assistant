@@ -45,7 +45,7 @@ def _build_payload(sequence: int = 1, frame_samples: int = 4) -> bytes:
         0,  # flags
         sequence,
         123456,  # timestamp
-        16_000,
+        44_100,
         frame_samples,
         2,  # channels
         16,  # sample bits
@@ -122,7 +122,7 @@ def test_websocket_server_sends_tts_to_robot() -> None:
             pcm = struct.pack("<hh", 1200, -1200)
             stream.send_tts(
                 pcm,
-                16_000,
+                44_100,
                 text="привет",
                 preset="neutral",
                 chunk_index=1,
@@ -159,7 +159,7 @@ def test_websocket_server_sends_effect_to_robot() -> None:
             pcm = struct.pack("<hhhh", 500, -500, 1000, -1000)
             stream.send_effect(
                 pcm,
-                22_050,
+                44_100,
                 name="SIGH",
                 source_file="sigh.wav",
                 repeat_index=1,
@@ -171,13 +171,13 @@ def test_websocket_server_sends_effect_to_robot() -> None:
 
     payload, pcm_len = asyncio.run(_runner())
 
-    # Проверяем XiaoZhi-заголовок (4 байта) и длину полезной нагрузки после
-    # ресемплинга 22.05→16 кГц: из 4 сэмплов остаётся 3, итого 6 байт PCM.
+    # Проверяем XiaoZhi-заголовок (4 байта) и длину полезной нагрузки без
+    # ресемплинга: 4 сэмпла по 2 байта = 8 байт PCM.
     assert payload[0] == 0
     assert payload[1] == 0
     size = (payload[2] << 8) | payload[3]
-    assert size == 6
-    assert len(payload) == 10
+    assert size == 8
+    assert len(payload) == 12
     # Проверяем, что полезная нагрузка не обрезана и содержит 3 сэмпла после
     # ресемплинга. Значения могут немного отличаться из-за интерполяции,
     # поэтому фиксируем только длину и первый сэмпл.
@@ -209,7 +209,7 @@ def test_effect_is_split_for_xiaozhi_client() -> None:
                     "transport": "websocket",
                     "audio_params": {
                         "format": "pcm16",
-                        "sample_rate": 16_000,
+                        "sample_rate": 44_100,
                         "channels": 1,
                         "frame_duration": 60,
                     },
@@ -221,7 +221,7 @@ def test_effect_is_split_for_xiaozhi_client() -> None:
 
             stream.send_effect(
                 pcm,
-                16_000,
+                44_100,
                 name="THINKING",
                 source_file="buzz.wav",
                 repeat_index=1,
@@ -268,7 +268,7 @@ def test_xiaozhi_hello_and_frame_delivery() -> None:
                 "version": 3,
                 "audio_params": {
                     "format": "pcm16",
-                    "sample_rate": 16_000,
+                    "sample_rate": 44_100,
                     "channels": 1,
                     "frame_duration": 60,
                 },
@@ -288,7 +288,7 @@ def test_xiaozhi_hello_and_frame_delivery() -> None:
         return received
 
     frame = asyncio.run(_runner())
-    assert frame.sample_rate == 16_000
+    assert frame.sample_rate == 44_100
     assert frame.frame_samples == 4
     assert frame.channels == 1
     assert frame.pcm_mono == struct.pack("<hhhh", 100, -100, 50, -50)
@@ -313,12 +313,12 @@ def test_tts_is_split_into_small_frames() -> None:
         )
         stream._sessions.append(session)
 
-        # Генерируем ~100 мс моно PCM (1600 сэмплов при 16 кГц).
+        # Генерируем ~36 мс моно PCM (1600 сэмплов при 44.1 кГц).
         pcm = struct.pack("<" + "h" * 1600, *range(1600))
         # Просим делить звук на фреймы по 256 сэмплов.
         stream.send_tts(
             pcm,
-            16_000,
+            44_100,
             text="тест",  # noqa: PIE798 — важно видеть в логах
             preset="neutral",
             chunk_index=1,
@@ -381,7 +381,7 @@ def test_tts_respects_payload_limit_and_throttles_warning() -> None:
         stream._sessions.append(session)
         stream.send_tts(
             pcm,
-            16_000,
+            44_100,
             text="ограничение",  # noqa: PIE798
             preset="neutral",
             chunk_index=1,
@@ -394,7 +394,7 @@ def test_tts_respects_payload_limit_and_throttles_warning() -> None:
         # Повторный вызов сразу после первого не должен обновить таймстамп из-за троттлинга.
         stream.send_tts(
             pcm,
-            16_000,
+            44_100,
             text="повтор",  # noqa: PIE798
             preset="neutral",
             chunk_index=1,
@@ -431,7 +431,7 @@ def test_tts_skipped_without_clients(caplog) -> None:
 
     stream.send_tts(
         pcm,
-        16_000,
+        44_100,
         text="нет клиента",  # noqa: PIE798 — читается в логах
         preset="neutral",
         chunk_index=1,
@@ -442,7 +442,7 @@ def test_tts_skipped_without_clients(caplog) -> None:
 
     stream.send_tts(
         pcm,
-        16_000,
+        44_100,
         text="повтор нет клиента",  # noqa: PIE798
         preset="neutral",
         chunk_index=1,
@@ -457,18 +457,18 @@ def test_tts_skipped_without_clients(caplog) -> None:
 
 
 def test_default_playback_payload_matches_xiaozhi_frame() -> None:
-    """Дефолтный лимит покрывает 60 мс PCM16/16кГц без обрезки и треска."""
+    """Дефолтный лимит покрывает 60 мс PCM16/44.1кГц без обрезки и треска."""
 
     stream = RobotAudioStream("ws://127.0.0.1:0/robot")
-    # 2048 байт позволяют передать 60 мс моно PCM16 (1920 байт) + заголовок XiaoZhi.
-    assert stream._max_playback_payload == 2048
-    # Генерируем ровно 60 мс PCM16 моно: 16_000 * 0.06 = 960 сэмплов.
-    pcm = struct.pack("<" + "h" * 960, *range(960))
-    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=16_000, channels=1, frame_duration_ms=60)
+    # 8192 байта позволяют передать 60 мс моно PCM16 (≈5292 байта) + заголовок XiaoZhi.
+    assert stream._max_playback_payload == 8192
+    # Генерируем ровно 60 мс PCM16 моно: 44_100 * 0.06 ≈ 2646 сэмплов.
+    pcm = struct.pack("<" + "h" * 2646, *range(2646))
+    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=44_100, channels=1, frame_duration_ms=60)
     frames = stream._split_pcm_for_caps(pcm, channels=1, caps=caps)
     assert frames, "Должен получиться хотя бы один кадр"
     assert len(frames) == 1, "60 мс помещаются в один XiaoZhi-фрейм"
-    payload = stream._prepare_playback_payload(frames[0], 16_000, channels=1, volume=1.0, caps=caps)
+    payload = stream._prepare_playback_payload(frames[0], 44_100, channels=1, volume=1.0, caps=caps)
     assert payload is not None
     packet, meta = payload
     # Итоговая нагрузка укладывается в лимит и сохраняет исходный объём PCM.
@@ -477,13 +477,13 @@ def test_default_playback_payload_matches_xiaozhi_frame() -> None:
 
 
 def test_prepare_payload_resamples_to_caps_rate() -> None:
-    """TTS/эффекты приводятся к частоте 16 кГц, чтобы робот не трещал."""
+    """TTS/эффекты приводятся к частоте 44.1 кГц, чтобы робот не трещал."""
 
-    stream = RobotAudioStream("ws://127.0.0.1:0/robot", max_playback_payload=4096)
-    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=16_000, channels=1, frame_duration_ms=60)
+    stream = RobotAudioStream("ws://127.0.0.1:0/robot", max_playback_payload=8192)
+    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=44_100, channels=1, frame_duration_ms=60)
 
-    # Формируем 60 мс моно-сигнал 44.1 кГц и проверяем, что он ресемплируется в 16 кГц.
-    src_rate = 44_100
+    # Формируем 60 мс моно-сигнал 48 кГц и проверяем, что он ресемплируется в 44.1 кГц.
+    src_rate = 48_000
     src_frames = int(src_rate * 0.06)
     pcm = struct.pack("<" + "h" * src_frames, *([500] * src_frames))
 
@@ -503,7 +503,7 @@ def test_resample_and_downmix_aligns_with_caps() -> None:
     """Ресемплинг и перевод в моно приводят PCM к формату XiaoZhi без артефактов."""
 
     stream = RobotAudioStream("ws://127.0.0.1:0/robot")
-    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=16_000, channels=1, frame_duration_ms=60)
+    caps = PlaybackClientCaps(mode="xiaozhi", sample_rate=44_100, channels=1, frame_duration_ms=60)
 
     # Формируем стерео-сигнал 22.05 кГц с постоянной амплитудой, чтобы легко
     # проверить отсутствие искажений после ресемплинга и downmix.
@@ -599,7 +599,7 @@ def test_tts_sent_as_xiaozhi_payload() -> None:
         pcm = struct.pack("<hh", 1200, -1200)
         stream.send_tts(
             pcm,
-            16_000,
+            44_100,
             text="привет",
             preset="neutral",
             chunk_index=1,
@@ -623,18 +623,18 @@ def test_default_session_caps_are_xiaozhi_without_hello() -> None:
     async def _runner() -> bytes:
         stream = RobotAudioStream(
             "ws://127.0.0.1:0/robot",
-            max_playback_payload=2048,
+            max_playback_payload=8192,
         )
         await stream.start()
         assert stream._server is not None
         port = stream._server.sockets[0].getsockname()[1]
 
         async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
-            # Отправляем 60 мс PCM16/16 кГц в 1 канал — ровно то, что ждёт XiaoZhi.
-            pcm = b"\x01\x00" * 960
+            # Отправляем 60 мс PCM16/44.1 кГц в 1 канал — ровно то, что ждёт XiaoZhi.
+            pcm = b"\x01\x00" * 2646
             stream.send_tts(
                 pcm,
-                16_000,
+                44_100,
                 text="auto-caps",
                 preset="neutral",
                 chunk_index=1,
@@ -650,9 +650,9 @@ def test_default_session_caps_are_xiaozhi_without_hello() -> None:
     assert payload[1] == 0
     size = (payload[2] << 8) | payload[3]
     assert size == len(payload) - 4
-    # Полезная нагрузка должна уместиться целиком (1920 байт) без обрезки под
+    # Полезная нагрузка должна уместиться целиком (≈5292 байта) без обрезки под
     # заголовок AF, иначе возникнет треск на роботе.
-    assert size == 1920
+    assert size == 5292
 
 
 class _DummyClosedWebSocket:
