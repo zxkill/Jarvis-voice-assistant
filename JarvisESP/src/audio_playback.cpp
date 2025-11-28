@@ -21,7 +21,7 @@ constexpr uint8_t PROTOCOL_VERSION = 1; ///< Поддерживаемая вер
 constexpr size_t HEADER_SIZE = 36;      ///< Размер заголовка в байтах.
 constexpr uint32_t MIN_IDLE_DELAY_MS = 50; ///< Минимальная задержка, после которой включаем режим тишины.
 #ifdef ARDUINO
-constexpr i2s_port_t I2S_PORT = I2S_NUM_0;               ///< Встроенный ЦАП ESP32 доступен только на I2S0, поэтому закрепляем порт.
+constexpr i2s_port_t I2S_PORT = I2S_NUM_0;               ///< I2S0 используется и для встроенного ЦАП, и для внешнего MAX98357A.
 constexpr size_t PLAYBACK_TASK_STACK_WORDS = 4096;       ///< Увеличенный стек из-за конвертаций и логов.
 constexpr UBaseType_t PLAYBACK_TASK_PRIORITY = 4;        ///< Приоритет выше телеметрии, чтобы не рвалась речь.
 #endif
@@ -116,7 +116,12 @@ bool prime_dma_with_silence(const char* context) {
   size_t samples = gConfig.frameSamplesHint == 0 ? 512 : gConfig.frameSamplesHint;
   samples = std::max<size_t>(samples, 256);
 
-  std::vector<uint16_t> silence(samples, 0x8000u); // 0x8000 = половина диапазона, что соответствует 0 В.
+  const bool useExternalI2S = gConfig.mode == OutputMode::ExternalI2S;
+  const size_t channels = useExternalI2S ? 2 : 1; // Для внешнего I2S сразу готовим стерео, чтобы MAX98357A не оставлял второй канал пустым.
+  const size_t totalSamples = samples * channels;
+
+  const uint16_t silenceWord = useExternalI2S ? 0u : 0x8000u; // Для цифрового I2S тишина — нулевой сэмпл, для ЦАП нужен смещённый уровень.
+  std::vector<uint16_t> silence(totalSamples, silenceWord);
   size_t bytesWritten = 0;
   const size_t bytesToWrite = silence.size() * sizeof(uint16_t);
   const esp_err_t primeRc =
@@ -153,7 +158,10 @@ bool mute_output(const char* reason, bool countTransition) {
   if (stopRc != ESP_OK) {
     Serial.printf("[PLAYBACK] предупреждение: i2s_stop вернул %d\n", stopRc);
   }
-  dac_output_disable(DAC_CHANNEL_1);
+  if (gConfig.mode == OutputMode::InternalDac) {
+    // Внешний I2S не использует встроенный ЦАП, поэтому выключаем его только при работе с LM386.
+    dac_output_disable(DAC_CHANNEL_1);
+  }
   gOutputMuted = true;
   record_mute_state(true, countTransition);
   return true;
@@ -176,7 +184,10 @@ bool unmute_output(const char* reason) {
     unlock_stats();
     return false;
   }
-  dac_output_enable(DAC_CHANNEL_1);
+  if (gConfig.mode == OutputMode::InternalDac) {
+    // При использовании MAX98357A управление питанием ЦАП не требуется: микросхема принимает битовый поток напрямую.
+    dac_output_enable(DAC_CHANNEL_1);
+  }
   i2s_zero_dma_buffer(I2S_PORT);
   if (!prime_dma_with_silence("пробуждение")) {
     Serial.println(F("[PLAYBACK] ошибка: не удалось подать тишину при выходе из mute"));
@@ -227,7 +238,8 @@ bool apply_sample_rate(uint32_t sampleRate) {
     sampleRate = 16000; // последний рубеж: не позволяем нулевой частоте свалить вывод.
   }
 
-  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  const i2s_channel_t channelMode = (gConfig.mode == OutputMode::ExternalI2S) ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO;
+  const esp_err_t rc = i2s_set_clk(I2S_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, channelMode);
   if (rc != ESP_OK) {
     Serial.printf("[PLAYBACK] ошибка установки частоты %u Гц: %d\n", static_cast<unsigned>(sampleRate), rc);
     lock_stats();
@@ -284,6 +296,51 @@ std::vector<uint16_t> convert_to_dac_words(const Frame& frame) {
   return out;
 }
 
+std::vector<int16_t> convert_to_i2s_words(const Frame& frame) {
+  // Для внешнего I2S‑усилителя MAX98357A мы формируем стереопоток: даже если сервер прислал моно,
+  // заполняем оба канала, чтобы динамик на пине DIN не оставался без данных при переключении LRCK.
+  std::vector<int16_t> out;
+  if (frame.samples.empty()) {
+    return out;
+  }
+
+  const uint16_t inputChannels = frame.channels == 0 ? 1 : frame.channels;
+  const size_t samplesPerChannel = frame.samples.size() / inputChannels;
+  out.resize(samplesPerChannel * 2);
+
+  const float requestedVolume = (std::isfinite(frame.volume) && frame.volume > 0.0f)
+                                    ? frame.volume
+                                    : gConfig.defaultVolume;
+
+  for (size_t i = 0; i < samplesPerChannel; ++i) {
+    int32_t left = 0;
+    int32_t right = 0;
+
+    if (inputChannels == 1) {
+      // Дублируем моно в оба канала, чтобы усилитель не «щёлкал» между пустыми сэмплами.
+      left = right = static_cast<int32_t>(frame.samples[i]);
+    } else {
+      left = static_cast<int32_t>(frame.samples[i * 2]);
+      right = static_cast<int32_t>(frame.samples[i * 2 + 1]);
+    }
+
+    left = static_cast<int32_t>(std::lround(static_cast<float>(left) * requestedVolume));
+    right = static_cast<int32_t>(std::lround(static_cast<float>(right) * requestedVolume));
+
+    left = std::max(-32768, std::min(32767, left));
+    right = std::max(-32768, std::min(32767, right));
+
+    out[i * 2] = static_cast<int16_t>(left);
+    out[i * 2 + 1] = static_cast<int16_t>(right);
+  }
+
+  lock_stats();
+  gStats.lastVolume = requestedVolume;
+  unlock_stats();
+
+  return out;
+}
+
 void playback_task(void*) {
   Serial.println(F("[PLAYBACK] задача воспроизведения запущена"));
   for (;;) {
@@ -322,8 +379,18 @@ void playback_task(void*) {
       continue;
     }
 
-    std::vector<uint16_t> dacWords = convert_to_dac_words(frame);
-    if (dacWords.empty()) {
+    const bool useExternalI2S = gConfig.mode == OutputMode::ExternalI2S;
+    std::vector<uint16_t> dacWords;
+    std::vector<int16_t> i2sWords;
+
+    if (useExternalI2S) {
+      i2sWords = convert_to_i2s_words(frame);
+    } else {
+      dacWords = convert_to_dac_words(frame);
+    }
+
+    const size_t preparedSamples = useExternalI2S ? i2sWords.size() : dacWords.size();
+    if (preparedSamples == 0) {
       lock_stats();
       gStats.bufferUnderruns++;
       gStats.lastError = "empty-frame";
@@ -334,12 +401,12 @@ void playback_task(void*) {
     }
 
     size_t bytesWritten = 0;
-    const size_t bytesToWrite = dacWords.size() * sizeof(uint16_t);
-    const esp_err_t rc = i2s_write(I2S_PORT,
-                                   reinterpret_cast<const char*>(dacWords.data()),
-                                   bytesToWrite,
-                                   &bytesWritten,
-                                   portMAX_DELAY);
+    const void* payloadPtr = useExternalI2S
+                                 ? reinterpret_cast<const char*>(i2sWords.data())
+                                 : reinterpret_cast<const char*>(dacWords.data());
+    const size_t bytesToWrite = preparedSamples * sizeof(int16_t);
+
+    const esp_err_t rc = i2s_write(I2S_PORT, payloadPtr, bytesToWrite, &bytesWritten, portMAX_DELAY);
     if (rc != ESP_OK || bytesWritten != bytesToWrite) {
       lock_stats();
       gStats.lastError = "i2s-write";
@@ -358,7 +425,7 @@ void playback_task(void*) {
       unlock_stats();
       Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u)\n",
                     static_cast<unsigned>(frame.sequence),
-                    static_cast<unsigned>(dacWords.size()),
+                    static_cast<unsigned>(preparedSamples),
                     static_cast<unsigned>(sampleRate),
                     static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)));
     }
@@ -422,7 +489,7 @@ bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std:
     error = "bad-version";
     return false;
   }
-  if (header.bitsPerSample != 16) {
+  if (header.bitsPerSample != 16 && header.bitsPerSample != 8) {
     error = "bad-bits";
     return false;
   }
@@ -437,7 +504,8 @@ bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std:
     return false;
   }
 
-  const size_t expectedBytes = static_cast<size_t>(header.frameSamples) * header.channels * sizeof(int16_t);
+  const size_t expectedBytes = static_cast<size_t>(header.frameSamples) * header.channels *
+                               (header.bitsPerSample / 8);
   if (expectedBytes != header.pcmBytes) {
     error = "bad-frameSamples";
     return false;
@@ -454,8 +522,21 @@ bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std:
   } else {
     out.volume = gConfig.defaultVolume;
   }
-  out.samples.resize(header.pcmBytes / sizeof(int16_t));
-  std::memcpy(out.samples.data(), payload + HEADER_SIZE, header.pcmBytes);
+
+  // Приводим входные сэмплы к знаковому 16-битному представлению, чтобы
+  // воспроизведение могло работать в едином формате (I2S/ЦАП).
+  const size_t totalSamples = static_cast<size_t>(header.frameSamples) * header.channels;
+  out.samples.resize(totalSamples);
+  if (header.bitsPerSample == 8) {
+    // PCM8 беззнаковый: сдвигаем на 0x80 и растягиваем до 16 бит, как в примере WAV.
+    for (size_t i = 0; i < totalSamples; ++i) {
+      const uint8_t raw = payload[HEADER_SIZE + i];
+      const int32_t centered = static_cast<int32_t>(raw) - 128;
+      out.samples[i] = static_cast<int16_t>(centered * 256);
+    }
+  } else {
+    std::memcpy(out.samples.data(), payload + HEADER_SIZE, header.pcmBytes);
+  }
   return true;
 }
 
@@ -466,10 +547,8 @@ bool init(const Config& cfg) {
 
 #ifdef ARDUINO
   i2s_config_t i2sConfig = {};
-  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
   i2sConfig.sample_rate = cfg.defaultSampleRate == 0 ? 16000 : cfg.defaultSampleRate;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT; // Используем только левый моно-канал DAC1 (GPIO25).
   i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   i2sConfig.dma_buf_count = 6;
@@ -477,6 +556,16 @@ bool init(const Config& cfg) {
   i2sConfig.use_apll = false;
   i2sConfig.tx_desc_auto_clear = true;
   i2sConfig.fixed_mclk = 0;
+
+  if (cfg.mode == OutputMode::ExternalI2S) {
+    // Внешний усилитель MAX98357A принимает стандартный I2S-поток, поэтому используем формат RIGHT/LEFT.
+    i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX);
+    i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  } else {
+    // Совместимость со старым LM386 через встроенный ЦАП: только левый канал DAC1.
+    i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
+    i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  }
 
   if (i2s_driver_install(I2S_PORT, &i2sConfig, 0, nullptr) != ESP_OK) {
     Serial.println(F("[PLAYBACK] ошибка: не удалось установить драйвер I2S"));
@@ -489,10 +578,34 @@ bool init(const Config& cfg) {
 
   gDriverInstalled = true; // Запоминаем успешный старт, чтобы грамотно гасить порт в shutdown().
 
-  i2s_set_pin(I2S_PORT, nullptr);
-  // Включаем только DAC1 (GPIO25): LM386 работает с моно сигналом, поэтому второй канал не задействуем.
-  i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN);
-  dac_output_enable(DAC_CHANNEL_1);
+  if (cfg.mode == OutputMode::ExternalI2S) {
+    // Настраиваем вывод на MAX98357A: пины берём из конфигурации, чтобы можно было переопределить разводку без правок кода.
+    i2s_pin_config_t pinCfg = {};
+    pinCfg.bck_io_num = cfg.pinBclk;
+    pinCfg.ws_io_num = cfg.pinLrc;
+    pinCfg.data_out_num = cfg.pinDout;
+    pinCfg.data_in_num = -1;
+    const esp_err_t pinRc = i2s_set_pin(I2S_PORT, &pinCfg);
+    if (pinRc != ESP_OK) {
+      Serial.printf("[PLAYBACK] ошибка: не удалось привязать пины I2S (BCLK=%d, LRCK=%d, DIN=%d), rc=%d\n",
+                    cfg.pinBclk,
+                    cfg.pinLrc,
+                    cfg.pinDout,
+                    pinRc);
+      lock_stats();
+      gStats.initialized = false;
+      gStats.lastError = "i2s-pins";
+      unlock_stats();
+      i2s_driver_uninstall(I2S_PORT);
+      gDriverInstalled = false;
+      return false;
+    }
+  } else {
+    i2s_set_pin(I2S_PORT, nullptr);
+    // Включаем только DAC1 (GPIO25): LM386 работает с моно сигналом, поэтому второй канал не задействуем.
+    i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN);
+    dac_output_enable(DAC_CHANNEL_1);
+  }
 
   const esp_err_t startRc = i2s_start(I2S_PORT);
   if (startRc != ESP_OK) {
@@ -503,7 +616,9 @@ bool init(const Config& cfg) {
     unlock_stats();
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
-    dac_output_disable(DAC_CHANNEL_1);
+    if (cfg.mode == OutputMode::InternalDac) {
+      dac_output_disable(DAC_CHANNEL_1);
+    }
     return false;
   }
 
@@ -513,15 +628,27 @@ bool init(const Config& cfg) {
     unlock_stats();
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
-    dac_output_disable(DAC_CHANNEL_1);
-    dac_output_disable(DAC_CHANNEL_2);
+    if (cfg.mode == OutputMode::InternalDac) {
+      dac_output_disable(DAC_CHANNEL_1);
+      dac_output_disable(DAC_CHANNEL_2);
+    }
     return false;
   }
 
-  Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=DAC1\n",
-                static_cast<int>(I2S_PORT),
-                static_cast<unsigned>(i2sConfig.sample_rate),
-                static_cast<unsigned>(cfg.queueCapacity));
+  if (cfg.mode == OutputMode::ExternalI2S) {
+    Serial.printf("[PLAYBACK] I2S-усилитель готов: порт=%d, %u Гц, очередь=%u, пины BCLK=%d LRCK=%d DIN=%d\n",
+                  static_cast<int>(I2S_PORT),
+                  static_cast<unsigned>(i2sConfig.sample_rate),
+                  static_cast<unsigned>(cfg.queueCapacity),
+                  cfg.pinBclk,
+                  cfg.pinLrc,
+                  cfg.pinDout);
+  } else {
+    Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=DAC1\n",
+                  static_cast<int>(I2S_PORT),
+                  static_cast<unsigned>(i2sConfig.sample_rate),
+                  static_cast<unsigned>(cfg.queueCapacity));
+  }
 #else
   (void)ensure_queue_created;
 #endif
@@ -567,14 +694,16 @@ void shutdown() {
     gQueue = nullptr;
   }
   if (gDriverInstalled) {
-    Serial.printf("[PLAYBACK] останавливаем I2S-ЦАП: порт=%d\n", static_cast<int>(I2S_PORT));
+    Serial.printf("[PLAYBACK] останавливаем I2S-тракт: порт=%d\n", static_cast<int>(I2S_PORT));
     i2s_stop(I2S_PORT);
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
   }
-  dac_output_disable(DAC_CHANNEL_1);
-  // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
-  dac_output_disable(DAC_CHANNEL_2);
+  if (gConfig.mode == OutputMode::InternalDac) {
+    dac_output_disable(DAC_CHANNEL_1);
+    // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
+    dac_output_disable(DAC_CHANNEL_2);
+  }
 #endif
   gOutputMuted = true;
   record_mute_state(true, false);
@@ -629,6 +758,11 @@ bool handle_server_frame(const uint8_t* payload, size_t length) {
 
   bool accepted = false;
 #ifdef ARDUINO
+  if (frame.bitsPerSample == 8) {
+    Serial.printf("[PLAYBACK] принят PCM8, выполнена конверсия в PCM16 (seq=%u, bytes=%u)\n",
+                  static_cast<unsigned>(frame.sequence),
+                  static_cast<unsigned>(frame.samples.size() * sizeof(int16_t)));
+  }
   if (!ensure_queue_created()) {
     return false;
   }

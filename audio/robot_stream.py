@@ -23,6 +23,14 @@ _HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
 # Заголовок исходящих кадров TTS, описанный в прошивке ESP32.
 _PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
 
+# ---- Ограничения исходящего аудио ----
+# Библиотека WebSockets на стороне ESP32 разрывает соединение с кодом 1009,
+# если попытаться отправить слишком большой бинарный фрейм.  Чтобы не рисковать
+# потерей сессии при озвучке, ограничиваем полезную нагрузку и при необходимости
+# дробим PCM на несколько кадров.  Верхний предел подобран с запасом под
+# I2S-буфер 512 сэмплов: 4096 байт PCM16 = 2048 сэмплов моно ≈ 128 мс при 16 кГц.
+_PLAYBACK_MAX_PCM_BYTES = 4096
+
 
 @dataclasses.dataclass(slots=True)
 class RobotAudioFrame:
@@ -64,8 +72,17 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
+        send_queue_maxsize: int = 200,
     ) -> None:
-        """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
+        """Создаёт сервер, принимающий бинарные кадры PCM16 от робота.
+
+        ``send_queue_maxsize`` позволяет управлять глубиной очереди исходящих
+        кадров AP для всех подключённых роботов.  Увеличенный лимит помогает
+        избежать обрезания длинных эффектов (например, THINKING), которые после
+        безопасного дробления на чанки могут превышать десятки пакетов.  При
+        нулевом значении параметр по умолчанию приводится к 1, чтобы избежать
+        ошибок asyncio.Queue.
+        """
 
         self._parsed = urlparse(endpoint)
         if self._parsed.scheme not in {"ws", "wss"}:
@@ -89,6 +106,7 @@ class RobotAudioStream:
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
         self._send_queues: Set[asyncio.Queue[bytes]] = set()
+        self._send_queue_maxsize = max(1, send_queue_maxsize)
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
@@ -179,11 +197,25 @@ class RobotAudioStream:
                 self.log.warning("Отклоняю подключение: неверный Authorization")
                 await websocket.close(code=4403, reason="unauthorized")
                 return
-        self.log.info("Робот подключился", extra={"attrs": {"peer": peer}})
+        self.log.info(
+            "Робот подключился",
+            extra={
+                "attrs": {
+                    "peer": peer,
+                    "send_queue_maxsize": self._send_queue_maxsize,
+                }
+            },
+        )
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Отдельная очередь исходящих аудио-кадров для конкретного робота.
+        # Увеличенный лимит (по умолчанию 200) предотвращает ситуации, когда
+        # длинный THINKING-эффект дробится на десятки кадров и мгновенно
+        # переполняет буфер быстрее, чем WebSocket успевает их отправлять.
+        send_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self._send_queue_maxsize
+        )
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -302,20 +334,14 @@ class RobotAudioStream:
         self._playback_sequence = (self._playback_sequence + 1) & 0xFFFFFFFF
         return self._playback_sequence
 
-    def _prepare_playback_payload(
-        self,
-        pcm: bytes,
-        sample_rate: int,
-        *,
-        channels: int,
-        volume: float,
-    ) -> tuple[bytes, dict] | None:
-        """Готовит бинарный пакет ``AP`` и возвращает полезные метрики.
+    def _normalize_pcm_for_playback(
+        self, pcm: bytes, sample_rate: int, channels: int
+    ) -> tuple[bytes, int] | None:
+        """Проверяет входной PCM, приводит к моно и возвращает актуальные каналы.
 
-        Возвращаем словарь со статистикой, чтобы логи TTS и фоновых эффектов
-        содержали одинаковые поля: длительность, пики и RMS.  В случае ошибки
-        (например, некорректного числа каналов) метод возвращает ``None`` и
-        соответствующий вызов прерывается.
+        Все ошибки форматирования логируются, чтобы оператор сразу видел причину
+        отсутствия озвучки.  Возврат ``None`` означает, что отправку следует
+        прекратить.
         """
 
         if not pcm:
@@ -351,6 +377,65 @@ class RobotAudioStream:
             pcm = downmix_to_mono(pcm, channels)
             channels = 1
 
+        return pcm, channels
+
+    def _split_pcm_chunks(self, pcm: bytes, channels: int) -> list[bytes]:
+        """Делит PCM на куски, не превышающие ограничение WebSocket-клиента ESP32."""
+
+        bytes_per_sample = 2 * channels
+        if bytes_per_sample == 0:
+            return []
+        max_samples = _PLAYBACK_MAX_PCM_BYTES // bytes_per_sample
+        if max_samples == 0:
+            self.log.error(
+                "Невозможно рассчитать размер чанка: channels=%s bytes_per_sample=%s",
+                channels,
+                bytes_per_sample,
+            )
+            return []
+
+        if len(pcm) <= _PLAYBACK_MAX_PCM_BYTES:
+            return [pcm]
+
+        chunks: list[bytes] = []
+        offset = 0
+        pcm_len = len(pcm)
+        while offset < pcm_len:
+            end = offset + max_samples * bytes_per_sample
+            chunks.append(pcm[offset:end])
+            offset = end
+
+        self.log.info(
+            "PCM разбит на несколько кадров для отправки роботу",
+            extra={
+                "attrs": {
+                    "total_bytes": pcm_len,
+                    "chunks": len(chunks),
+                    "max_pcm_bytes": _PLAYBACK_MAX_PCM_BYTES,
+                    "channels": channels,
+                }
+            },
+        )
+
+        return chunks
+
+    def _prepare_playback_payload(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        channels: int,
+        volume: float,
+        sequence: int,
+    ) -> tuple[bytes, dict] | None:
+        """Готовит бинарный пакет ``AP`` и возвращает полезные метрики.
+
+        Возвращаем словарь со статистикой, чтобы логи TTS и фоновых эффектов
+        содержали одинаковые поля: длительность, пики и RMS.  В случае ошибки
+        (например, некорректного числа каналов) метод возвращает ``None`` и
+        соответствующий вызов прерывается.
+        """
+
         samples = array("h")
         samples.frombytes(pcm)
         total_samples = len(samples)
@@ -365,7 +450,6 @@ class RobotAudioStream:
         )
         peak = max((abs(val) for val in samples), default=0) / 32768.0
 
-        sequence = self._next_playback_sequence()
         timestamp_us = int(time.time() * 1_000_000) & 0xFFFFFFFF
 
         header = _PLAYBACK_HEADER_STRUCT.pack(
@@ -420,6 +504,75 @@ class RobotAudioStream:
 
         self._loop.call_soon_threadsafe(_enqueue)
 
+    def _send_playback_stream(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        *,
+        volume: float,
+        channels: int,
+        purpose: str,
+        meta: dict,
+    ) -> None:
+        """Общий цикл отправки TTS/эффектов с нарезкой крупных чанков."""
+
+        normalized = self._normalize_pcm_for_playback(pcm, sample_rate, channels)
+        if normalized is None:
+            self.log.warning(
+                "Отправка %s прервана из-за некорректного PCM", purpose
+            )
+            return
+        pcm, channels = normalized
+
+        chunks = self._split_pcm_chunks(pcm, channels)
+        if not chunks:
+            self.log.warning(
+                "Не удалось подготовить чанки для %s", purpose,
+                extra={"attrs": {"channels": channels, "pcm_bytes": len(pcm)}},
+            )
+            return
+
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            sequence = self._next_playback_sequence()
+            prepared = self._prepare_playback_payload(
+                chunk,
+                sample_rate,
+                channels=channels,
+                volume=volume,
+                sequence=sequence,
+            )
+            if prepared is None:
+                continue
+            payload, stats = prepared
+            if len(chunk) > _PLAYBACK_MAX_PCM_BYTES:
+                self.log.warning(
+                    "Сформирован слишком большой чанк после деления",
+                    extra={
+                        "attrs": {
+                            "size": len(chunk),
+                            "max_pcm_bytes": _PLAYBACK_MAX_PCM_BYTES,
+                            "purpose": purpose,
+                        }
+                    },
+                )
+            self._broadcast_payload(payload, purpose=purpose)
+
+            self.log.debug(
+                "Готов и отправлен аудиокадр",
+                extra={
+                    "attrs": {
+                        "purpose": purpose,
+                        "chunk_index": chunk_index,
+                        "chunks_total": meta.get("chunks_total", 1),
+                        "split_chunks_total": len(chunks),
+                        "sequence": sequence,
+                        "volume": round(volume, 3),
+                        **stats,
+                        **meta,
+                    }
+                },
+            )
+
     def send_tts(
         self,
         pcm: bytes,
@@ -438,30 +591,19 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
+        meta = {
+            "text": text,
+            "preset": preset,
+            "chunk_index": chunk_index,
+            "chunks_total": chunks_total,
+        }
+        self._send_playback_stream(
             pcm,
             sample_rate,
-            channels=channels,
             volume=volume,
-        )
-        if prepared is None:
-            return
-        payload, stats = prepared
-
-        self._broadcast_payload(payload, purpose="TTS")
-
-        self.log.debug(
-            "Сформирован TTS-кадр",
-            extra={
-                "attrs": {
-                    "text": text,
-                    "preset": preset,
-                    "chunk_index": chunk_index,
-                    "chunks_total": chunks_total,
-                    "volume": round(volume, 3),
-                    **stats,
-                }
-            },
+            channels=channels,
+            purpose="TTS",
+            meta=meta,
         )
 
     def send_effect(
@@ -482,31 +624,20 @@ class RobotAudioStream:
             self.log.warning("Event loop сервера ещё не готов, эффект не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
+        meta = {
+            "effect": name,
+            "file": source_file,
+            "repeat_index": repeat_index,
+            "repeat_total": repeat_total,
+        }
+        purpose = f"эффекта {name}"
+        self._send_playback_stream(
             pcm,
             sample_rate,
-            channels=channels,
             volume=volume,
-        )
-        if prepared is None:
-            return
-        payload, stats = prepared
-
-        purpose = f"эффекта {name}"
-        self._broadcast_payload(payload, purpose=purpose)
-
-        self.log.debug(
-            "Сформирован аудиокадр фонового эффекта",
-            extra={
-                "attrs": {
-                    "effect": name,
-                    "file": source_file,
-                    "repeat_index": repeat_index,
-                    "repeat_total": repeat_total,
-                    "volume": round(volume, 3),
-                    **stats,
-                }
-            },
+            channels=channels,
+            purpose=purpose,
+            meta=meta,
         )
 
     def forward_tts_chunk(
