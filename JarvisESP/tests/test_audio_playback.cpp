@@ -139,6 +139,41 @@ void test_handle_requires_init() {
   assert(stats.lastError == "not-initialized");
 }
 
+void test_build_i2s_from_mono() {
+  AudioPlayback::reset_stats();
+  AudioPlayback::Frame frame{};
+  frame.channels = 1;
+  frame.bitsPerSample = 16;
+  frame.volume = 1.0f;
+  frame.samples = {1000, -1000, 500};
+
+  const auto stereo = AudioPlayback::build_i2s_stereo_frame(frame);
+  assert(stereo.size() == 6);
+  assert(stereo[0] == 1000 && stereo[1] == 1000);
+  assert(stereo[2] == -1000 && stereo[3] == -1000);
+  assert(stereo[4] == 500 && stereo[5] == 500);
+
+  const auto stats = AudioPlayback::stats();
+  assert(stats.lastVolume > 0.99f && stats.lastVolume < 1.01f);
+}
+
+void test_build_i2s_from_stereo_with_volume() {
+  AudioPlayback::reset_stats();
+  AudioPlayback::Frame frame{};
+  frame.channels = 2;
+  frame.bitsPerSample = 16;
+  frame.volume = 0.5f;
+  frame.samples = {1000, -1000, 2000, -2000};
+
+  const auto stereo = AudioPlayback::build_i2s_stereo_frame(frame);
+  assert(stereo.size() == 4);
+  assert(stereo[0] == 500 && stereo[1] == -500);
+  assert(stereo[2] == 1000 && stereo[3] == -1000);
+
+  const auto stats = AudioPlayback::stats();
+  assert(stats.lastVolume > 0.49f && stats.lastVolume < 0.51f);
+}
+
 } // namespace
 
 int main() {
@@ -148,6 +183,8 @@ int main() {
   test_decode_server_frame_rejects_magic();
   test_handle_frame_updates_stats();
   test_handle_requires_init();
+  test_build_i2s_from_mono();
+  test_build_i2s_from_stereo_with_volume();
   return 0;
 }
 
