@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import sys
 import types
+import wave
+from pathlib import Path
 
+import pytest
 import numpy as np
 
 
@@ -29,7 +32,7 @@ class _StubPiper(types.ModuleType):
 
     class PiperVoice:  # type: ignore[too-few-public-methods]
         def __init__(self) -> None:
-            self.config = types.SimpleNamespace(sample_rate=16000)
+            self.config = types.SimpleNamespace(sample_rate=44100)
 
         @classmethod
         def load(cls, *_args, **_kwargs):  # type: ignore[no-untyped-def]
@@ -91,7 +94,7 @@ def test_local_playback_enabled_triggers_sounddevice(monkeypatch) -> None:
     working_tts.set_local_playback_enabled(True)
 
     audio = np.zeros(8, dtype=np.float32)
-    working_tts._perform_playback(audio, 16000, 0.0)
+    working_tts._perform_playback(audio, 44100, 0.0)
 
     assert dummy.play_calls, "ожидали вызов sounddevice.play при включённом флаге"
     assert dummy.stop_calls == 1, "ожидали остановку воспроизведения"
@@ -113,7 +116,52 @@ def test_local_playback_disabled_skips_sounddevice(monkeypatch) -> None:
     working_tts.set_local_playback_enabled(False)
 
     audio = np.zeros(8, dtype=np.float32)
-    working_tts._perform_playback(audio, 16000, 0.0)
+    working_tts._perform_playback(audio, 44100, 0.0)
 
     # Отсутствие исключений означает, что ``sounddevice`` не вызывался.
     working_tts.set_local_playback_enabled(True)
+
+
+def test_resample_for_stream_downsamples_to_16k() -> None:
+    """Ресемплинг TTS до 16 кГц уменьшает объём кадров и выставляет целевую частоту."""
+
+    # Формируем простой линейный сигнал, чтобы audioop корректно его пересчитал.
+    pcm_src = np.arange(0, 20, dtype=np.int16).tobytes()
+    out_pcm, out_rate = working_tts._resample_for_stream(pcm_src, 44100, working_tts.STREAM_SAMPLE_RATE)
+
+    in_frames = len(pcm_src) // 2
+    out_frames = len(out_pcm) // 2
+    expected_frames = int(round(in_frames * working_tts.STREAM_SAMPLE_RATE / 44100))
+
+    assert out_rate == working_tts.STREAM_SAMPLE_RATE, "Частота должна быть приведена к 16 кГц"
+    # Разрешаем погрешность в 1 кадр из-за округления внутри audioop.
+    assert out_frames in {expected_frames, max(1, expected_frames - 1), expected_frames + 1}
+
+
+def test_resample_for_stream_passthrough_same_rate() -> None:
+    """Если частоты совпадают, PCM передаётся как есть без лишних искажений."""
+
+    pcm_src = b"\x01\x00\x02\x00\x03\x00\x04\x00"
+    out_pcm, out_rate = working_tts._resample_for_stream(pcm_src, working_tts.STREAM_SAMPLE_RATE, working_tts.STREAM_SAMPLE_RATE)
+
+    assert out_rate == working_tts.STREAM_SAMPLE_RATE
+    assert out_pcm == pcm_src
+
+
+def test_save_wav_resamples_to_stream_rate(tmp_path: Path) -> None:
+    """WAV, сохранённый для отладки, конвертируется в 16 кГц PCM16 LE."""
+
+    src_rate = 22050
+    pcm_src = np.arange(0, 1000, dtype=np.int16)
+    wav_path = tmp_path / "tts.wav"
+
+    working_tts._save_wav(str(wav_path), pcm_src, sample_rate=src_rate)
+
+    with wave.open(str(wav_path), "rb") as wf:
+        assert wf.getframerate() == working_tts.STREAM_SAMPLE_RATE
+        assert wf.getnchannels() == 1
+        frames = wf.readframes(wf.getnframes())
+
+    expected_frames = int(round(pcm_src.size * working_tts.STREAM_SAMPLE_RATE / src_rate))
+    assert wf.getnframes() in {expected_frames, max(1, expected_frames - 1), expected_frames + 1}
+    assert len(frames) > 0, "Ресемплированный WAV не должен быть пустым"

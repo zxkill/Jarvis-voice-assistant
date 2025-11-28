@@ -20,7 +20,7 @@ from typing import Any
 # Импортируем аудиопоток робота на уровне модуля, чтобы не получать NameError
 # при раннем запуске ``start_robot_audio_stream`` до ленивых импортов внутри
 # ``main``. Это гарантирует наличие класса в глобальной области видимости.
-from audio.robot_stream import RobotAudioStream, RobotStreamClosed
+from audio.robot_stream import RobotAudioStream, RobotStreamClosed, _resample_pcm
 
 from display import DisplayItem, init_driver, DisplayDriver
 from core.logging_json import TRACE_ID, configure_logging, new_trace_id
@@ -188,16 +188,22 @@ async def start_robot_audio_stream(
     robot_auth = cfg.get("ROBOT_AUDIO", "authorization", fallback="").strip() or None
     ping_interval = cfg.getfloat("ROBOT_AUDIO", "ping_interval", fallback=10.0)
     ping_timeout = cfg.getfloat("ROBOT_AUDIO", "ping_timeout", fallback=5.0)
+    # По умолчанию используем лимит 8192 байта: этого хватает на 60 мс PCM16/44.1 кГц
+    # для XiaoZhi, и кадры не обрезаются, устраняя треск на MAX98357A.
+    max_playback_payload = cfg.getint("ROBOT_AUDIO", "max_playback_payload", fallback=8192)
+    playback_queue_max = cfg.getint("ROBOT_AUDIO", "playback_queue_max", fallback=200)
 
     audio_stream = RobotAudioStream(
         endpoint=robot_audio_endpoint,
         queue_max=cfg.getint("AUDIO", "queue_max", fallback=200),
-        expected_sample_rate=cfg.getint("AUDIO", "sample_rate", fallback=16000),
+        expected_sample_rate=cfg.getint("AUDIO", "sample_rate", fallback=44100),
         expected_channels=2,
         subprotocol=robot_subprotocol,
         authorization=robot_auth,
         ping_interval=ping_interval,
         ping_timeout=ping_timeout,
+        max_playback_payload=max_playback_payload,
+        playback_queue_max=playback_queue_max,
     )
 
     try:
@@ -220,6 +226,53 @@ async def start_robot_audio_stream(
         return None
 
     return audio_stream
+
+
+def _prepare_pcm_for_stt(
+    raw_pcm: bytes,
+    source_sample_rate: int,
+    stt_sample_rate: int,
+    stt_log: logging.Logger,
+) -> tuple[bytes, int]:
+    """Приводит входящий кадр к частоте распознавания речи.
+
+    Возвращает итоговый PCM и количество сэмплов после нормализации. Вся
+    переработка сопровождается подробными логами на русском языке, чтобы
+    оперативно понять причину нераспознавания (частота кадра, глубина, объём).
+    """
+
+    pcm = raw_pcm
+    if source_sample_rate != stt_sample_rate:
+        stt_log.info(
+            "Ресемплирую входящий кадр под частоту Vosk",
+            extra={
+                "attrs": {
+                    "from_rate": source_sample_rate,
+                    "to_rate": stt_sample_rate,
+                    "pcm_bytes_before": len(pcm),
+                }
+            },
+        )
+        pcm = _resample_pcm(
+            pcm,
+            from_rate=source_sample_rate,
+            to_rate=stt_sample_rate,
+            channels=1,
+            sample_bits=16,
+        )
+        stt_log.info(
+            "Ресемплирование завершено",
+            extra={
+                "attrs": {
+                    "from_rate": source_sample_rate,
+                    "to_rate": stt_sample_rate,
+                    "pcm_bytes_after": len(pcm),
+                }
+            },
+        )
+
+    samples = len(pcm) // 2
+    return pcm, samples
 
 async def main() -> None:
     """Инициализация и основной цикл ассистента."""
@@ -380,9 +433,19 @@ async def main() -> None:
         )
 
     # 2. Распознавание речи (Vosk)
-    expected_sample_rate = cfg.getint("AUDIO", "sample_rate", fallback=16000)
+    expected_sample_rate = cfg.getint("AUDIO", "sample_rate", fallback=44100)
+    stt_sample_rate = cfg.getint("AUDIO", "stt_sample_rate", fallback=16000)
+    log.info(
+        "Инициализирую распознавание речи",
+        extra={
+            "attrs": {
+                "vosk_sample_rate": stt_sample_rate,
+                "robot_sample_rate": expected_sample_rate,
+            }
+        },
+    )
     model = vosk.Model('models/model_small')
-    kaldi = vosk.KaldiRecognizer(model, expected_sample_rate)
+    kaldi = vosk.KaldiRecognizer(model, stt_sample_rate)
 
     working_tts.set_local_playback_enabled(
         cfg.getboolean("ROBOT_AUDIO", "local_playback", fallback=False)
@@ -478,23 +541,42 @@ async def main() -> None:
             log.error("Аудиопоток робота завершён, останавливаю распознавание")
             break
 
-        pcm = frame.pcm_mono
+        pcm, stt_samples = _prepare_pcm_for_stt(
+            frame.pcm_mono,
+            source_sample_rate=frame.sample_rate,
+            stt_sample_rate=stt_sample_rate,
+            stt_log=log,
+        )
+
+        frame_duration = (
+            frame.frame_samples / frame.sample_rate if frame.sample_rate > 0 else 0.0
+        )
+        # Переводим длительность кадра в количество сэмплов под частоту Vosk.
+        stt_frame_samples = (
+            int(round(frame_duration * stt_sample_rate)) if frame_duration > 0 else stt_samples
+        )
+        if stt_frame_samples <= 0:
+            stt_frame_samples = max(1, stt_samples)
+
         if buffer_limit_frames is None:
             buffer_limit_frames = max(
                 1,
-                int(round(1.5 * frame.sample_rate / frame.frame_samples)),
+                int(round(1.5 * stt_sample_rate / stt_frame_samples)),
             )
             new_buffer: deque[bytes] = deque(maxlen=buffer_limit_frames)
             new_buffer.extend(pcm_buffer)
             pcm_buffer = new_buffer
-            buffer_seconds = buffer_limit_frames * frame.frame_samples / frame.sample_rate
+            buffer_seconds = buffer_limit_frames * stt_frame_samples / stt_sample_rate
             log.info(
                 "Размер кольцевого буфера настроен",
                 extra={
                     "attrs": {
                         "frames": buffer_limit_frames,
                         "seconds": round(buffer_seconds, 3),
-                        "frame_samples": frame.frame_samples,
+                        "frame_samples": stt_frame_samples,
+                        "source_frame_samples": frame.frame_samples,
+                        "source_rate": frame.sample_rate,
+                        "stt_rate": stt_sample_rate,
                     }
                 },
             )
@@ -506,6 +588,7 @@ async def main() -> None:
                     "sequence": frame.sequence,
                     "timestamp_us": frame.timestamp_us,
                     "buffer": len(pcm_buffer),
+                    "stt_rate": stt_sample_rate,
                 }
             },
         )

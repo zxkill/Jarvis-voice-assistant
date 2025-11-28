@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array as _array
+import audioop
 import inspect
 import os
 import re
@@ -57,6 +58,46 @@ def register_stream_listener(listener: Callable[..., None]) -> None:
         if listener not in _STREAM_LISTENERS:
             _STREAM_LISTENERS.append(listener)
     log.info("Добавлен слушатель потоковой озвучки: %s", listener)
+
+
+def _resample_for_stream(pcm: bytes, from_rate: int, to_rate: int) -> tuple[bytes, int]:
+    """Приводит PCM16 LE к нужной частоте перед отправкой роботу.
+
+    Используем ``audioop.ratecv`` из стандартной библиотеки — он лёгкий, не требует
+    внешних зависимостей и даёт достаточно качественный результат для речи. Если
+    ресемплинг невозможен, возвращаем исходные данные, чтобы не рвать поток.
+    """
+
+    if to_rate <= 0 or from_rate <= 0 or not pcm:
+        log.warning(
+            "Пропускаю ресемплинг: некорректные параметры",
+            extra={"attrs": {"from_rate": from_rate, "to_rate": to_rate, "pcm_bytes": len(pcm)}},
+        )
+        return pcm, from_rate
+
+    if from_rate == to_rate:
+        return pcm, from_rate
+
+    try:
+        resampled, _state = audioop.ratecv(pcm, 2, 1, from_rate, to_rate, None)
+        log.debug(
+            "PCM приведён к частоте робота",
+            extra={
+                "attrs": {
+                    "from_rate": from_rate,
+                    "to_rate": to_rate,
+                    "bytes_before": len(pcm),
+                    "bytes_after": len(resampled),
+                }
+            },
+        )
+        return resampled, to_rate
+    except Exception:
+        log.exception(
+            "Ошибка ресемплинга PCM перед отправкой роботу",
+            extra={"attrs": {"from_rate": from_rate, "to_rate": to_rate, "pcm_bytes": len(pcm)}},
+        )
+        return pcm, from_rate
 
 
 def unregister_stream_listener(listener: Callable[..., None]) -> None:
@@ -138,6 +179,9 @@ VOICE_ID: str = "ru_RU-ruslan-medium"  # "ru-RU-irina-medium"  # default voice I
 SEARCH_DIRS: List[str] = ["./models/piper"]
 # Максимальный размер чанка текста для озвучивания
 MAX_CHARS: int = 180
+# Частота, в которую приводим поток для робота (XiaoZhi/ESP32 ожидает 16 кГц моно)
+# Чтобы избежать треска из-за несовпадения форматов, TTS всегда отдаём в 16 кГц.
+STREAM_SAMPLE_RATE: int = 16_000
 # Пауза в секундах, добавляемая в конец каждого чанка, чтобы не обрезать фразу
 TAIL_PAD_SEC: float = 0.3
 # Преднастроенные "эмоции"/тона (громкость, скорость, пауза)
@@ -317,14 +361,61 @@ def stop_speaking() -> None:
     except Exception:
         pass
 
-def _save_wav(path: str, pcm_i16: np.ndarray) -> None:
-    """Пишет mono-PCM-16 bit в .wav (для отладки)."""
+def _save_wav(path: str, pcm_i16: np.ndarray, *, sample_rate: int = SAMPLE_RATE) -> None:
+    """Сохраняет WAV-файл в формате, ожидаемом роботом (PCM16 LE, 16 кГц моно).
+
+    Даже если Piper возвращает звук в 22.05/44.1 кГц, перед записью мы приводим
+    его к ``STREAM_SAMPLE_RATE``. Это избавляет от путаницы при диагностике
+    (скриншоты, метаданные) и гарантирует, что файл можно отправить роботу без
+    повторного ресемплинга. При ошибке ресемплинга пишем исходный сигнал, чтобы
+    не терять данные, но фиксируем проблему в логах для последующей отладки.
+    """
+
+    if pcm_i16.size == 0:
+        log.warning("WAV-debug: пустой PCM, файл %s не записан", path)
+        return
+
+    pcm_for_wav = pcm_i16
+    target_rate = sample_rate
+
+    # Приводим звук к 16 кГц перед записью, чтобы формат файла совпадал с XiaoZhi.
+    if sample_rate != STREAM_SAMPLE_RATE:
+        try:
+            resampled_bytes, target_rate = _resample_for_stream(
+                pcm_i16.tobytes(), sample_rate, STREAM_SAMPLE_RATE
+            )
+            pcm_for_wav = np.frombuffer(resampled_bytes, dtype=np.int16)
+            log.debug(
+                "WAV-debug: ресемплирую PCM перед записью",
+                extra={
+                    "attrs": {
+                        "from_rate": sample_rate,
+                        "to_rate": target_rate,
+                        "frames_before": pcm_i16.size,
+                        "frames_after": pcm_for_wav.size,
+                        "path": path,
+                    }
+                },
+            )
+        except Exception:
+            log.exception(
+                "WAV-debug: не удалось привести WAV к целевой частоте",
+                extra={"attrs": {"from_rate": sample_rate, "to_rate": STREAM_SAMPLE_RATE}},
+            )
+            target_rate = sample_rate
+
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)              # 16-bit
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(pcm_i16.tobytes())
-    log.info("WAV-debug: saved %s (%.2f s)", path, pcm_i16.size / SAMPLE_RATE)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(target_rate)
+        wf.writeframes(pcm_for_wav.tobytes())
+
+    log.info(
+        "WAV-debug: saved %s (%.2f s @ %d Hz)",
+        path,
+        pcm_for_wav.size / max(1, target_rate),
+        target_rate,
+    )
 
 
 def working_tts(
@@ -423,7 +514,11 @@ def working_tts(
             tail = np.zeros(int(SAMPLE_RATE * pause), np.int16)
             pcm_i16_pad = np.concatenate([pcm_i16, tail])
             cache_file.parent.mkdir(parents=True, exist_ok=True)
-            _save_wav(str(cache_file), pcm_i16_pad)
+            _save_wav(
+                str(cache_file),
+                pcm_i16_pad,
+                sample_rate=SAMPLE_RATE,
+            )
             log.debug("Чанк %d сохранён в кэш %s", i, cache_file)
 
         # Применяем изменение высоты голоса согласно коэффициенту ``pitch``
@@ -435,9 +530,14 @@ def working_tts(
 
         playback_rate = max(1, int(SAMPLE_RATE * speed))
         pcm_bytes = np.clip(audio_f32 * 32767.0, -32768, 32767).astype(np.int16)
+
+        # Перед отправкой роботу приводим звук к 16 кГц моно, чтобы совпадать с hello XiaoZhi.
+        stream_pcm, stream_rate = _resample_for_stream(
+            pcm_bytes.tobytes(), playback_rate, STREAM_SAMPLE_RATE
+        )
         _notify_stream_listeners(
-            pcm_bytes.tobytes(),
-            playback_rate,
+            stream_pcm,
+            stream_rate,
             text=chunk,
             preset=emotion or preset,
             chunk_index=i,
@@ -464,7 +564,7 @@ def working_tts(
 
     full_audio = np.concatenate(playback_parts) if playback_parts else np.zeros(0, np.int16)
     if save_wav:
-        _save_wav(save_wav, full_audio)
+        _save_wav(save_wav, full_audio, sample_rate=SAMPLE_RATE)
     total_duration = full_audio.size / (SAMPLE_RATE * speed) if speed else 0.0
     log.info("Озвучивание завершено: длительность %.2f с", total_duration)
     is_playing = False

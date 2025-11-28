@@ -1,5 +1,7 @@
 """Проверяем, что глобальный таймер предотвращает повтор дыхания."""
 
+import numpy as np
+
 import emotion.sounds as sounds
 
 
@@ -18,7 +20,9 @@ def test_global_idle_breath_cooldown(monkeypatch):  # type: ignore[no-untyped-de
 
     dummy_sd = DummySD()
     monkeypatch.setattr(sounds, "sd", dummy_sd)
-    monkeypatch.setattr(sounds, "_read_wav", lambda path: (0.0, 44100))
+    monkeypatch.setattr(
+        sounds, "_read_wav", lambda path: (np.array([0.0], dtype=np.float32), 44100, 1)
+    )
 
     # Отключаем фоновый таймер, чтобы тест был детерминированным
     class SilentTimer:

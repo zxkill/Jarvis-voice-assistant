@@ -56,7 +56,7 @@ std::vector<uint8_t> build_playback_frame(uint32_t sequence,
 
 void test_decode_server_frame_success() {
   AudioPlayback::Config cfg{};
-  cfg.defaultSampleRate = 16000;
+  cfg.defaultSampleRate = 44100;
   assert(AudioPlayback::init(cfg));
 
   const auto raw = build_playback_frame(5, 123456, 22050, 2, 4, 0.75f);
@@ -75,7 +75,7 @@ void test_decode_server_frame_success() {
 
 void test_init_primes_silence() {
   AudioPlayback::Config cfg{};
-  cfg.defaultSampleRate = 16000;
+  cfg.defaultSampleRate = 44100;
   cfg.frameSamplesHint = 256;
   assert(AudioPlayback::init(cfg));
   const auto stats = AudioPlayback::stats();
@@ -86,8 +86,23 @@ void test_init_primes_silence() {
   AudioPlayback::shutdown();
 }
 
+void test_init_max98357a_mode() {
+  AudioPlayback::Config cfg{};
+  cfg.mode = AudioPlayback::OutputMode::Max98357aI2S; // Проверяем, что внешний усилитель тоже корректно инициализируется.
+  cfg.defaultSampleRate = 22050;
+  cfg.pinBclk = 26;
+  cfg.pinLrc = 27;
+  cfg.pinDin = 25;
+
+  assert(AudioPlayback::init(cfg));
+  const auto stats = AudioPlayback::stats();
+  assert(stats.initialized);
+  assert(stats.lastError.empty());
+  AudioPlayback::shutdown();
+}
+
 void test_decode_server_frame_rejects_magic() {
-  const auto raw = build_playback_frame(1, 0, 16000, 1, 2, 1.0f);
+  const auto raw = build_playback_frame(1, 0, 44100, 1, 2, 1.0f);
   std::vector<uint8_t> broken = raw;
   broken[0] = 'X';
   AudioPlayback::Frame frame{};
@@ -98,18 +113,18 @@ void test_decode_server_frame_rejects_magic() {
 
 void test_handle_frame_updates_stats() {
   AudioPlayback::Config cfg{};
-  cfg.defaultSampleRate = 16000;
+  cfg.defaultSampleRate = 44100;
   cfg.queueCapacity = 3;
   assert(AudioPlayback::init(cfg));
   AudioPlayback::reset_stats();
 
-  const auto raw = build_playback_frame(7, 42, 16000, 2, 8, 1.0f);
+  const auto raw = build_playback_frame(7, 42, 44100, 2, 8, 1.0f);
   assert(AudioPlayback::handle_server_frame(raw.data(), raw.size()));
   const auto stats = AudioPlayback::stats();
   assert(stats.framesAccepted == 1);
   assert(stats.queueDepth == 1);
   assert(stats.lastSequence == 7);
-  assert(stats.lastSampleRate == 16000);
+  assert(stats.lastSampleRate == 44100);
   assert(stats.lastVolume > 0.99f && stats.lastVolume < 1.01f);
   AudioPlayback::shutdown();
 }
@@ -117,11 +132,46 @@ void test_handle_frame_updates_stats() {
 void test_handle_requires_init() {
   AudioPlayback::shutdown();
   AudioPlayback::reset_stats();
-  const auto raw = build_playback_frame(1, 0, 16000, 1, 2, 1.0f);
+  const auto raw = build_playback_frame(1, 0, 44100, 1, 2, 1.0f);
   assert(!AudioPlayback::handle_server_frame(raw.data(), raw.size()));
   const auto stats = AudioPlayback::stats();
   assert(stats.framesRejected == 1);
   assert(stats.lastError == "not-initialized");
+}
+
+void test_build_i2s_from_mono() {
+  AudioPlayback::reset_stats();
+  AudioPlayback::Frame frame{};
+  frame.channels = 1;
+  frame.bitsPerSample = 16;
+  frame.volume = 1.0f;
+  frame.samples = {1000, -1000, 500};
+
+  const auto stereo = AudioPlayback::build_i2s_stereo_frame(frame);
+  assert(stereo.size() == 6);
+  assert(stereo[0] == 1000 && stereo[1] == 1000);
+  assert(stereo[2] == -1000 && stereo[3] == -1000);
+  assert(stereo[4] == 500 && stereo[5] == 500);
+
+  const auto stats = AudioPlayback::stats();
+  assert(stats.lastVolume > 0.99f && stats.lastVolume < 1.01f);
+}
+
+void test_build_i2s_from_stereo_with_volume() {
+  AudioPlayback::reset_stats();
+  AudioPlayback::Frame frame{};
+  frame.channels = 2;
+  frame.bitsPerSample = 16;
+  frame.volume = 0.5f;
+  frame.samples = {1000, -1000, 2000, -2000};
+
+  const auto stereo = AudioPlayback::build_i2s_stereo_frame(frame);
+  assert(stereo.size() == 4);
+  assert(stereo[0] == 500 && stereo[1] == -500);
+  assert(stereo[2] == 1000 && stereo[3] == -1000);
+
+  const auto stats = AudioPlayback::stats();
+  assert(stats.lastVolume > 0.49f && stats.lastVolume < 0.51f);
 }
 
 } // namespace
@@ -129,9 +179,12 @@ void test_handle_requires_init() {
 int main() {
   test_decode_server_frame_success();
   test_init_primes_silence();
+  test_init_max98357a_mode();
   test_decode_server_frame_rejects_magic();
   test_handle_frame_updates_stats();
   test_handle_requires_init();
+  test_build_i2s_from_mono();
+  test_build_i2s_from_stereo_with_volume();
   return 0;
 }
 

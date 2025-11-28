@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <sstream>
 
 #include "audio_capture.h"
 
@@ -79,6 +80,12 @@ struct AudioStreamConfig {
   uint32_t handshakeTimeoutMs = 5000;   ///< Максимальная длительность рукопожатия перед попыткой переподключения.
   uint32_t reconnectIntervalMs = 3000;  ///< Интервал между автоматическими переподключениями, мс.
   uint32_t pingIntervalMs = 15000;      ///< Частота отправки ping для поддержания соединения, мс.
+  bool xiaoZhiCompat = true;            ///< Включает проводной протокол XiaoZhi (hello + BinaryProtocol2/3).
+  uint16_t xiaoZhiVersion = 3;          ///< Версия бинарного протокола XiaoZhi (2 или 3).
+  uint16_t xiaoZhiFrameDurationMs = 60; ///< Длительность кадра, используемая в hello.
+  uint32_t xiaoZhiSampleRate = 16000;   ///< Частота дискретизации для приветствия и расчёта размеров кадра (совпадает с микрофоном).
+  uint16_t xiaoZhiChannels = 1;         ///< Количество каналов (xiaozhi использует моно).
+  std::string xiaoZhiFormat = "opus";   ///< Кодек, объявляемый в hello (opus или pcm16 для отладки).
 };
 
 /**
@@ -124,9 +131,13 @@ struct TelemetryStreamStats {
 };
 
 #ifndef ARDUINO
-std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
+std::vector<uint8_t> build_audio_stream_frame(const AudioStreamConfig& cfg,
+                                              const Audio::PcmChunk& chunk,
                                               const Audio::Diagnostics& diag,
-                                              uint32_t sequence);
+                                              uint32_t sequence,
+                                              uint16_t serverFrameDurationMs,
+                                              uint32_t serverSampleRate,
+                                              uint16_t serverChannels);
 #endif
 
 namespace detail {
@@ -137,6 +148,29 @@ namespace detail {
  * \return true, если elapsedMs строго больше timeoutMs и следует перезапустить соединение.
  */
 bool handshake_timeout_elapsed(uint32_t timeoutMs, uint32_t elapsedMs);
+
+/**
+ * \brief Возвращает человеко-читаемое описание причины недоступности WebSocket.
+ *
+ * Логика вынесена в заголовок и не зависит от Arduino, чтобы её можно было тестировать
+ * на хосте. В строку добавляется статус Wi‑Fi, наличие конфигурации, факт подключения,
+ * число переподключений, последняя ошибка и тайминги рукопожатия.
+ */
+inline std::string describe_ws_offline_reason(const AudioStreamConfig& cfg,
+                                              const AudioStreamStats& stats,
+                                              bool wifiConnected,
+                                              uint32_t handshakeTimeoutMs,
+                                              uint32_t elapsedMs) {
+  std::ostringstream ss;
+  ss << "wifi=" << (wifiConnected ? "up" : "down")
+     << " cfg=" << (cfg.endpoint.empty() ? "none" : "ok")
+     << " ws=" << (stats.wsConnected ? "on" : "off")
+     << " reconns=" << stats.wsReconnects
+     << " lastErr=" << (stats.lastError.empty() ? "-" : stats.lastError)
+     << " timeoutMs=" << handshakeTimeoutMs
+     << " elapsedMs=" << elapsedMs;
+  return ss.str();
+}
 
 /**
  * \brief Формирует человеко-читаемое описание статуса аудиопотока.

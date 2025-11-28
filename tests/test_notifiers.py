@@ -2,6 +2,8 @@ import asyncio
 import contextlib
 import importlib
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -144,12 +146,8 @@ def test_voice_send_processes_queue(monkeypatch):
         monkeypatch.setattr(voice, "set_metric", lambda name, value: None)
 
         # reset queue and worker state
+        voice.stop()
         voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
 
         voice.send('{"reply": "test"}')
         assert voice._worker_task is not None
@@ -157,11 +155,7 @@ def test_voice_send_processes_queue(monkeypatch):
         await asyncio.wait_for(voice._queue.join(), timeout=1)
         assert spoken == ["test"]
 
-        # cancel worker task to clean up
-        voice._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await voice._worker_task
-        voice._worker_task = None
+        voice.stop()
 
     asyncio.run(run_test())
     sys.modules.pop("working_tts", None)
@@ -192,25 +186,59 @@ def test_voice_no_telegram_when_listener_active(monkeypatch):
             SimpleNamespace(is_active=lambda: True, USER_ID=123),
         )
 
+        voice.stop()
         voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
 
         voice.send("hi")
         await asyncio.wait_for(voice._queue.join(), timeout=1)
 
-        voice._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await voice._worker_task
-        voice._worker_task = None
+        voice.stop()
 
     asyncio.run(run_test())
 
     assert sent == []
     assert metrics == []
+    sys.modules.pop("working_tts", None)
+
+
+def test_voice_start_without_event_loop(monkeypatch):
+    """Вызов send() из стороннего потока создаёт собственный event loop."""
+
+    voice = _load_voice(monkeypatch)
+    spoken: list[str] = []
+
+    async def fake_speak_async(text, **kwargs):
+        spoken.append(text)
+
+    monkeypatch.setattr(voice, "speak_async", fake_speak_async)
+    monkeypatch.setattr(voice, "set_metric", lambda *_, **__: None)
+    monkeypatch.setattr(voice, "inc_metric", lambda *_, **__: None)
+
+    # Полностью сбрасываем состояние очереди и воркера перед запуском.
+    voice.stop()
+    voice._queue = asyncio.Queue()
+
+    finished = threading.Event()
+
+    def _producer() -> None:
+        voice.send("thread hello")
+        finished.set()
+
+    thread = threading.Thread(target=_producer, name="voice-test-producer")
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert finished.is_set()
+
+    # Ждём, пока фоновый loop заберёт задание и вызовет speak_async.
+    for _ in range(50):
+        if spoken:
+            break
+        time.sleep(0.02)
+
+    assert spoken == ["thread hello"]
+
+    voice.stop()
     sys.modules.pop("working_tts", None)
 
 
@@ -239,20 +267,13 @@ def test_voice_not_send_when_listener_inactive(monkeypatch):
             SimpleNamespace(is_active=lambda: False, USER_ID=123),
         )
 
+        voice.stop()
         voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
 
         voice.send("hi")
         await asyncio.wait_for(voice._queue.join(), timeout=1)
 
-        voice._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await voice._worker_task
-        voice._worker_task = None
+        voice.stop()
 
     asyncio.run(run_test())
 
@@ -295,22 +316,15 @@ def test_voice_logs_warning_on_telegram_error(monkeypatch):
             SimpleNamespace(is_active=lambda: True, USER_ID=123),
         )
 
+        voice.stop()
         voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
 
         token = set_request_source("telegram")
         voice.send("hi")
         await asyncio.wait_for(voice._queue.join(), timeout=1)
         reset_request_source(token)
 
-        voice._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await voice._worker_task
-        voice._worker_task = None
+        voice.stop()
 
     asyncio.run(run_test())
 
@@ -343,22 +357,15 @@ def test_voice_skips_tts_for_telegram_source(monkeypatch):
             SimpleNamespace(is_active=lambda: True, USER_ID=123),
         )
 
+        voice.stop()
         voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
 
         token = set_request_source("telegram")
         voice.send("hi")
         await asyncio.wait_for(voice._queue.join(), timeout=1)
         reset_request_source(token)
 
-        voice._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await voice._worker_task
-        voice._worker_task = None
+        voice.stop()
 
     asyncio.run(run_test())
 
@@ -390,22 +397,15 @@ def test_voice_forwards_reply_json_to_telegram(monkeypatch):
             SimpleNamespace(is_active=lambda: True, USER_ID=123),
         )
 
+        voice.stop()
         voice._queue = asyncio.Queue()
-        if voice._worker_task is not None:
-            voice._worker_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await voice._worker_task
-            voice._worker_task = None
 
         token = set_request_source("telegram")
         voice.send('{"reply": "привет"}')
         await asyncio.wait_for(voice._queue.join(), timeout=1)
         reset_request_source(token)
 
-        voice._worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await voice._worker_task
-        voice._worker_task = None
+        voice.stop()
 
     asyncio.run(run_test())
 
