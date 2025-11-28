@@ -86,6 +86,20 @@ void test_init_primes_silence() {
   AudioPlayback::shutdown();
 }
 
+void test_external_i2s_mode_primes_silence() {
+  AudioPlayback::Config cfg{};
+  cfg.mode = AudioPlayback::OutputMode::ExternalI2S;
+  cfg.defaultSampleRate = 44100;
+  cfg.frameSamplesHint = 512;
+  assert(AudioPlayback::init(cfg));
+  const auto stats = AudioPlayback::stats();
+  // Внешний усилитель тоже должен получать тишину в DMA и оставаться готовым к первому кадру TTS.
+  assert(stats.initialized);
+  assert(stats.silencePrimed == 1);
+  assert(!stats.muted);
+  AudioPlayback::shutdown();
+}
+
 void test_decode_server_frame_rejects_magic() {
   const auto raw = build_playback_frame(1, 0, 16000, 1, 2, 1.0f);
   std::vector<uint8_t> broken = raw;
@@ -94,6 +108,17 @@ void test_decode_server_frame_rejects_magic() {
   std::string error;
   assert(!AudioPlayback::decode_server_frame(broken.data(), broken.size(), frame, error));
   assert(error == "bad-magic");
+}
+
+void test_decode_rejects_too_many_channels() {
+  auto raw = build_playback_frame(3, 0, 16000, 1, 2, 1.0f);
+  // Портим поле channels на заведомо неподдерживаемое значение, чтобы проверить отказоустойчивость приёмника.
+  raw[16] = 3; // channels low byte
+  raw[17] = 0; // channels high byte
+  AudioPlayback::Frame frame{};
+  std::string error;
+  assert(!AudioPlayback::decode_server_frame(raw.data(), raw.size(), frame, error));
+  assert(error == "bad-channels");
 }
 
 void test_handle_frame_updates_stats() {
@@ -129,7 +154,9 @@ void test_handle_requires_init() {
 int main() {
   test_decode_server_frame_success();
   test_init_primes_silence();
+  test_external_i2s_mode_primes_silence();
   test_decode_server_frame_rejects_magic();
+  test_decode_rejects_too_many_channels();
   test_handle_frame_updates_stats();
   test_handle_requires_init();
   return 0;

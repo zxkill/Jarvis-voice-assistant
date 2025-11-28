@@ -230,13 +230,17 @@ void setup() {
   }
 
   AudioPlayback::Config playbackCfg{};
-  playbackCfg.mode = AudioPlayback::OutputMode::InternalDac; // Используем встроенный моно ЦАП на GPIO25 (I2S0).
+  // Переключаемся на внешний I2S-усилитель MAX98357A: вывод стерео на DIN=GPIO25, BCLK=GPIO26, LRCK=GPIO27.
+  playbackCfg.mode = AudioPlayback::OutputMode::ExternalI2S;
+  playbackCfg.pinBclk = 26; // BCLK (Bit Clock)
+  playbackCfg.pinLrc = 27;  // LRCK/WS (Left-Right Clock)
+  playbackCfg.pinDout = 25; // DIN (Data In)
   playbackCfg.defaultSampleRate = audioCfg.sampleRate;
   playbackCfg.frameSamplesHint = audioCfg.frameSamples;
   playbackCfg.queueCapacity = 6;
   playbackCfg.defaultVolume = 1.0f;
   if (AudioPlayback::init(playbackCfg)) {
-    Serial.println("[PLAYBACK] ЦАП готов воспроизводить команды сервера через LM386");
+    Serial.println("[PLAYBACK] I2S-усилитель MAX98357A готов принимать TTS от сервера");
   } else {
     Serial.println("[PLAYBACK] ошибка: не удалось запустить тракт воспроизведения");
   }
