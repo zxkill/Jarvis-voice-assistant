@@ -16,7 +16,7 @@ namespace XiaoZhi {
 struct HelloConfig {
   uint16_t version = 3;          ///< Версия бинарного протокола (2 или 3).
   std::string format = "opus";   ///< Кодек аудио на линии (обычно opus, для отладки можно pcm16).
-  uint32_t sampleRate = 44100;   ///< Частота дискретизации, Гц.
+  uint32_t sampleRate = 16000;   ///< Частота дискретизации, Гц (микрофонный поток идёт на 16 кГц).
   uint16_t channels = 1;         ///< Количество каналов (xiaozhi использует моно).
   uint16_t frameDurationMs = 60; ///< Длительность кадра, мс.
 };

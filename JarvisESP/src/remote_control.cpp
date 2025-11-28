@@ -116,7 +116,7 @@ namespace {
   unsigned long gLastHelloLogMs = 0;             ///< Таймер логирования отправленного hello.
 
   // --- Служебные поля для совместимости с протоколом XiaoZhi ---
-uint32_t gXiaoZhiServerSampleRate = 44100; ///< Частота, которую прислал сервер в hello.
+uint32_t gXiaoZhiServerSampleRate = 16000; ///< Частота, которую прислал сервер в hello (по умолчанию 16 кГц как у микрофона).
   uint16_t gXiaoZhiServerChannels = 1;       ///< Каналы сервера из приветствия.
   uint16_t gXiaoZhiServerFrameDuration = 60; ///< Длительность кадра из приветствия.
   bool gXiaoZhiHelloAcknowledged = false;    ///< Получили ли ответ hello от сервера.

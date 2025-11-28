@@ -17,7 +17,7 @@ void test_build_hello_json_defaults() {
   assert(json.find("\"type\":\"hello\"") != std::string::npos);
   assert(json.find("\"version\":3") != std::string::npos);
   assert(json.find("\"format\":\"opus\"") != std::string::npos);
-  assert(json.find("\"sample_rate\":44100") != std::string::npos);
+  assert(json.find("\"sample_rate\":16000") != std::string::npos);
   assert(json.find("\"frame_duration\":60") != std::string::npos);
 }
 

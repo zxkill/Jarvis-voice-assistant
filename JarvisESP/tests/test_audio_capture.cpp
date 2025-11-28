@@ -6,7 +6,7 @@
 int main() {
   // --- Проверяем инициализацию без локальной локализации ---
   Audio::Config cfg{};
-  cfg.sampleRate = 44100;
+  cfg.sampleRate = 16000;
   cfg.frameSamples = 256;
   cfg.microphoneSpacingMeters = 0.15f;
   cfg.enableLocalization = false;

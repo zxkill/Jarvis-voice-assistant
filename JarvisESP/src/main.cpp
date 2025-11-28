@@ -217,7 +217,7 @@ void setup() {
   audioCfg.pinWs = PIN_I2S_WS;
   audioCfg.pinBclk = PIN_I2S_BCLK;
   audioCfg.pinData = PIN_I2S_SD;
-  audioCfg.sampleRate = 44100;
+  audioCfg.sampleRate = 16000; // Микрофоны всегда работали на 16 кГц для корректного STT
   audioCfg.frameSamples = 512;
   audioCfg.microphoneSpacingMeters = MIC_SPACING_M;
   audioCfg.enableLocalization = false; // Угол будет вычисляться на сервере, чтобы не нагружать ESP32.
@@ -231,7 +231,7 @@ void setup() {
 
   AudioPlayback::Config playbackCfg{};
   playbackCfg.mode = AudioPlayback::OutputMode::Max98357aI2S; // Переключаем вывод речи на внешний I2S-усилитель MAX98357A.
-  playbackCfg.defaultSampleRate = audioCfg.sampleRate;
+  playbackCfg.defaultSampleRate = 44100; // Выводим TTS/эмоции в 44.1 кГц, независим от входа
   playbackCfg.frameSamplesHint = audioCfg.frameSamples;
   playbackCfg.queueCapacity = 6;
   playbackCfg.defaultVolume = 1.0f;
