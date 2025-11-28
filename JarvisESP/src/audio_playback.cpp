@@ -489,7 +489,7 @@ bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std:
     error = "bad-version";
     return false;
   }
-  if (header.bitsPerSample != 16) {
+  if (header.bitsPerSample != 16 && header.bitsPerSample != 8) {
     error = "bad-bits";
     return false;
   }
@@ -504,7 +504,8 @@ bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std:
     return false;
   }
 
-  const size_t expectedBytes = static_cast<size_t>(header.frameSamples) * header.channels * sizeof(int16_t);
+  const size_t expectedBytes = static_cast<size_t>(header.frameSamples) * header.channels *
+                               (header.bitsPerSample / 8);
   if (expectedBytes != header.pcmBytes) {
     error = "bad-frameSamples";
     return false;
@@ -521,8 +522,21 @@ bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std:
   } else {
     out.volume = gConfig.defaultVolume;
   }
-  out.samples.resize(header.pcmBytes / sizeof(int16_t));
-  std::memcpy(out.samples.data(), payload + HEADER_SIZE, header.pcmBytes);
+
+  // Приводим входные сэмплы к знаковому 16-битному представлению, чтобы
+  // воспроизведение могло работать в едином формате (I2S/ЦАП).
+  const size_t totalSamples = static_cast<size_t>(header.frameSamples) * header.channels;
+  out.samples.resize(totalSamples);
+  if (header.bitsPerSample == 8) {
+    // PCM8 беззнаковый: сдвигаем на 0x80 и растягиваем до 16 бит, как в примере WAV.
+    for (size_t i = 0; i < totalSamples; ++i) {
+      const uint8_t raw = payload[HEADER_SIZE + i];
+      const int32_t centered = static_cast<int32_t>(raw) - 128;
+      out.samples[i] = static_cast<int16_t>(centered * 256);
+    }
+  } else {
+    std::memcpy(out.samples.data(), payload + HEADER_SIZE, header.pcmBytes);
+  }
   return true;
 }
 
@@ -744,6 +758,11 @@ bool handle_server_frame(const uint8_t* payload, size_t length) {
 
   bool accepted = false;
 #ifdef ARDUINO
+  if (frame.bitsPerSample == 8) {
+    Serial.printf("[PLAYBACK] принят PCM8, выполнена конверсия в PCM16 (seq=%u, bytes=%u)\n",
+                  static_cast<unsigned>(frame.sequence),
+                  static_cast<unsigned>(frame.samples.size() * sizeof(int16_t)));
+  }
   if (!ensure_queue_created()) {
     return false;
   }
