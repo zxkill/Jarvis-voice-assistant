@@ -269,17 +269,10 @@ bool is_output_muted() {
   return gOutputMuted;
 }
 
-void update_queue_depth_metric(size_t depth) {
-  lock_stats();
-  gStats.queueDepth = static_cast<uint32_t>(depth);
-  if (gStats.queueHighWatermark < gStats.queueDepth) {
-    gStats.queueHighWatermark = gStats.queueDepth;
-  }
-  unlock_stats();
-}
-
-
-std::vector<int16_t> build_i2s_stereo_frame(const Frame& frame) {
+std::vector<int16_t> build_i2s_stereo_frame_internal(const Frame& frame) {
+  // Подробная конвертация кадра в стерео-буфер для MAX98357A с дублированием моно-сигнала и
+  // усреднением многоканальных потоков. Внутренняя версия нужна, чтобы избежать конфликтов имени
+  // с публичной функцией из заголовка и при этом использовать служебные утилиты (lock_stats).
   std::vector<int16_t> out;
   if (frame.samples.empty()) {
     return out;
@@ -308,6 +301,7 @@ std::vector<int16_t> build_i2s_stereo_frame(const Frame& frame) {
     int32_t left = static_cast<int32_t>(frame.samples[base]);
     int32_t right = (channels > 1) ? static_cast<int32_t>(frame.samples[base + 1]) : left;
 
+    // Если каналов больше двух, усредняем, чтобы не потерять энергию сигнала и избежать искажений.
     if (channels > 2) {
       for (uint16_t ch = 2; ch < channels; ++ch) {
         const int32_t sample = static_cast<int32_t>(frame.samples[base + ch]);
@@ -330,6 +324,16 @@ std::vector<int16_t> build_i2s_stereo_frame(const Frame& frame) {
 
   return out;
 }
+
+void update_queue_depth_metric(size_t depth) {
+  lock_stats();
+  gStats.queueDepth = static_cast<uint32_t>(depth);
+  if (gStats.queueHighWatermark < gStats.queueDepth) {
+    gStats.queueHighWatermark = gStats.queueDepth;
+  }
+  unlock_stats();
+}
+
 
 #ifdef ARDUINO
 
@@ -488,7 +492,9 @@ void playback_task(void*) {
                       static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)));
       }
     } else {
-      std::vector<int16_t> stereo = build_i2s_stereo_frame(frame);
+      // Используем внутреннюю версию функции, чтобы избежать конфликтов имен с публичным API и
+      // иметь доступ к локации статистики внутри анонимного пространства имен.
+      std::vector<int16_t> stereo = build_i2s_stereo_frame_internal(frame);
       if (stereo.empty()) {
         lock_stats();
         gStats.bufferUnderruns++;
@@ -572,6 +578,12 @@ bool ensure_queue_created() {
 
 } // namespace
 
+std::vector<int16_t> build_i2s_stereo_frame(const Frame& frame) {
+  // Публичная обёртка над внутренней функцией: позволяет использовать подготовку стерео-буфера
+  // из тестов и внешнего кода, сохраняя основную логику в одном месте.
+  return build_i2s_stereo_frame_internal(frame);
+}
+
 bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std::string& error) {
   if (!payload || length < HEADER_SIZE) {
     error = "short-frame";
@@ -643,7 +655,8 @@ bool init(const Config& cfg) {
   if (is_dac_mode()) {
     // Для DAC оставляем моно и минимальные буферы, чтобы уменьшить задержку отклика.
     i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-    i2sConfig.communication_format = I2S_COMM_FORMAT_I2S_MSB;
+    // Используем актуальный формат без deprecated-флага, чтобы избавить сборку от предупреждений.
+    i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
     i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
     i2sConfig.dma_buf_count = 6;
     i2sConfig.dma_buf_len = cfg.frameSamplesHint == 0 ? 256 : cfg.frameSamplesHint;
