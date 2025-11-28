@@ -194,3 +194,79 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert pcm_bytes == pcm_len
     assert volume == pytest.approx(0.75)
     assert reserved == pytest.approx(0.0)
+
+
+def test_tts_chunks_are_split_when_too_large(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Крупные TTS-чанки должны дробиться, чтобы ESP32 не разрывал WebSocket."""
+
+    import audio.robot_stream as rs
+
+    # Принудительно уменьшаем лимит, чтобы проверить разбиение на части.
+    monkeypatch.setattr(rs, "_PLAYBACK_MAX_PCM_BYTES", 8)
+
+    async def _runner() -> list[bytes]:
+        stream = RobotAudioStream("ws://127.0.0.1:0/robot", queue_max=2)
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        # 12 сэмплов = 24 байта PCM16 → при лимите 8 байт должны получиться 3 кадра.
+        pcm = struct.pack("<" + "h" * 12, *range(12))
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot") as ws:
+            stream.send_tts(
+                pcm,
+                16_000,
+                text="split",
+                preset="neutral",
+                chunk_index=1,
+                chunks_total=1,
+                volume=0.9,
+            )
+            payloads = [await asyncio.wait_for(ws.recv(), timeout=1.0) for _ in range(3)]
+        return payloads
+
+    payloads = asyncio.run(_runner())
+    assert len(payloads) == 3
+
+    sequences = []
+    total_pcm = 0
+    for idx, payload in enumerate(payloads, start=1):
+        header = _PLAYBACK_HEADER.unpack_from(payload)
+        (
+            magic,
+            version,
+            flags,
+            sequence,
+            timestamp_us,
+            sample_rate,
+            channels,
+            sample_bits,
+            frame_samples,
+            pcm_bytes,
+            volume,
+            reserved,
+        ) = header
+
+        assert magic == b"AP"
+        assert version == 1
+        assert flags == 0
+        assert sample_rate == 16_000
+        assert channels == 1
+        assert sample_bits == 16
+        assert pcm_bytes <= 8
+        assert frame_samples == pcm_bytes // 2
+        sequences.append(sequence)
+        total_pcm += pcm_bytes
+
+        pcm_chunk = payload[_PLAYBACK_HEADER.size : _PLAYBACK_HEADER.size + pcm_bytes]
+        # Проверяем, что аудио не повреждено и объём соответствует заголовку.
+        assert len(pcm_chunk) == pcm_bytes
+        # Заголовок дополнительно хранит номер частичного чанка в логе, поэтому
+        # сами байты должны идти подряд без пропусков.
+        assert pcm_chunk == struct.pack("<" + "h" * (pcm_bytes // 2), *range((idx - 1) * 4, (idx - 1) * 4 + (pcm_bytes // 2)))
+
+    # Последовательности должны монотонно возрастать, сохраняя порядок кадров.
+    assert sequences == sorted(sequences)
+    # Суммарный объём равен исходным 24 байтам PCM.
+    assert total_pcm == 24
