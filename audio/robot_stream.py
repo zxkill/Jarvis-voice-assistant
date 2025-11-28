@@ -72,8 +72,17 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
+        send_queue_maxsize: int = 200,
     ) -> None:
-        """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
+        """Создаёт сервер, принимающий бинарные кадры PCM16 от робота.
+
+        ``send_queue_maxsize`` позволяет управлять глубиной очереди исходящих
+        кадров AP для всех подключённых роботов.  Увеличенный лимит помогает
+        избежать обрезания длинных эффектов (например, THINKING), которые после
+        безопасного дробления на чанки могут превышать десятки пакетов.  При
+        нулевом значении параметр по умолчанию приводится к 1, чтобы избежать
+        ошибок asyncio.Queue.
+        """
 
         self._parsed = urlparse(endpoint)
         if self._parsed.scheme not in {"ws", "wss"}:
@@ -97,6 +106,7 @@ class RobotAudioStream:
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
         self._send_queues: Set[asyncio.Queue[bytes]] = set()
+        self._send_queue_maxsize = max(1, send_queue_maxsize)
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         self.log = configure_logging("audio.robot_stream")
@@ -187,11 +197,25 @@ class RobotAudioStream:
                 self.log.warning("Отклоняю подключение: неверный Authorization")
                 await websocket.close(code=4403, reason="unauthorized")
                 return
-        self.log.info("Робот подключился", extra={"attrs": {"peer": peer}})
+        self.log.info(
+            "Робот подключился",
+            extra={
+                "attrs": {
+                    "peer": peer,
+                    "send_queue_maxsize": self._send_queue_maxsize,
+                }
+            },
+        )
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        # Отдельная очередь исходящих аудио-кадров для конкретного робота.
+        # Увеличенный лимит (по умолчанию 200) предотвращает ситуации, когда
+        # длинный THINKING-эффект дробится на десятки кадров и мгновенно
+        # переполняет буфер быстрее, чем WebSocket успевает их отправлять.
+        send_queue: asyncio.Queue[bytes] = asyncio.Queue(
+            maxsize=self._send_queue_maxsize
+        )
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )

@@ -144,6 +144,35 @@ def test_websocket_server_sends_tts_to_robot() -> None:
     assert reserved == pytest.approx(0.0)
 
 
+def test_send_queue_respects_custom_limit() -> None:
+    """Очередь исходящих кадров создаётся с заданной глубиной.
+
+    Это важно для длинных THINKING-эффектов: параметр `send_queue_maxsize`
+    должен позволять расширять буфер без перепрошивки робота и отключения
+    chunking на стороне сервера. Проверяем, что очередь берёт именно указанное
+    значение, а не жёстко прошитый лимит.
+    """
+
+    async def _runner() -> int:
+        stream = RobotAudioStream(
+            "ws://127.0.0.1:0/robot", queue_max=2, send_queue_maxsize=7
+        )
+        await stream.start()
+        assert stream._server is not None
+        port = stream._server.sockets[0].getsockname()[1]
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}/robot"):
+            # Достаточно лишь установить соединение, чтобы очередь создалась.
+            await asyncio.sleep(0.05)
+
+        # Берём созданную очередь и проверяем её максимально допустимый размер.
+        (queue,) = stream._send_queues
+        return queue.maxsize
+
+    maxsize = asyncio.run(_runner())
+    assert maxsize == 7
+
+
 def test_websocket_server_sends_effect_to_robot() -> None:
     """Эффекты эмоций тоже должны доходить до ESP32 через AP-заголовок."""
 
