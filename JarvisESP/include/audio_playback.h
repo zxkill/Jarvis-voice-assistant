@@ -12,13 +12,17 @@ namespace AudioPlayback {
  */
 enum class OutputMode : uint8_t {
   InternalDac = 0, ///< Использовать встроенный ЦАП ESP32 (моно канал DAC1 на GPIO25).
+  ExternalI2S = 1, ///< Использовать внешний I2S-усилитель (например, MAX98357A) через выводы BCLK/LRCLK/DIN.
 };
 
 /**
  * \brief Конфигурация приёмника аудиопотока от сервера.
  */
 struct Config {
-  OutputMode mode = OutputMode::InternalDac; ///< Каким способом выводить звук (по умолчанию — встроенный ЦАП на GPIO25).
+  OutputMode mode = OutputMode::ExternalI2S; ///< Каким способом выводить звук (по умолчанию — внешний I2S-усилитель).
+  int pinBclk = 26;                          ///< Пин I2S BCLK для внешнего усилителя (по умолчанию GPIO26 под MAX98357A).
+  int pinWs = 27;                            ///< Пин I2S LRCLK/WS (по умолчанию GPIO27 под MAX98357A).
+  int pinData = 25;                          ///< Пин I2S DIN (по умолчанию GPIO25 под MAX98357A).
   uint32_t defaultSampleRate = 16000;        ///< Частота дискретизации по умолчанию, Гц.
   size_t frameSamplesHint = 512;             ///< Оценка длины кадра для расчёта буферов.
   size_t queueCapacity = 6;                  ///< Максимальное количество кадров в очереди.

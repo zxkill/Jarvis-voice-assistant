@@ -24,6 +24,11 @@ constexpr int PIN_I2S_BCLK = 18; ///< Тактовая линия BCLK (SCK) д�
 constexpr int PIN_I2S_SD   = 19; ///< Линия данных микрофонов (SD) для I2S1 — перенесена с GPIO25, что исключает конфликт с DAC1 (GPIO25).
 constexpr float MIC_SPACING_M = 0.15f; ///< Расстояние между левым и правым микрофоном, м (15 см по макету).
 
+// ===== Воспроизведение через MAX98357A =====
+constexpr int PIN_SPKR_WS   = 27; ///< LRCLK (WS/LRC) внешнего I2S-усилителя MAX98357A.
+constexpr int PIN_SPKR_BCLK = 26; ///< BCLK (SCK) внешнего I2S-усилителя.
+constexpr int PIN_SPKR_DIN  = 25; ///< DIN (SD) внешнего I2S-усилителя.
+
 // ===== Потоковое аудио =====
 constexpr const char* AUDIO_STREAM_ENDPOINT = "ws://192.168.31.231:8765/"; ///< WebSocket-адрес приёмника аудио.
 constexpr const char* AUDIO_STREAM_AUTH     = "";                             ///< Заголовок авторизации, если нужен.
@@ -230,15 +235,18 @@ void setup() {
   }
 
   AudioPlayback::Config playbackCfg{};
-  playbackCfg.mode = AudioPlayback::OutputMode::InternalDac; // Используем встроенный моно ЦАП на GPIO25 (I2S0).
+  playbackCfg.mode = AudioPlayback::OutputMode::ExternalI2S; // Используем внешний I2S-усилитель MAX98357A.
+  playbackCfg.pinWs = PIN_SPKR_WS;
+  playbackCfg.pinBclk = PIN_SPKR_BCLK;
+  playbackCfg.pinData = PIN_SPKR_DIN;
   playbackCfg.defaultSampleRate = audioCfg.sampleRate;
   playbackCfg.frameSamplesHint = audioCfg.frameSamples;
   playbackCfg.queueCapacity = 6;
   playbackCfg.defaultVolume = 1.0f;
   if (AudioPlayback::init(playbackCfg)) {
-    Serial.println("[PLAYBACK] ЦАП готов воспроизводить команды сервера через LM386");
+    Serial.printf("[PLAYBACK] MAX98357A готов: WS=%d BCLK=%d DIN=%d\n", PIN_SPKR_WS, PIN_SPKR_BCLK, PIN_SPKR_DIN);
   } else {
-    Serial.println("[PLAYBACK] ошибка: не удалось запустить тракт воспроизведения");
+    Serial.println("[PLAYBACK] ошибка: не удалось запустить тракт воспроизведения на MAX98357A");
   }
 
   RemoteControl::AudioStreamConfig streamCfg{};
