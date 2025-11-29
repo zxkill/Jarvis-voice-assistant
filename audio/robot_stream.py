@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import math
@@ -73,6 +74,7 @@ class RobotAudioStream:
         authorization: str | None = None,
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
+        max_outgoing_frame: int = 4096,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
 
@@ -88,6 +90,12 @@ class RobotAudioStream:
         self._authorization = authorization
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
+        # Максимальный размер одного бинарного кадра при отправке TTS/эмоций.
+        # Если прислали крупный PCM-фрагмент, дробим его, чтобы не ловить
+        # ошибку 1009 (Message Too Big) на стороне клиента. Нижнюю границу
+        # оставляем равной 1 байту, чтобы тесты могли проверять дробление на
+        # малых буферах.
+        self._max_outgoing_frame = max(1, max_outgoing_frame)
         self._queue: asyncio.Queue[RobotAudioFrame | object] = asyncio.Queue(
             maxsize=max(1, queue_max)
         )
@@ -208,6 +216,9 @@ class RobotAudioStream:
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
+        heartbeat_task = asyncio.create_task(
+            self._ping_watchdog(websocket, peer)
+        )
         self._send_queues.add(send_queue)
         try:
             async for message in websocket:
@@ -225,6 +236,11 @@ class RobotAudioStream:
                 "Соединение закрыто с ошибкой",
                 extra={"attrs": {"peer": peer, "code": exc.code, "reason": exc.reason}},
             )
+            if exc.code == 1009:
+                self.log.error(
+                    "Робот закрыл соединение из-за слишком большого фрейма — дроблю PCM на части",
+                    extra={"attrs": {"peer": peer, "max_frame": self._max_outgoing_frame}},
+                )
         except Exception:
             self.log.exception("Ошибка при обработке аудиопотока робота")
         finally:
@@ -233,6 +249,9 @@ class RobotAudioStream:
             sender_task.cancel()
             self._send_queues.discard(send_queue)
             self.log.info("Соединение с роботом завершено", extra={"attrs": {"peer": peer}})
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
 
     def _handle_text_message(self, message: str, peer: str) -> None:
         """Обрабатывает управляющие JSON-сообщения от робота.
@@ -348,6 +367,52 @@ class RobotAudioStream:
                 "Ошибка отправки аудио роботу", extra={"attrs": {"peer": peer}}
             )
 
+    async def _ping_watchdog(
+        self, websocket: WebSocketServerProtocol, peer: str
+    ) -> None:
+        """Отправляет ping/pong, чтобы своевременно узнавать об обрывах."""
+
+        if not self._ping_interval or self._ping_interval <= 0:
+            return
+        try:
+            while True:
+                await asyncio.sleep(self._ping_interval)
+                if websocket.closed:
+                    return
+                try:
+                    # Отправляем ping и ждём pong не дольше таймаута.
+                    pong_waiter = websocket.ping()
+                    await asyncio.wait_for(
+                        pong_waiter,
+                        timeout=self._ping_timeout or self._ping_interval,
+                    )
+                    self.log.debug(
+                        "Пинг-понг с роботом успешен",
+                        extra={"attrs": {"peer": peer}},
+                    )
+                except asyncio.TimeoutError:
+                    self.log.warning(
+                        "Не получили pong от робота в отведённое время",
+                        extra={
+                            "attrs": {
+                                "peer": peer,
+                                "timeout": self._ping_timeout,
+                                "interval": self._ping_interval,
+                            }
+                        },
+                    )
+                    await websocket.close(code=4000, reason="ping timeout")
+                    return
+        except asyncio.CancelledError:
+            self.log.debug(
+                "Пинг-понг остановлен из-за завершения подключения",
+                extra={"attrs": {"peer": peer}},
+            )
+        except Exception:
+            self.log.exception(
+                "Сбой цикла ping/pong с роботом", extra={"attrs": {"peer": peer}}
+            )
+
     def _next_playback_sequence(self) -> int:
         """Возвращает следующий номер исходящего потока аудио."""
 
@@ -413,6 +478,15 @@ class RobotAudioStream:
                 queue.put_nowait(payload)
 
         self._loop.call_soon_threadsafe(_enqueue)
+
+    def _iter_chunked(self, payload: bytes) -> Iterable[bytes]:
+        """Дробит крупный PCM на безопасные куски для WebSocket-клиента."""
+
+        if not payload:
+            return []
+        size = self._max_outgoing_frame
+        # Используем генератор, чтобы не создавать лишних копий.
+        return (payload[idx : idx + size] for idx in range(0, len(payload), size))
 
     def _send_audio_start(
         self,
@@ -486,27 +560,31 @@ class RobotAudioStream:
                 channels=channels,
             )
 
-        self._broadcast_binary(pcm, purpose="tts_pcm")
-        duration_ms = (
-            len(pcm) / (2 * max(1, channels) * sample_rate) * 1000
-            if sample_rate > 0
-            else 0.0
-        )
-        self.log.debug(
-            "Отправлен TTS-чанк",
-            extra={
-                "attrs": {
-                    "audio_id": self._current_tts_id,
-                    "text": text,
-                    "preset": preset,
-                    "chunk_index": chunk_index,
-                    "chunks_total": chunks_total,
-                    "volume": round(volume, 3),
-                    "pcm_bytes": len(pcm),
-                    "duration_ms": round(duration_ms, 2),
-                }
-            },
-        )
+        # Дробим крупный PCM на фреймы, чтобы WebSocket-клиент ESP32 не рвал соединение с кодом 1009.
+        for piece_index, piece in enumerate(self._iter_chunked(pcm), start=1):
+            self._broadcast_binary(piece, purpose="tts_pcm")
+            duration_ms = (
+                len(piece) / (2 * max(1, channels) * sample_rate) * 1000
+                if sample_rate > 0
+                else 0.0
+            )
+            self.log.debug(
+                "Отправлен TTS-чанк",
+                extra={
+                    "attrs": {
+                        "audio_id": self._current_tts_id,
+                        "text": text,
+                        "preset": preset,
+                        "chunk_index": chunk_index,
+                        "chunks_total": chunks_total,
+                        "volume": round(volume, 3),
+                        "pcm_bytes": len(piece),
+                        "duration_ms": round(duration_ms, 2),
+                        "split_index": piece_index,
+                        "split_total": math.ceil(len(pcm) / self._max_outgoing_frame),
+                    }
+                },
+            )
 
         if chunk_index >= chunks_total and self._current_tts_id is not None:
             self._send_audio_end(self._current_tts_id)
@@ -549,21 +627,24 @@ class RobotAudioStream:
                 channels=channels,
             )
 
-        self._broadcast_binary(pcm, purpose="effect_pcm")
-        self.log.debug(
-            "Отправлен аудиочанк фонового эффекта",
-            extra={
-                "attrs": {
-                    "effect": name,
-                    "file": source_file,
-                    "repeat_index": repeat_index,
-                    "repeat_total": repeat_total,
-                    "pcm_bytes": len(pcm),
-                    "audio_id": self._current_effect_id,
-                    "volume": round(volume, 3),
-                }
-            },
-        )
+        for piece_index, piece in enumerate(self._iter_chunked(pcm), start=1):
+            self._broadcast_binary(piece, purpose="effect_pcm")
+            self.log.debug(
+                "Отправлен аудиочанк фонового эффекта",
+                extra={
+                    "attrs": {
+                        "effect": name,
+                        "file": source_file,
+                        "repeat_index": repeat_index,
+                        "repeat_total": repeat_total,
+                        "pcm_bytes": len(piece),
+                        "audio_id": self._current_effect_id,
+                        "volume": round(volume, 3),
+                        "split_index": piece_index,
+                        "split_total": math.ceil(len(pcm) / self._max_outgoing_frame),
+                    }
+                },
+            )
 
         if repeat_index >= repeat_total and self._current_effect_id is not None:
             self._send_audio_end(self._current_effect_id)

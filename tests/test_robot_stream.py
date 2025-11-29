@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import asyncio
 import json
+import math
 import struct
 
 import pytest
@@ -161,3 +163,53 @@ def test_websocket_server_sends_effect_to_robot() -> None:
     assert payload == struct.pack("<hhhh", 500, -500, 1000, -1000)
 
     assert json.loads(end_msg)["type"] == "audio_end"
+
+
+def test_chunking_does_not_exceed_frame_limit() -> None:
+    """Крупные PCM-буферы дробятся на безопасные кадры для ESP32."""
+
+    stream = RobotAudioStream(
+        "ws://127.0.0.1:8765/",
+        max_outgoing_frame=4,
+    )
+    # Притворяемся, что сервер запущен: переопределяем очередь отправки
+    # на простые накопители и выставляем loop, чтобы обходной путь не
+    # блокировался проверками на None.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    stream._loop = loop
+
+    sent_binary: list[bytes] = []
+    sent_json: list[dict] = []
+
+    def _fake_broadcast_binary(payload: bytes, *, purpose: str) -> None:
+        sent_binary.append(payload)
+
+    def _fake_broadcast_json(payload: dict, *, purpose: str) -> None:
+        sent_json.append(payload)
+
+    stream._broadcast_binary = _fake_broadcast_binary  # type: ignore[method-assign]
+    stream._broadcast_json = _fake_broadcast_json  # type: ignore[method-assign]
+
+    pcm = b"0123456789"  # 10 байт превратятся в 3 фрейма по 4,4,2
+    stream.send_tts(
+        pcm,
+        16_000,
+        text="chunk-test",
+        preset="neutral",
+        chunk_index=1,
+        chunks_total=1,
+        volume=1.0,
+    )
+
+    assert len(sent_json) == 2  # audio_start и audio_end
+    assert sent_json[0]["type"] == "audio_start"
+    assert sent_json[-1]["type"] == "audio_end"
+
+    assert [len(piece) for piece in sent_binary] == [4, 4, 2]
+    assert b"".join(sent_binary) == pcm
+    # Проверяем, что split_total в логах вычислился корректно.
+    assert math.ceil(len(pcm) / stream._max_outgoing_frame) == 3
+
+    loop.close()
+    asyncio.set_event_loop(None)
