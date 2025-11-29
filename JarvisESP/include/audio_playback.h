@@ -30,31 +30,28 @@ struct Config {
  * \brief Раскодированный кадр, полученный от сервера.
  */
 struct Frame {
-  uint32_t sequence = 0;       ///< Порядковый номер кадра, назначенный сервером.
-  uint32_t timestampUs = 0;    ///< Метка времени формирования кадра на сервере (микросекунды).
-  uint32_t sampleRate = 0;     ///< Частота дискретизации, Гц.
-  uint16_t channels = 0;       ///< Количество каналов (1 или 2).
-  uint16_t bitsPerSample = 0;  ///< Глубина сэмпла (поддерживается только 16 бит).
-  float volume = 1.0f;         ///< Нормированное усиление (1.0 = без изменений).
-  std::vector<int16_t> samples;///< Интерливированный PCM16 (L,R,L,R ...).
+  uint32_t sequence = 0;        ///< Порядковый номер чанка внутри текущей сессии.
+  uint32_t sampleRate = 0;      ///< Частота дискретизации, Гц.
+  uint16_t channels = 0;        ///< Количество каналов (1 или 2).
+  float volume = 1.0f;          ///< Нормированное усиление (1.0 = без изменений).
+  std::vector<int16_t> samples; ///< Интерливированный PCM16 (L,R,L,R ...).
 };
 
 /**
  * \brief Диагностика приёмника аудио.
  */
 struct Stats {
-  uint32_t framesAccepted = 0;     ///< Сколько кадров успешно поставлено в очередь.
-  uint32_t framesRejected = 0;     ///< Сколько кадров отброшено из-за ошибок формата.
-  uint32_t framesPlayed = 0;       ///< Сколько кадров полностью выведено на ЦАП.
-  uint32_t decodeErrors = 0;       ///< Количество ошибок разбора заголовка.
-  uint32_t queueDrops = 0;         ///< Сколько кадров потеряно из-за переполнения очереди.
-  uint32_t bufferUnderruns = 0;    ///< Сколько раз поток иссякал до окончания воспроизведения кадра.
+  uint32_t chunksAccepted = 0;     ///< Сколько бинарных чанков успешно поставлено в очередь воспроизведения.
+  uint32_t chunksRejected = 0;     ///< Сколько чанков отброшено из-за ошибок состояния или формата.
+  uint32_t chunksPlayed = 0;       ///< Сколько чанков реально дошло до ЦАП.
+  uint32_t queueDrops = 0;         ///< Сколько чанков потеряно из-за переполнения очереди.
+  uint32_t bufferUnderruns = 0;    ///< Сколько раз поток иссякал до окончания воспроизведения.
   uint32_t silencePrimed = 0;      ///< Сколько раз буфер ЦАП заполнялся «тишиной» для устранения фонового треска.
-  uint32_t lastSequence = 0;       ///< Последний принятый номер кадра.
+  uint32_t lastSequence = 0;       ///< Последний принятый номер чанка.
   uint32_t lastSampleRate = 0;     ///< Последняя частота дискретизации, применённая к ЦАП.
-  uint32_t queueDepth = 0;         ///< Текущая глубина очереди кадров.
+  uint32_t queueDepth = 0;         ///< Текущая глубина очереди.
   uint32_t queueHighWatermark = 0; ///< Максимальная глубина очереди со старта.
-  float lastVolume = 0.0f;         ///< Фактически применённая громкость последнего кадра.
+  float lastVolume = 0.0f;         ///< Фактически применённая громкость последнего чанка.
   bool initialized = false;        ///< Успешно ли инициализирован вывод звука.
   uint32_t idleTransitions = 0;    ///< Сколько раз тракт переходил в режим программного «мьюта».
   bool muted = false;              ///< Находится ли тракт сейчас в режиме тишины (I2S/DAC остановлены).
@@ -85,17 +82,11 @@ Stats stats();
  * \brief Обрабатывает бинарный кадр, полученный от сервера через WebSocket.
  * \return true, если кадр принят в очередь воспроизведения.
  */
-bool handle_server_frame(const uint8_t* payload, size_t length);
+bool start_stream(uint32_t sampleRate, uint8_t channels, float volume = 1.0f);
 
-/**
- * \brief Декодирует кадр без постановки в очередь (используется в тестах).
- * \param payload Указатель на начало бинарного сообщения от сервера.
- * \param length  Размер сообщения в байтах.
- * \param out     Структура, в которую будут записаны результаты разбора.
- * \param error   Текстовое описание ошибки формата (если функция вернула false).
- * \return true, если кадр успешно разобран.
- */
-bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std::string& error);
+bool feed_stream_chunk(const uint8_t* payload, size_t length);
+
+void stop_stream(const char* reason = nullptr);
 
 } // namespace AudioPlayback
 

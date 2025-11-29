@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <vector>
 
 #ifdef ARDUINO
 #include <Arduino.h>
@@ -16,49 +17,37 @@
 namespace AudioPlayback {
 namespace {
 
-constexpr char MAGIC[2] = {'A', 'P'}; ///< Сигнатура воспроизводимого кадра.
-constexpr uint8_t PROTOCOL_VERSION = 1; ///< Поддерживаемая версия протокола.
-constexpr size_t HEADER_SIZE = 36;      ///< Размер заголовка в байтах.
-constexpr uint32_t MIN_IDLE_DELAY_MS = 50; ///< Минимальная задержка, после которой включаем режим тишины.
+// --- Константы протокола и аппаратного вывода ---
+constexpr uint32_t MIN_IDLE_DELAY_MS = 50;                ///< Минимальная задержка тишины перед автоматическим mute.
 #ifdef ARDUINO
-constexpr i2s_port_t I2S_PORT = I2S_NUM_0;               ///< Встроенный ЦАП ESP32 доступен только на I2S0, поэтому закрепляем порт.
-constexpr size_t PLAYBACK_TASK_STACK_WORDS = 4096;       ///< Увеличенный стек из-за конвертаций и логов.
-constexpr UBaseType_t PLAYBACK_TASK_PRIORITY = 4;        ///< Приоритет выше телеметрии, чтобы не рвалась речь.
+constexpr i2s_port_t I2S_PORT = I2S_NUM_0;                ///< Встроенный ЦАП доступен только на I2S0.
+constexpr size_t PLAYBACK_TASK_STACK_WORDS = 4096;        ///< Увеличенный стек из-за конвертаций и логов.
+constexpr UBaseType_t PLAYBACK_TASK_PRIORITY = 4;         ///< Приоритет выше телеметрии, чтобы не рвалась речь.
 #endif
-
-#pragma pack(push, 1)
-struct PlaybackHeader {
-  char magic[2];
-  uint8_t version;
-  uint8_t flags;
-  uint32_t sequence;
-  uint32_t timestampUs;
-  uint32_t sampleRate;
-  uint16_t channels;
-  uint16_t bitsPerSample;
-  uint32_t frameSamples;
-  uint32_t pcmBytes;
-  float volume;
-  float reserved;
-};
-#pragma pack(pop)
-
-static_assert(sizeof(PlaybackHeader) == HEADER_SIZE, "Playback header size mismatch");
 
 struct PlaybackFrame {
   Frame frame;
 };
 
+struct StreamState {
+  bool active = false;       ///< Находится ли плеер в режиме приёма аудио от сервера.
+  uint32_t sampleRate = 16000; ///< Текущая частота дискретизации активной сессии.
+  uint8_t channels = 1;      ///< Количество каналов (сервер шлёт моно, но поле оставляем для совместимости).
+  float volume = 1.0f;       ///< Громкость, переданная в audio_start, с падением на значения по умолчанию.
+  uint32_t sequence = 0;     ///< Последний назначенный номер чанка.
+};
+
 Config gConfig{};
 Stats gStats{};
+StreamState gStream{};
 bool gInitialized = false;
-bool gOutputMuted = true; ///< Состояние тракта воспроизведения актуально и для тестовой сборки.
+bool gOutputMuted = true;
 
 #ifdef ARDUINO
 QueueHandle_t gQueue = nullptr;
 TaskHandle_t gTask = nullptr;
 portMUX_TYPE gStatsMux = portMUX_INITIALIZER_UNLOCKED;
-bool gDriverInstalled = false; ///< Флаг, позволяющий аккуратно выключать I2S только если драйвер реально поднят.
+bool gDriverInstalled = false; ///< Нужен, чтобы аккуратно выключать I2S только если он реально поднят.
 bool gIdleMuteEnabled = true;  ///< Признак, что перевод в тишину по таймауту включён конфигурацией.
 TickType_t gIdleTimeoutTicks = 0; ///< Сколько тиков ожидать до гашения тракта.
 TickType_t gQueuePollTicks = 0;   ///< Период опроса очереди, когда таймаут отключён.
@@ -204,9 +193,7 @@ bool unmute_output(const char*) { return true; }
 
 #endif
 
-bool is_output_muted() {
-  return gOutputMuted;
-}
+bool is_output_muted() { return gOutputMuted; }
 
 void update_queue_depth_metric(size_t depth) {
   lock_stats();
@@ -292,7 +279,7 @@ void playback_task(void*) {
     if (xQueueReceive(gQueue, &holder, waitTicks) != pdPASS) {
       update_queue_depth_metric(0);
       if (gIdleMuteEnabled) {
-        mute_output("таймаут ожидания аудиокадров", true);
+        mute_output("таймаут ожидания аудиочанков", true);
       }
       continue;
     }
@@ -302,9 +289,9 @@ void playback_task(void*) {
     }
 
     const Frame& frame = holder->frame;
-    if (!unmute_output("получен кадр")) {
+    if (!unmute_output("получен чанк")) {
       lock_stats();
-      gStats.framesRejected++;
+      gStats.chunksRejected++;
       gStats.lastError = "unmute-failed";
       unlock_stats();
       Serial.println(F("[PLAYBACK] ошибка: не удалось вывести тракт из mute"));
@@ -313,10 +300,9 @@ void playback_task(void*) {
       continue;
     }
 
-    const uint32_t sampleRate = frame.sampleRate ? frame.sampleRate : gConfig.defaultSampleRate;
-    if (!apply_sample_rate(sampleRate)) {
+    if (!apply_sample_rate(frame.sampleRate)) {
       lock_stats();
-      gStats.framesRejected++;
+      gStats.chunksRejected++;
       unlock_stats();
       delete holder;
       continue;
@@ -328,7 +314,7 @@ void playback_task(void*) {
       gStats.bufferUnderruns++;
       gStats.lastError = "empty-frame";
       unlock_stats();
-      Serial.printf("[PLAYBACK] предупреждение: кадр #%u пустой, пропущен\n", static_cast<unsigned>(frame.sequence));
+      Serial.printf("[PLAYBACK] предупреждение: чанк #%u пустой, пропущен\n", static_cast<unsigned>(frame.sequence));
       delete holder;
       continue;
     }
@@ -343,23 +329,23 @@ void playback_task(void*) {
     if (rc != ESP_OK || bytesWritten != bytesToWrite) {
       lock_stats();
       gStats.lastError = "i2s-write";
-      gStats.framesRejected++;
+      gStats.chunksRejected++;
       unlock_stats();
-      Serial.printf("[PLAYBACK] ошибка вывода кадра #%u: rc=%d bytes=%u/%u\n",
+      Serial.printf("[PLAYBACK] ошибка вывода чанка #%u: rc=%d bytes=%u/%u\n",
                     static_cast<unsigned>(frame.sequence),
                     rc,
                     static_cast<unsigned>(bytesWritten),
                     static_cast<unsigned>(bytesToWrite));
     } else {
       lock_stats();
-      gStats.framesPlayed++;
+      gStats.chunksPlayed++;
       gStats.lastSequence = frame.sequence;
       gStats.lastError.clear();
       unlock_stats();
-      Serial.printf("[PLAYBACK] кадр #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u)\n",
+      Serial.printf("[PLAYBACK] чанк #%u воспроизведён (%u сэмплов, %u Гц, очередь=%u)\n",
                     static_cast<unsigned>(frame.sequence),
                     static_cast<unsigned>(dacWords.size()),
-                    static_cast<unsigned>(sampleRate),
+                    static_cast<unsigned>(frame.sampleRate),
                     static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)));
     }
 
@@ -373,8 +359,7 @@ void playback_task(void*) {
 bool ensure_queue_created() {
 #ifdef ARDUINO
   if (!gQueue) {
-    gQueue = xQueueCreate(static_cast<UBaseType_t>(std::max<size_t>(gConfig.queueCapacity, 2)),
-                          sizeof(PlaybackFrame*));
+    gQueue = xQueueCreate(static_cast<UBaseType_t>(std::max<size_t>(gConfig.queueCapacity, 2)), sizeof(PlaybackFrame*));
     if (!gQueue) {
       lock_stats();
       gStats.lastError = "queue-create";
@@ -403,61 +388,52 @@ bool ensure_queue_created() {
   return true;
 }
 
-} // namespace
-
-bool decode_server_frame(const uint8_t* payload, size_t length, Frame& out, std::string& error) {
-  if (!payload || length < HEADER_SIZE) {
-    error = "short-frame";
-    return false;
+void clear_queue() {
+#ifdef ARDUINO
+  if (!gQueue) {
+    return;
   }
-
-  PlaybackHeader header{};
-  std::memcpy(&header, payload, sizeof(header));
-
-  if (std::memcmp(header.magic, MAGIC, sizeof(MAGIC)) != 0) {
-    error = "bad-magic";
-    return false;
+  PlaybackFrame* stale = nullptr;
+  while (xQueueReceive(gQueue, &stale, 0) == pdPASS) {
+    delete stale;
   }
-  if (header.version != PROTOCOL_VERSION) {
-    error = "bad-version";
-    return false;
-  }
-  if (header.bitsPerSample != 16) {
-    error = "bad-bits";
-    return false;
-  }
-  if (header.channels == 0 || header.channels > 2) {
-    error = "bad-channels";
-    return false;
-  }
-
-  const size_t payloadBytes = length - HEADER_SIZE;
-  if (payloadBytes != header.pcmBytes) {
-    error = "bad-size";
-    return false;
-  }
-
-  const size_t expectedBytes = static_cast<size_t>(header.frameSamples) * header.channels * sizeof(int16_t);
-  if (expectedBytes != header.pcmBytes) {
-    error = "bad-frameSamples";
-    return false;
-  }
-
-  out = Frame{};
-  out.sequence = header.sequence;
-  out.timestampUs = header.timestampUs;
-  out.sampleRate = header.sampleRate;
-  out.channels = header.channels;
-  out.bitsPerSample = header.bitsPerSample;
-  if (std::isfinite(header.volume) && header.volume > 0.0f) {
-    out.volume = header.volume;
-  } else {
-    out.volume = gConfig.defaultVolume;
-  }
-  out.samples.resize(header.pcmBytes / sizeof(int16_t));
-  std::memcpy(out.samples.data(), payload + HEADER_SIZE, header.pcmBytes);
-  return true;
+  xQueueReset(gQueue);
+  update_queue_depth_metric(0);
+#else
+  gPendingFrames.clear();
+  update_queue_depth_metric(0);
+#endif
 }
+
+Frame make_frame_from_pcm(const uint8_t* payload, size_t length) {
+  Frame frame{};
+  frame.sequence = ++gStream.sequence;
+  frame.sampleRate = gStream.sampleRate;
+  frame.channels = gStream.channels == 0 ? 1 : gStream.channels;
+  frame.volume = gStream.volume;
+
+  const size_t pcmSamples = length / sizeof(int16_t);
+  if (pcmSamples == 0) {
+    return frame;
+  }
+
+  // Сервер присылает моно-поток, но если channels == 2 — дублируем сэмплы на оба канала.
+  frame.samples.reserve(pcmSamples * frame.channels);
+  for (size_t i = 0; i < pcmSamples; ++i) {
+    int16_t sample = 0;
+    std::memcpy(&sample, payload + i * sizeof(int16_t), sizeof(int16_t));
+    if (frame.channels == 1) {
+      frame.samples.push_back(sample);
+    } else {
+      frame.samples.push_back(sample);
+      frame.samples.push_back(sample);
+    }
+  }
+
+  return frame;
+}
+
+} // namespace
 
 bool init(const Config& cfg) {
   shutdown();
@@ -509,7 +485,7 @@ bool init(const Config& cfg) {
 
   if (!ensure_queue_created()) {
     lock_stats();
-    gStats.framesRejected++;
+    gStats.chunksRejected++;
     unlock_stats();
     i2s_driver_uninstall(I2S_PORT);
     gDriverInstalled = false;
@@ -521,33 +497,22 @@ bool init(const Config& cfg) {
   Serial.printf("[PLAYBACK] I2S-ЦАП запущен: порт=%d, %u Гц, очередь=%u, канал=DAC1\n",
                 static_cast<int>(I2S_PORT),
                 static_cast<unsigned>(i2sConfig.sample_rate),
-                static_cast<unsigned>(cfg.queueCapacity));
-#else
-  (void)ensure_queue_created;
-#endif
-
-  gOutputMuted = false;
-  gInitialized = true;
-  reset_stats();
-  record_mute_state(false, false);
-
-#ifdef ARDUINO
-  if (!prime_dma_with_silence("инициализация")) {
-    Serial.println(F("[PLAYBACK] критическая ошибка: не удалось подготовить тишину в DMA"));
-    shutdown();
-    return false;
+                static_cast<unsigned>(gConfig.queueCapacity));
+  if (!prime_dma_with_silence("init")) {
+    Serial.println(F("[PLAYBACK] предупреждение: не удалось заполнить DMA тишиной при инициализации"));
   }
 #else
-  prime_dma_with_silence("init-stub");
+  (void)cfg;
+  ensure_queue_created();
+  prime_dma_with_silence("init-host");
 #endif
 
-#ifdef ARDUINO
-  mute_output("ожидание аудиопотока", true);
-#endif
-
+  gInitialized = true;
+  gOutputMuted = false;
+  record_mute_state(false, false);
   lock_stats();
   gStats.initialized = true;
-  gStats.lastError.clear();
+  gStats.lastSampleRate = gConfig.defaultSampleRate;
   unlock_stats();
   return true;
 }
@@ -573,8 +538,9 @@ void shutdown() {
     gDriverInstalled = false;
   }
   dac_output_disable(DAC_CHANNEL_1);
-  // DAC2 не использовался, но отключаем его явно, чтобы исключить паразитную утечку тока при повторных инициализациях.
   dac_output_disable(DAC_CHANNEL_2);
+#else
+  gPendingFrames.clear();
 #endif
   gOutputMuted = true;
   record_mute_state(true, false);
@@ -601,29 +567,65 @@ Stats stats() {
   return copy;
 }
 
-bool handle_server_frame(const uint8_t* payload, size_t length) {
-  Frame frame;
-  std::string error;
-  if (!decode_server_frame(payload, length, frame, error)) {
+bool start_stream(uint32_t sampleRate, uint8_t channels, float volume) {
+  if (!gInitialized) {
     lock_stats();
-    gStats.decodeErrors++;
-    gStats.framesRejected++;
-    gStats.lastError = error;
+    gStats.lastError = "not-initialized";
     unlock_stats();
-#ifdef ARDUINO
-    Serial.printf("[PLAYBACK] ошибка разбора кадра: %s\n", error.c_str());
-#endif
     return false;
   }
 
+  clear_queue();
+  gStream.sequence = 0;
+  gStream.sampleRate = sampleRate == 0 ? gConfig.defaultSampleRate : sampleRate;
+  gStream.channels = channels == 0 ? 1 : channels;
+  gStream.volume = (std::isfinite(volume) && volume > 0.0f) ? volume : gConfig.defaultVolume;
+  gStream.active = true;
+
+#ifdef ARDUINO
+  Serial.printf("[PLAYBACK] audio_start: %u Гц, каналов=%u, громкость=%.2f\n",
+                static_cast<unsigned>(gStream.sampleRate),
+                static_cast<unsigned>(gStream.channels),
+                gStream.volume);
+#endif
+
+  lock_stats();
+  gStats.lastSampleRate = gStream.sampleRate;
+  gStats.lastVolume = gStream.volume;
+  gStats.lastError.clear();
+  unlock_stats();
+  return true;
+}
+
+bool feed_stream_chunk(const uint8_t* payload, size_t length) {
   if (!gInitialized) {
     lock_stats();
-    gStats.framesRejected++;
+    gStats.chunksRejected++;
     gStats.lastError = "not-initialized";
     unlock_stats();
-#ifdef ARDUINO
-    Serial.println(F("[PLAYBACK] предупреждение: кадр получен до инициализации"));
-#endif
+    return false;
+  }
+  if (!gStream.active) {
+    lock_stats();
+    gStats.chunksRejected++;
+    gStats.lastError = "stream-inactive";
+    unlock_stats();
+    return false;
+  }
+  if (!payload || length < sizeof(int16_t)) {
+    lock_stats();
+    gStats.chunksRejected++;
+    gStats.lastError = "empty-payload";
+    unlock_stats();
+    return false;
+  }
+
+  Frame frame = make_frame_from_pcm(payload, length);
+  if (frame.samples.empty()) {
+    lock_stats();
+    gStats.chunksRejected++;
+    gStats.lastError = "empty-frame";
+    unlock_stats();
     return false;
   }
 
@@ -636,10 +638,10 @@ bool handle_server_frame(const uint8_t* payload, size_t length) {
   if (!holder) {
     lock_stats();
     gStats.queueDrops++;
-    gStats.framesRejected++;
+    gStats.chunksRejected++;
     gStats.lastError = "oom";
     unlock_stats();
-    Serial.println(F("[PLAYBACK] ошибка: недостаточно памяти для буфера кадра"));
+    Serial.println(F("[PLAYBACK] ошибка: недостаточно памяти для буфера чанка"));
     return false;
   }
   holder->frame = std::move(frame);
@@ -649,7 +651,7 @@ bool handle_server_frame(const uint8_t* payload, size_t length) {
     gStats.queueDrops++;
     gStats.lastError = "queue-full";
     unlock_stats();
-    Serial.println(F("[PLAYBACK] очередь переполнена, кадр отброшен"));
+    Serial.println(F("[PLAYBACK] очередь переполнена, чанк отброшен"));
   } else {
     accepted = true;
     update_queue_depth_metric(uxQueueMessagesWaiting(gQueue));
@@ -664,23 +666,33 @@ bool handle_server_frame(const uint8_t* payload, size_t length) {
 
   if (accepted) {
     lock_stats();
-    gStats.framesAccepted++;
-    gStats.lastSequence = frame.sequence;
-    gStats.lastSampleRate = frame.sampleRate ? frame.sampleRate : gConfig.defaultSampleRate;
-    gStats.lastVolume = frame.volume;
+    gStats.chunksAccepted++;
+    gStats.lastSequence = gStream.sequence;
+    gStats.lastSampleRate = gStream.sampleRate;
+    gStats.lastVolume = gStream.volume;
     gStats.lastError.clear();
     unlock_stats();
 #ifdef ARDUINO
-    Serial.printf("[PLAYBACK] принят кадр #%u (%u Гц, %u каналов, объём %.2f, очередь=%u)\n",
-                  static_cast<unsigned>(frame.sequence),
-                  static_cast<unsigned>(frame.sampleRate),
-                  static_cast<unsigned>(frame.channels),
-                  frame.volume,
+    Serial.printf("[PLAYBACK] принят чанк #%u (%u байт, %u Гц, очередь=%u)\n",
+                  static_cast<unsigned>(gStream.sequence),
+                  static_cast<unsigned>(length),
+                  static_cast<unsigned>(gStream.sampleRate),
                   static_cast<unsigned>(uxQueueMessagesWaiting(gQueue)));
 #endif
   }
 
   return accepted;
+}
+
+void stop_stream(const char* reason) {
+  gStream.active = false;
+  clear_queue();
+#ifdef ARDUINO
+  mute_output(reason ? reason : "audio_end", false);
+  Serial.printf("[PLAYBACK] audio_end: очередь очищена, причина=%s\n", reason ? reason : "нет");
+#else
+  (void)reason;
+#endif
 }
 
 } // namespace AudioPlayback

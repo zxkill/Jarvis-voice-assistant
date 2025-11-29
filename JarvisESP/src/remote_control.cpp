@@ -9,6 +9,7 @@
 #include <WebServer.h>
 #include <WebSocketsClient.h>
 #include <WebSocketsServer.h>
+#include <ArduinoJson.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -103,11 +104,14 @@ namespace {
   AudioStreamStats gAudioStreamStats{};   ///< Статистика отправленных/ошибочных кадров.
   TelemetryStreamStats gTelemetryStats{}; ///< Диагностика канала телеметрии для веб-интерфейса.
 
+  bool gMicPausedForPlayback = false;     ///< Флаг, что микрофон временно не отправляет данные во время TTS.
+
   bool gStatusDirty = true;               ///< Требуется ли отправить свежий JSON статуса по WebSocket.
   std::string gLastStatusJson;            ///< Кэш последнего JSON статуса для мгновенной выдачи новым подписчикам.
   unsigned long gLastTelemetryBroadcastMs = 0; ///< Время последней рассылки статуса по WebSocket.
   unsigned long gLastTelemetryLogMs = 0;        ///< Таймер периодического логирования состояния телеметрии.
   unsigned long gLastWsWaitLogMs = 0;            ///< Таймер логирования ожидания подключения WebSocket.
+  unsigned long gLastMicPauseLogMs = 0;           ///< Таймер логирования паузы микрофона во время воспроизведения.
 
 #ifdef ARDUINO
   constexpr size_t AUDIO_STREAM_QUEUE_DEPTH = 6;      ///< Глубина очереди фоновой отправки аудио.
@@ -224,6 +228,26 @@ namespace {
     unlock_stream_stats();
     // Отмечаем необходимость обновления статуса, чтобы клиенты мгновенно увидели глубину очереди.
     mark_status_dirty();
+#endif
+  }
+
+  void pause_mic_stream(const char* reason) {
+    if (gMicPausedForPlayback) {
+      return;
+    }
+    gMicPausedForPlayback = true;
+#ifdef ARDUINO
+    Serial.printf("[AUDIO] поток микрофона приостановлен: %s\n", reason ? reason : "не указано");
+#endif
+  }
+
+  void resume_mic_stream(const char* reason) {
+    if (!gMicPausedForPlayback) {
+      return;
+    }
+    gMicPausedForPlayback = false;
+#ifdef ARDUINO
+    Serial.printf("[AUDIO] поток микрофона возобновлён: %s\n", reason ? reason : "не указано");
 #endif
   }
 
@@ -640,17 +664,14 @@ function applyStatusPayload(data){
           playbackParts.push(`queue:${data.audioPlaybackQueueDepth}`);
         }
       }
-      if(typeof data.audioPlaybackFramesAccepted==='number'){
-        playbackParts.push(`in:${data.audioPlaybackFramesAccepted}`);
+      if(typeof data.audioPlaybackChunksAccepted==='number'){
+        playbackParts.push(`in:${data.audioPlaybackChunksAccepted}`);
       }
-      if(typeof data.audioPlaybackFramesPlayed==='number'){
-        playbackParts.push(`played:${data.audioPlaybackFramesPlayed}`);
+      if(typeof data.audioPlaybackChunksPlayed==='number'){
+        playbackParts.push(`played:${data.audioPlaybackChunksPlayed}`);
       }
-      if(typeof data.audioPlaybackFramesRejected==='number'&&data.audioPlaybackFramesRejected>0){
-        playbackParts.push(`rej:${data.audioPlaybackFramesRejected}`);
-      }
-      if(typeof data.audioPlaybackDecodeErrors==='number'&&data.audioPlaybackDecodeErrors>0){
-        playbackParts.push(`decode:${data.audioPlaybackDecodeErrors}`);
+      if(typeof data.audioPlaybackChunksRejected==='number'&&data.audioPlaybackChunksRejected>0){
+        playbackParts.push(`rej:${data.audioPlaybackChunksRejected}`);
       }
       if(typeof data.audioPlaybackDrops==='number'&&data.audioPlaybackDrops>0){
         playbackParts.push(`drop:${data.audioPlaybackDrops}`);
@@ -952,12 +973,11 @@ loadParams();
     }
     json += ']';
     const bool playbackReady = playbackStats.initialized &&
-                               (playbackStats.framesPlayed > 0 || playbackStats.framesAccepted > 0);
+                               (playbackStats.chunksPlayed > 0 || playbackStats.chunksAccepted > 0);
     json += F(",\"audioPlaybackReady\":"); json += playbackReady ? F("true") : F("false");
-    json += F(",\"audioPlaybackFramesAccepted\":"); json += String(static_cast<unsigned long>(playbackStats.framesAccepted));
-    json += F(",\"audioPlaybackFramesRejected\":"); json += String(static_cast<unsigned long>(playbackStats.framesRejected));
-    json += F(",\"audioPlaybackFramesPlayed\":"); json += String(static_cast<unsigned long>(playbackStats.framesPlayed));
-    json += F(",\"audioPlaybackDecodeErrors\":"); json += String(static_cast<unsigned long>(playbackStats.decodeErrors));
+    json += F(",\"audioPlaybackChunksAccepted\":"); json += String(static_cast<unsigned long>(playbackStats.chunksAccepted));
+    json += F(",\"audioPlaybackChunksRejected\":"); json += String(static_cast<unsigned long>(playbackStats.chunksRejected));
+    json += F(",\"audioPlaybackChunksPlayed\":"); json += String(static_cast<unsigned long>(playbackStats.chunksPlayed));
     json += F(",\"audioPlaybackQueueDepth\":"); json += String(static_cast<unsigned long>(playbackStats.queueDepth));
     json += F(",\"audioPlaybackQueueHigh\":"); json += String(static_cast<unsigned long>(playbackStats.queueHighWatermark));
     json += F(",\"audioPlaybackDrops\":"); json += String(static_cast<unsigned long>(playbackStats.queueDrops));
@@ -1664,17 +1684,51 @@ loadParams();
         mark_status_dirty();
         break;
       case WStype_BIN: {
-        const bool accepted = AudioPlayback::handle_server_frame(payload, length);
+        const bool accepted = AudioPlayback::feed_stream_chunk(payload, length);
         if (!accepted) {
-          Serial.println(F("[PLAYBACK] предупреждение: сервер прислал кадр, который не удалось воспроизвести"));
+          Serial.println(F("[PLAYBACK] предупреждение: сервер прислал PCM, который не удалось воспроизвести"));
         }
         break;
       }
       case WStype_TEXT:
         if (payload && length > 0) {
-          Serial.printf("[AUDIO] текстовое сообщение от сервера: %.*s\n",
-                        static_cast<int>(length),
-                        reinterpret_cast<const char*>(payload));
+#ifdef ARDUINO
+          DynamicJsonDocument doc(256);
+          const DeserializationError err = deserializeJson(doc, payload, length);
+          if (err) {
+            Serial.printf("[AUDIO] ошибка разбора JSON от сервера: %s\n", err.c_str());
+            break;
+          }
+          const char* msgType = doc["type"] | "";
+          if (strcmp(msgType, "audio_start") == 0) {
+            const uint32_t sr = doc["sample_rate"] | 16000;
+            const uint8_t ch = doc["channels"] | 1;
+            const float volume = doc["volume"] | 1.0f;
+            if (AudioPlayback::start_stream(sr, ch, volume)) {
+              pause_mic_stream("воспроизведение начато");
+            }
+          } else if (strcmp(msgType, "audio_end") == 0) {
+            AudioPlayback::stop_stream("audio_end");
+            resume_mic_stream("воспроизведение завершено");
+          } else if (strcmp(msgType, "emotion") == 0) {
+            const char* val = doc["value"] | "";
+            Serial.printf("[AUDIO] эмоция сервера: %s\n", val);
+          } else {
+            Serial.printf("[AUDIO] текстовое сообщение от сервера: %.*s\n",
+                          static_cast<int>(length),
+                          reinterpret_cast<const char*>(payload));
+          }
+#else
+          const std::string text(reinterpret_cast<const char*>(payload), length);
+          if (text.find("audio_start") != std::string::npos) {
+            AudioPlayback::start_stream(16000, 1, 1.0f);
+            pause_mic_stream("audio_start");
+          } else if (text.find("audio_end") != std::string::npos) {
+            AudioPlayback::stop_stream("audio_end");
+            resume_mic_stream("audio_end");
+          }
+          std::printf("[AUDIO] текстовое сообщение от сервера: %s\n", text.c_str());
+#endif
         }
         break;
       case WStype_PONG:
@@ -1951,6 +2005,16 @@ loadParams();
     // Основной поток не вызывает loop() клиента, чтобы исключить паузы в обработке HTTP/WebSocket-управления.
     update_queue_depth_metric();
     if (!stream_queue_has_capacity(now)) {
+      return;
+    }
+
+    if (gMicPausedForPlayback) {
+      if (now - gLastMicPauseLogMs > 1000UL) {
+#ifdef ARDUINO
+        Serial.println(F("[AUDIO] микрофон в паузе из-за проигрывания TTS"));
+#endif
+        gLastMicPauseLogMs = now;
+      }
       return;
     }
 

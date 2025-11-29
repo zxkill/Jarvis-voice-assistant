@@ -1,4 +1,11 @@
-"""Приём и отправка аудио роботу по WebSocket."""
+"""Приём и отправка аудио роботу по WebSocket.
+
+Новая версия протокола следует принципу разделения управляющих сообщений
+и бинарных PCM-чанков. Управление (``audio_start``/``audio_end``/``emotion``)
+передаётся в текстовых JSON-фреймах, а сами сэмплы приходят и отправляются
+как «сырой» байтовый поток без заголовков. Это упрощает прошивку ESP32 и
+исключает проблемы с несовместимыми бинарными структурами.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +17,7 @@ import struct
 import time
 from array import array
 from collections import deque
-from typing import Deque, Set
+from typing import Deque, Iterable, Set
 from urllib.parse import urlparse
 
 import websockets
@@ -19,14 +26,16 @@ from websockets.legacy.server import Serve, WebSocketServerProtocol, serve
 
 from core.logging_json import configure_logging
 
-_HEADER_STRUCT = struct.Struct("<2sBBIQIIHHIfffff")
-# Заголовок исходящих кадров TTS, описанный в прошивке ESP32.
-_PLAYBACK_HEADER_STRUCT = struct.Struct("<2sBBIIIHHIIff")
-
 
 @dataclasses.dataclass(slots=True)
 class RobotAudioFrame:
-    """Структура аудиокадра, который прислал робот."""
+    """Структура аудиокадра, который прислал робот.
+
+    Поля оставлены максимально совместимыми с предыдущей версией, чтобы
+    существующий пайплайн распознавания речи не пришлось переписывать. Там,
+    где новый протокол не передаёт информацию (например, о локализации),
+    заполняются безопасные значения по умолчанию.
+    """
 
     sequence: int
     timestamp_us: int
@@ -88,11 +97,23 @@ class RobotAudioStream:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
-        self._send_queues: Set[asyncio.Queue[bytes]] = set()
+        self._send_queues: Set[asyncio.Queue[object]] = set()
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
+        # Текущие параметры входящего аудио. Их можно обновлять управляющим
+        # сообщением ``mic_chunk``, чтобы сервер корректно интерпретировал
+        # бинарные PCM-чанки без заголовка.
+        self._incoming_sample_rate = expected_sample_rate
+        self._incoming_channels = expected_channels
+        self._incoming_format = "s16le"
+        self._incoming_sequence = 0
+        # Текущие идентификаторы исходящих потоков, чтобы отправлять
+        # ``audio_start``/``audio_end`` строго по границам синтезированных
+        # ответов и эффектов.
+        self._current_tts_id: str | None = None
+        self._current_effect_id: str | None = None
         self.log = configure_logging("audio.robot_stream")
-        # Счётчик исходящих кадров, общий для TTS и фоновых эффектов.
+        # Счётчик исходящих потоков, пригодный для генерации ``audio_id``.
         self._playback_sequence = 0
 
     async def start(self) -> None:
@@ -183,7 +204,7 @@ class RobotAudioStream:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        send_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=50)
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -191,41 +212,9 @@ class RobotAudioStream:
         try:
             async for message in websocket:
                 if isinstance(message, str):
-                    self.log.debug(
-                        "Текстовое сообщение от робота",
-                        extra={"attrs": {"text": message}},
-                    )
+                    self._handle_text_message(message, peer)
                     continue
-                if len(message) < _HEADER_STRUCT.size:
-                    self.log.warning(
-                        "Получен слишком короткий пакет",
-                        extra={"attrs": {"length": len(message)}},
-                    )
-                    continue
-                frame = self._decode_frame(message)
-                if frame is None:
-                    continue
-                if self._queue.full():
-                    dropped = self._queue.get_nowait()
-                    if isinstance(dropped, RobotAudioFrame):
-                        self.log.warning(
-                            "Буфер переполнен, удаляю кадр",
-                            extra={"attrs": {"sequence": dropped.sequence}},
-                        )
-                self._queue.put_nowait(frame)
-                self.log.debug(
-                    "Кадр добавлен в очередь",
-                    extra={
-                        "attrs": {
-                            "sequence": frame.sequence,
-                            "timestamp_us": frame.timestamp_us,
-                            "queue_size": self._queue.qsize(),
-                        }
-                    },
-                )
-                # Отправляем подтверждение, чтобы робот знал, что кадр успешно получен.
-                ack = json.dumps({"type": "ack", "sequence": frame.sequence})
-                await websocket.send(ack)
+                self._handle_binary_message(message)
         except asyncio.CancelledError:  # pragma: no cover - закрытие при остановке
             self.log.debug("Обработка робота отменена")
             raise
@@ -245,180 +234,221 @@ class RobotAudioStream:
             self._send_queues.discard(send_queue)
             self.log.info("Соединение с роботом завершено", extra={"attrs": {"peer": peer}})
 
+    def _handle_text_message(self, message: str, peer: str) -> None:
+        """Обрабатывает управляющие JSON-сообщения от робота.
+
+        Сейчас используется только для передачи метаданных микрофона, но
+        оставлено расширяемым, чтобы в будущем принимать командные события
+        (например, состояние батареи или телеметрию).
+        """
+
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            self.log.warning(
+                "Получен невалидный JSON от робота",
+                extra={"attrs": {"peer": peer, "text": message[:128]}},
+            )
+            return
+
+        msg_type = payload.get("type", "")
+        if msg_type == "mic_chunk":
+            # Робот сообщает параметры входящего PCM, чтобы сервер правильно
+            # трактовал бинарные кадры. Формат соответствует ТЗ: s16le 16 kHz.
+            self._incoming_sample_rate = int(
+                payload.get("sample_rate", self._incoming_sample_rate)
+            )
+            self._incoming_format = payload.get("sample_format", self._incoming_format)
+            self._incoming_channels = int(
+                payload.get("channels", self._incoming_channels)
+            )
+            self.log.info(
+                "Обновлены параметры микрофона",
+                extra={
+                    "attrs": {
+                        "peer": peer,
+                        "sample_rate": self._incoming_sample_rate,
+                        "sample_format": self._incoming_format,
+                        "channels": self._incoming_channels,
+                    }
+                },
+            )
+        else:
+            # Любые другие текстовые сообщения просто логируем для отладки.
+            self.log.debug(
+                "Текстовое сообщение от робота",
+                extra={"attrs": {"peer": peer, "text": payload}},
+            )
+
+    def _handle_binary_message(self, message: bytes) -> None:
+        """Принимает бинарный PCM-чанк и кладёт его в очередь для STT."""
+
+        if not message:
+            self.log.warning("Получен пустой бинарный кадр от робота")
+            return
+        frame = self._decode_frame(message)
+        if frame is None:
+            return
+        if self._queue.full():
+            dropped = self._queue.get_nowait()
+            if isinstance(dropped, RobotAudioFrame):
+                self.log.warning(
+                    "Буфер переполнен, удаляю кадр",
+                    extra={"attrs": {"sequence": dropped.sequence}},
+                )
+        self._queue.put_nowait(frame)
+        self.log.debug(
+            "Кадр добавлен в очередь",
+            extra={
+                "attrs": {
+                    "sequence": frame.sequence,
+                    "timestamp_us": frame.timestamp_us,
+                    "queue_size": self._queue.qsize(),
+                    "bytes": len(message),
+                }
+            },
+        )
+
     async def _send_loop(
         self,
         websocket: WebSocketServerProtocol,
-        queue: asyncio.Queue[bytes],
+        queue: asyncio.Queue[object],
         peer: str,
     ) -> None:
-        """Отправляет накопленные чанки озвучки на робота."""
+        """Отправляет накопленные чанки озвучки и управляющие сообщения на робота."""
 
         self.log.debug(
-            "Запущен цикл отправки TTS", extra={"attrs": {"peer": peer}}
+            "Запущен цикл отправки аудио", extra={"attrs": {"peer": peer}}
         )
         try:
             while True:
                 payload = await queue.get()
                 await websocket.send(payload)
-                try:
-                    (
-                        _magic,
-                        _ver,
-                        _flags,
-                        seq,
-                        _ts,
-                        _sr,
-                        _ch,
-                        _bits,
-                        _frame_samples,
-                        pcm_bytes,
-                        _volume,
-                        _reserved,
-                    ) = _PLAYBACK_HEADER_STRUCT.unpack_from(payload)
-                except struct.error:
-                    seq = -1
-                    pcm_bytes = len(payload)
-                self.log.debug(
-                    "Отправлен аудиокадр роботу",
-                    extra={
-                        "attrs": {
-                            "peer": peer,
-                            "size": len(payload),
-                            "sequence": seq,
-                            "pcm_bytes": pcm_bytes,
-                        }
-                    },
-                )
+                if isinstance(payload, str):
+                    self.log.debug(
+                        "Отправлено управляющее сообщение",
+                        extra={"attrs": {"peer": peer, "payload": payload}},
+                    )
+                else:
+                    self.log.debug(
+                        "Отправлен аудиочанк роботу",
+                        extra={
+                            "attrs": {
+                                "peer": peer,
+                                "size": len(payload),
+                            }
+                        },
+                    )
         except asyncio.CancelledError:
-            self.log.debug("Цикл отправки TTS остановлен", extra={"attrs": {"peer": peer}})
+            self.log.debug(
+                "Цикл отправки аудио остановлен", extra={"attrs": {"peer": peer}}
+            )
         except Exception:
             self.log.exception(
                 "Ошибка отправки аудио роботу", extra={"attrs": {"peer": peer}}
             )
 
     def _next_playback_sequence(self) -> int:
-        """Возвращает следующий номер кадра исходящего аудио."""
+        """Возвращает следующий номер исходящего потока аудио."""
 
         self._playback_sequence = (self._playback_sequence + 1) & 0xFFFFFFFF
         return self._playback_sequence
 
-    def _prepare_playback_payload(
-        self,
-        pcm: bytes,
-        sample_rate: int,
-        *,
-        channels: int,
-        volume: float,
-    ) -> tuple[bytes, dict] | None:
-        """Готовит бинарный пакет ``AP`` и возвращает полезные метрики.
-
-        Возвращаем словарь со статистикой, чтобы логи TTS и фоновых эффектов
-        содержали одинаковые поля: длительность, пики и RMS.  В случае ошибки
-        (например, некорректного числа каналов) метод возвращает ``None`` и
-        соответствующий вызов прерывается.
-        """
-
-        if not pcm:
-            self.log.warning("Попытка отправить пустой PCM-чанк на робота")
-            return None
-
-        if sample_rate <= 0:
-            self.log.error(
-                "Некорректная частота дискретизации аудио",
-                extra={"attrs": {"sample_rate": sample_rate}},
-            )
-            return None
-
-        if channels <= 0:
-            self.log.error(
-                "Некорректное число каналов при отправке аудио",
-                extra={"attrs": {"channels": channels}},
-            )
-            return None
-
-        if len(pcm) % (2 * channels) != 0:
-            self.log.error(
-                "Размер PCM не делится на количество каналов",
-                extra={"attrs": {"pcm_bytes": len(pcm), "channels": channels}},
-            )
-            return None
-
-        if channels != 1:
-            self.log.debug(
-                "Конвертирую аудио в моно перед отправкой",
-                extra={"attrs": {"input_channels": channels}},
-            )
-            pcm = downmix_to_mono(pcm, channels)
-            channels = 1
-
-        samples = array("h")
-        samples.frombytes(pcm)
-        total_samples = len(samples)
-        per_channel = total_samples // channels if channels else 0
-        duration_ms = (
-            (per_channel / sample_rate) * 1000.0 if sample_rate > 0 and per_channel else 0.0
-        )
-
-        squares_sum = sum(val * val for val in samples)
-        rms_mono = (
-            math.sqrt(squares_sum / total_samples) / 32768.0 if total_samples else 0.0
-        )
-        peak = max((abs(val) for val in samples), default=0) / 32768.0
-
-        sequence = self._next_playback_sequence()
-        timestamp_us = int(time.time() * 1_000_000) & 0xFFFFFFFF
-
-        header = _PLAYBACK_HEADER_STRUCT.pack(
-            b"AP",
-            1,
-            0,
-            sequence,
-            timestamp_us,
-            sample_rate,
-            channels,
-            16,
-            per_channel,
-            len(pcm),
-            float(volume),
-            0.0,
-        )
-
-        return header + pcm, {
-            "sequence": sequence,
-            "duration_ms": round(duration_ms, 2),
-            "peak": round(peak, 3),
-            "rms": round(rms_mono, 3),
-            "pcm_bytes": len(pcm),
-            "sample_rate": sample_rate,
-        }
-
-    def _broadcast_payload(self, payload: bytes, *, purpose: str) -> None:
-        """Отправляет подготовленный пакет во все очереди клиентов."""
+    def _broadcast_json(self, payload: dict, *, purpose: str) -> None:
+        """Отправляет текстовое сообщение всем подключённым роботам."""
 
         if self._loop is None:
-            self.log.warning("Event loop сервера ещё не готов, %s не отправлен", purpose)
+            self.log.warning(
+                "Event loop сервера ещё не готов, %s не отправлен", purpose
+            )
             return
+
+        serialized = json.dumps(payload)
 
         def _enqueue() -> None:
             if not self._send_queues:
                 self.log.warning(
-                    "Нет активных подключений робота для отправки %s",
-                    purpose,
+                    "Нет активных подключений робота для отправки %s", purpose
                 )
                 return
             for queue in list(self._send_queues):
                 if queue.full():
                     try:
-                        dropped = queue.get_nowait()
+                        _ = queue.get_nowait()
                         self.log.warning(
                             "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={"attrs": {"dropped_size": len(dropped), "purpose": purpose}},
+                            extra={"attrs": {"purpose": purpose}},
+                        )
+                    except asyncio.QueueEmpty:
+                        pass
+                queue.put_nowait(serialized)
+
+        self._loop.call_soon_threadsafe(_enqueue)
+
+    def _broadcast_binary(self, payload: bytes, *, purpose: str) -> None:
+        """Отправляет бинарный PCM-чанк всем подключённым роботам."""
+
+        if self._loop is None:
+            self.log.warning(
+                "Event loop сервера ещё не готов, бинарный %s не отправлен", purpose
+            )
+            return
+
+        def _enqueue() -> None:
+            if not self._send_queues:
+                self.log.warning(
+                    "Нет активных подключений робота для отправки %s", purpose
+                )
+                return
+            for queue in list(self._send_queues):
+                if queue.full():
+                    try:
+                        _ = queue.get_nowait()
+                        self.log.warning(
+                            "Очередь отправки переполнена, удаляю старый кадр",
+                            extra={"attrs": {"purpose": purpose}},
                         )
                     except asyncio.QueueEmpty:
                         pass
                 queue.put_nowait(payload)
 
         self._loop.call_soon_threadsafe(_enqueue)
+
+    def _send_audio_start(
+        self,
+        audio_id: str,
+        *,
+        kind: str,
+        sample_rate: int,
+        sample_format: str,
+        channels: int,
+        length_ms: float | None = None,
+    ) -> None:
+        """Отправляет управляющее сообщение ``audio_start`` перед PCM-потоком."""
+
+        message: dict[str, object] = {
+            "type": "audio_start",
+            "id": audio_id,
+            "kind": kind,
+            "sample_rate": sample_rate,
+            "sample_format": sample_format,
+            "channels": channels,
+        }
+        if length_ms is not None:
+            message["length_ms"] = int(length_ms)
+        self.log.info(
+            "Начинаю поток аудио",
+            extra={"attrs": {"audio_id": audio_id, "kind": kind}},
+        )
+        self._broadcast_json(message, purpose=f"audio_start/{kind}")
+
+    def _send_audio_end(self, audio_id: str) -> None:
+        """Завершает поток озвучки сообщением ``audio_end``."""
+
+        self.log.info(
+            "Завершаю поток аудио", extra={"attrs": {"audio_id": audio_id}}
+        )
+        self._broadcast_json({"type": "audio_end", "id": audio_id}, purpose="audio_end")
 
     def send_tts(
         self,
@@ -432,37 +462,55 @@ class RobotAudioStream:
         volume: float,
         channels: int = 1,
     ) -> None:
-        """Отправляет подготовленный PCM на робота через WebSocket."""
+        """Отправляет подготовленный PCM на робота через WebSocket.
+
+        Поток TTS сопровождается управляющими сообщениями ``audio_start`` и
+        ``audio_end``. Первая часть отправляется при получении первого чанка,
+        финальная — после последнего. Так прошивка ESP32 может паузить микрофон
+        и не тратить ресурсы на разбор заголовков.
+        """
 
         if self._loop is None:
             self.log.warning("Event loop сервера ещё не готов, TTS не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
-            pcm,
-            sample_rate,
-            channels=channels,
-            volume=volume,
+        if chunk_index <= 1 or self._current_tts_id is None:
+            if self._current_tts_id is not None:
+                self._send_audio_end(self._current_tts_id)
+            self._current_tts_id = f"tts-{self._next_playback_sequence()}-{int(time.time()*1000)}"
+            self._send_audio_start(
+                self._current_tts_id,
+                kind="tts",
+                sample_rate=sample_rate,
+                sample_format="s16le",
+                channels=channels,
+            )
+
+        self._broadcast_binary(pcm, purpose="tts_pcm")
+        duration_ms = (
+            len(pcm) / (2 * max(1, channels) * sample_rate) * 1000
+            if sample_rate > 0
+            else 0.0
         )
-        if prepared is None:
-            return
-        payload, stats = prepared
-
-        self._broadcast_payload(payload, purpose="TTS")
-
         self.log.debug(
-            "Сформирован TTS-кадр",
+            "Отправлен TTS-чанк",
             extra={
                 "attrs": {
+                    "audio_id": self._current_tts_id,
                     "text": text,
                     "preset": preset,
                     "chunk_index": chunk_index,
                     "chunks_total": chunks_total,
                     "volume": round(volume, 3),
-                    **stats,
+                    "pcm_bytes": len(pcm),
+                    "duration_ms": round(duration_ms, 2),
                 }
             },
         )
+
+        if chunk_index >= chunks_total and self._current_tts_id is not None:
+            self._send_audio_end(self._current_tts_id)
+            self._current_tts_id = None
 
     def send_effect(
         self,
@@ -476,38 +524,50 @@ class RobotAudioStream:
         volume: float,
         channels: int = 1,
     ) -> None:
-        """Отправляет фоновый звуковой эффект на робота."""
+        """Отправляет фоновый звуковой эффект на робота.
+
+        Использует тот же протокол ``audio_start``/``audio_end``. Эффекты могут
+        идти подряд, поэтому при первом чанке каждого повторения отправляем
+        новый идентификатор, а при последнем — сигнал завершения.
+        """
 
         if self._loop is None:
             self.log.warning("Event loop сервера ещё не готов, эффект не отправлен")
             return
 
-        prepared = self._prepare_playback_payload(
-            pcm,
-            sample_rate,
-            channels=channels,
-            volume=volume,
-        )
-        if prepared is None:
-            return
-        payload, stats = prepared
+        if repeat_index <= 1 or self._current_effect_id is None:
+            if self._current_effect_id is not None:
+                self._send_audio_end(self._current_effect_id)
+            self._current_effect_id = (
+                f"emotion-{self._next_playback_sequence()}-{int(time.time()*1000)}"
+            )
+            self._send_audio_start(
+                self._current_effect_id,
+                kind="emotion",
+                sample_rate=sample_rate,
+                sample_format="s16le",
+                channels=channels,
+            )
 
-        purpose = f"эффекта {name}"
-        self._broadcast_payload(payload, purpose=purpose)
-
+        self._broadcast_binary(pcm, purpose="effect_pcm")
         self.log.debug(
-            "Сформирован аудиокадр фонового эффекта",
+            "Отправлен аудиочанк фонового эффекта",
             extra={
                 "attrs": {
                     "effect": name,
                     "file": source_file,
                     "repeat_index": repeat_index,
                     "repeat_total": repeat_total,
+                    "pcm_bytes": len(pcm),
+                    "audio_id": self._current_effect_id,
                     "volume": round(volume, 3),
-                    **stats,
                 }
             },
         )
+
+        if repeat_index >= repeat_total and self._current_effect_id is not None:
+            self._send_audio_end(self._current_effect_id)
+            self._current_effect_id = None
 
     def forward_tts_chunk(
         self,
@@ -548,7 +608,7 @@ class RobotAudioStream:
         volume: float,
         channels: int = 1,
     ) -> None:
-        """Проксирует звуковой эффект на робота в формате ``AP``."""
+        """Проксирует звуковой эффект на робота в новом протоколе PCM."""
 
         try:
             self.send_effect(
@@ -568,82 +628,68 @@ class RobotAudioStream:
             )
 
     def _decode_frame(self, payload: bytes) -> RobotAudioFrame | None:
-        """Разбирает бинарный пакет и сводит стерео в моно."""
+        """Разбирает бинарный PCM-чанк и вычисляет полезные метрики."""
 
-        (
-            magic,
-            version,
-            flags,
-            sequence,
-            timestamp_us,
-            sample_rate,
-            frame_samples,
-            channels,
-            sample_bits,
-            pcm_bytes,
-            rms_left,
-            rms_right,
-            spacing,
-            direction,
-            confidence,
-        ) = _HEADER_STRUCT.unpack_from(payload)
-
-        if magic != b"AF":
+        if len(payload) % 2 != 0:
             self.log.warning(
-                "Получен пакет с неверной сигнатурой",
-                extra={"attrs": {"magic": magic}},
+                "Размер PCM не делится на 2 байта (16-bit)",
+                extra={"attrs": {"pcm_bytes": len(payload)}},
             )
             return None
-        if version != 1:
+
+        channels = max(1, self._incoming_channels or 1)
+        sample_rate = self._incoming_sample_rate or self._expected_sample_rate
+        if self._incoming_format.lower() != "s16le":
             self.log.warning(
-                "Неожиданная версия протокола",
-                extra={"attrs": {"version": version}},
+                "Неподдерживаемый формат сэмпла",
+                extra={"attrs": {"format": self._incoming_format}},
             )
-        if sample_bits != 16:
+            return None
+
+        if channels > 1 and (len(payload) // 2) % channels != 0:
             self.log.error(
-                "Неподдерживаемая глубина сэмпла",
-                extra={"attrs": {"bits": sample_bits}},
+                "Размер PCM не делится на количество каналов",
+                extra={"attrs": {"pcm_bytes": len(payload), "channels": channels}},
             )
             return None
-        pcm_view = memoryview(payload)[_HEADER_STRUCT.size : _HEADER_STRUCT.size + pcm_bytes]
-        if len(pcm_view) != pcm_bytes:
-            self.log.warning(
-                "Размер PCM не совпадает",
-                extra={"attrs": {"expected": pcm_bytes, "actual": len(pcm_view)}},
-            )
-            return None
-        if self._expected_sample_rate and sample_rate != self._expected_sample_rate:
-            self.log.warning(
-                "Неожиданная частота дискретизации",
-                extra={"attrs": {"expected": self._expected_sample_rate, "actual": sample_rate}},
-            )
-        if self._expected_channels and channels != self._expected_channels:
-            self.log.warning(
-                "Неожиданное число каналов",
-                extra={"attrs": {"expected": self._expected_channels, "actual": channels}},
-            )
 
-        pcm_stereo = bytes(pcm_view)
-        pcm_mono = downmix_to_mono(pcm_stereo, channels)
+        samples = array("h")
+        samples.frombytes(payload)
 
+        # Считаем RMS по каналам для мониторинга качества.
+        if channels == 1:
+            rms_val = math.sqrt(sum(val * val for val in samples) / len(samples)) if samples else 0.0
+            rms_left = rms_right = rms_val
+            pcm_mono = payload
+            pcm_stereo = payload
+        else:
+            left_vals = samples[0::channels]
+            right_vals = samples[1::channels]
+            rms_left = math.sqrt(sum(val * val for val in left_vals) / len(left_vals)) if left_vals else 0.0
+            rms_right = math.sqrt(sum(val * val for val in right_vals) / len(right_vals)) if right_vals else 0.0
+            pcm_stereo = payload
+            pcm_mono = downmix_to_mono(payload, channels)
+
+        frame_samples = len(pcm_mono) // 2
         self.sample_rate = sample_rate
         self.frame_samples = frame_samples
+        self._incoming_sequence = (self._incoming_sequence + 1) & 0xFFFFFFFF
 
         return RobotAudioFrame(
-            sequence=sequence,
-            timestamp_us=timestamp_us,
+            sequence=self._incoming_sequence,
+            timestamp_us=int(time.time() * 1_000_000),
             sample_rate=sample_rate,
             frame_samples=frame_samples,
             channels=channels,
-            sample_bits=sample_bits,
+            sample_bits=16,
             pcm_stereo=pcm_stereo,
             pcm_mono=pcm_mono,
             rms_left=rms_left,
             rms_right=rms_right,
-            mic_spacing_m=spacing,
-            direction_deg=direction,
-            confidence=confidence,
-            localization_enabled=bool(flags & 0x01),
+            mic_spacing_m=0.0,
+            direction_deg=0.0,
+            confidence=0.0,
+            localization_enabled=False,
         )
 
 
