@@ -1707,9 +1707,11 @@ loadParams();
       case WStype_TEXT:
         if (payload && length > 0) {
 #ifdef ARDUINO
-          // Используем JsonDocument вместо устаревшего DynamicJsonDocument, чтобы
-          // избежать предупреждений сборки и сохранить совместимость с ArduinoJson 7.
-          JsonDocument doc(256);
+          // Используем StaticJsonDocument с фиксированным буфером 256 байт:
+          //  - хватает для малых служебных сообщений audio_start/audio_end/emotion;
+          //  - избегаем предупреждений об устаревшем DynamicJsonDocument;
+          //  - не вызываем heap-аллокатор, что снижает риск фрагментации памяти на ESP32.
+          StaticJsonDocument<256> doc;
           const DeserializationError err = deserializeJson(doc, payload, length);
           if (err) {
             Serial.printf("[AUDIO] ошибка разбора JSON от сервера: %s\n", err.c_str());
