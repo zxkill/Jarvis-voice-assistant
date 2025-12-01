@@ -93,11 +93,6 @@ std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
                                               const Audio::Diagnostics& diag,
                                               uint32_t sequence);
 
-// Предварительное объявление функции сброса состояния клиента WebSocket, чтобы
-// обработчик событий мог без предупреждений вызывать перезапуск даже если
-// реализация расположена ниже по файлу.
-void reset_websocket_client_state(const char* reason);
-
 namespace {
   // --- Общие (кроссплатформенные) данные ---
   Diagnostics gDiagnostics{};            ///< Последние диагностические данные.
@@ -152,6 +147,11 @@ namespace {
   std::string gWsExtraHeaders;            ///< Буфер с дополнительными HTTP-заголовками для рукопожатия.
   AudioStreamConfig gActiveWsConfig;      ///< Последняя применённая конфигурация потока.
   bool gHasActiveWsConfig = false;        ///< Флаг наличия валидной конфигурации в gActiveWsConfig.
+
+  // Предварительное объявление, чтобы обработчики могли дергать сброс клиента
+  // до фактической реализации и при этом функция оставалась внутренней для
+  // данного translation unit (без внешних символов для линковщика).
+  void reset_websocket_client_state(const char* reason);
 
   struct WsEndpointParts {
     std::string host;    ///< Имя хоста из URL.
@@ -1707,11 +1707,11 @@ loadParams();
       case WStype_TEXT:
         if (payload && length > 0) {
 #ifdef ARDUINO
-          // Используем StaticJsonDocument с фиксированным буфером 256 байт:
-          //  - хватает для малых служебных сообщений audio_start/audio_end/emotion;
-          //  - избегаем предупреждений об устаревшем DynamicJsonDocument;
-          //  - не вызываем heap-аллокатор, что снижает риск фрагментации памяти на ESP32.
-          StaticJsonDocument<256> doc;
+          // В ArduinoJson 7 рекомендуется JsonDocument; заранее резервируем 256 байт,
+          // чтобы минимизировать динамические выделения и оставить читаемый объём
+          // под типовые сообщения audio_start/audio_end/emotion.
+          JsonDocument doc;
+          doc.reserve(256);
           const DeserializationError err = deserializeJson(doc, payload, length);
           if (err) {
             Serial.printf("[AUDIO] ошибка разбора JSON от сервера: %s\n", err.c_str());
@@ -1779,6 +1779,10 @@ loadParams();
     }
   }
 
+  // Полная перезагрузка клиента WebSocket с подробным логированием причин.
+  // Размещаем реализацию рядом с конфигурированием клиента, чтобы все вызовы
+  // имели единый источник истины и чтобы линковщик не искал внешнюю версию
+  // функции (ранее это приводило к ошибке undefined reference).
   void reset_websocket_client_state(const char* reason) {
     const unsigned long now = millis();
     if (reason && *reason) {
