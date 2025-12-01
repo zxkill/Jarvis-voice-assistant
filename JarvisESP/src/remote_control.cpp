@@ -148,11 +148,6 @@ namespace {
   AudioStreamConfig gActiveWsConfig;      ///< Последняя применённая конфигурация потока.
   bool gHasActiveWsConfig = false;        ///< Флаг наличия валидной конфигурации в gActiveWsConfig.
 
-  // Предварительное объявление, чтобы обработчики могли дергать сброс клиента
-  // до фактической реализации и при этом функция оставалась внутренней для
-  // данного translation unit (без внешних символов для линковщика).
-  void reset_websocket_client_state(const char* reason);
-
   struct WsEndpointParts {
     std::string host;    ///< Имя хоста из URL.
     uint16_t port = 0;   ///< Порт подключения.
@@ -1707,11 +1702,11 @@ loadParams();
       case WStype_TEXT:
         if (payload && length > 0) {
 #ifdef ARDUINO
-          // В ArduinoJson 7 рекомендуется JsonDocument; заранее резервируем 256 байт,
-          // чтобы минимизировать динамические выделения и оставить читаемый объём
-          // под типовые сообщения audio_start/audio_end/emotion.
+          // В ArduinoJson 7 рекомендуется JsonDocument; используем его без устаревшего
+          // StaticJsonDocument и держим парсинг компактным, чтобы уменьшить
+          // динамические выделения на ESP32. Объём JSON короткий (audio_start/
+          // audio_end/emotion), поэтому стандартного пула хватает без ручного reserve.
           JsonDocument doc;
-          doc.reserve(256);
           const DeserializationError err = deserializeJson(doc, payload, length);
           if (err) {
             Serial.printf("[AUDIO] ошибка разбора JSON от сервера: %s\n", err.c_str());
