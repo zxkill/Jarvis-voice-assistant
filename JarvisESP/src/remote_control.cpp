@@ -94,6 +94,11 @@ std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
                                               uint32_t sequence);
 
 namespace {
+  // Предварительные объявления функций, которые используются выше по файлу, но
+  // определены ниже. Это защищает от ошибок линковки и позволяет обработчикам
+  // событий вызывать перезапуск клиента независимо от порядка определения.
+  void reset_websocket_client_state(const char* reason);
+
   // --- Общие (кроссплатформенные) данные ---
   Diagnostics gDiagnostics{};            ///< Последние диагностические данные.
   Command gPendingCommand{};             ///< Ожидающая выполнения команда.
