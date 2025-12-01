@@ -75,6 +75,7 @@ class RobotAudioStream:
         ping_interval: float | None = 10.0,
         ping_timeout: float | None = 5.0,
         max_outgoing_frame: int = 4096,
+        send_queue_max: int = 200,
     ) -> None:
         """Создаёт сервер, принимающий бинарные кадры PCM16 от робота."""
 
@@ -96,6 +97,11 @@ class RobotAudioStream:
         # оставляем равной 1 байту, чтобы тесты могли проверять дробление на
         # малых буферах.
         self._max_outgoing_frame = max(1, max_outgoing_frame)
+        # Максимальный размер исходящих очередей на одно подключение.
+        # Большое значение даёт запас для «вспышек» объёма аудио (эмоции,
+        # длинные TTS), а логика удаления старых кадров не позволит очереди
+        # бесконтрольно расти и захламлять память.
+        self._send_queue_max = max(5, send_queue_max)
         self._queue: asyncio.Queue[RobotAudioFrame | object] = asyncio.Queue(
             maxsize=max(1, queue_max)
         )
@@ -106,6 +112,10 @@ class RobotAudioStream:
         self._stop_event = asyncio.Event()
         self._client_tasks: Set[asyncio.Task[None]] = set()
         self._send_queues: Set[asyncio.Queue[object]] = set()
+        # Счётчик пропущенных кадров по каждой цели (tts_pcm, effect_pcm и т.п.),
+        # чтобы не спамить лог одинаковыми предупреждениями, а сообщать об
+        # обрезке очереди агрегировано.
+        self._drop_counters: dict[str, int] = {}
         self.sample_rate = expected_sample_rate
         self.frame_samples = 512
         # Текущие параметры входящего аудио. Их можно обновлять управляющим
@@ -212,7 +222,12 @@ class RobotAudioStream:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
-        send_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=50)
+        # Очередь исходящих данных на каждое подключение. Размер задаётся
+        # параметром ``send_queue_max`` и покрывает всплески аудио без мгновенного
+        # сброса кадров.
+        send_queue: asyncio.Queue[object] = asyncio.Queue(
+            maxsize=self._send_queue_max
+        )
         sender_task = asyncio.create_task(
             self._send_loop(websocket, send_queue, peer)
         )
@@ -440,13 +455,27 @@ class RobotAudioStream:
                 if queue.full():
                     try:
                         _ = queue.get_nowait()
-                        self.log.warning(
-                            "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={"attrs": {"purpose": purpose}},
+                        # Накапливаем счётчик удалённых кадров, чтобы
+                        # вывести одно агрегированное предупреждение.
+                        self._drop_counters[purpose] = (
+                            self._drop_counters.get(purpose, 0) + 1
                         )
                     except asyncio.QueueEmpty:
                         pass
                 queue.put_nowait(serialized)
+                dropped = self._drop_counters.pop(purpose, 0)
+                if dropped:
+                    self.log.warning(
+                        "Очередь отправки была переполнена, удалил старые кадры",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "dropped": dropped,
+                                "queue_size": queue.qsize(),
+                                "queue_max": queue.maxsize,
+                            }
+                        },
+                    )
 
         self._loop.call_soon_threadsafe(_enqueue)
 
@@ -469,13 +498,25 @@ class RobotAudioStream:
                 if queue.full():
                     try:
                         _ = queue.get_nowait()
-                        self.log.warning(
-                            "Очередь отправки переполнена, удаляю старый кадр",
-                            extra={"attrs": {"purpose": purpose}},
+                        self._drop_counters[purpose] = (
+                            self._drop_counters.get(purpose, 0) + 1
                         )
                     except asyncio.QueueEmpty:
                         pass
                 queue.put_nowait(payload)
+                dropped = self._drop_counters.pop(purpose, 0)
+                if dropped:
+                    self.log.warning(
+                        "Очередь отправки была переполнена, удалил старые кадры",
+                        extra={
+                            "attrs": {
+                                "purpose": purpose,
+                                "dropped": dropped,
+                                "queue_size": queue.qsize(),
+                                "queue_max": queue.maxsize,
+                            }
+                        },
+                    )
 
         self._loop.call_soon_threadsafe(_enqueue)
 

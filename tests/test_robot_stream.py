@@ -213,3 +213,34 @@ def test_chunking_does_not_exceed_frame_limit() -> None:
 
     loop.close()
     asyncio.set_event_loop(None)
+
+
+def test_send_queue_drops_oldest_and_resets_counter() -> None:
+    """Очередь отправки удаляет старый кадр и сбрасывает накопленный счётчик."""
+
+    stream = RobotAudioStream("ws://127.0.0.1:8765/", send_queue_max=1)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    stream._loop = loop
+
+    # Эмулируем подключение робота: создаём очередь с maxsize=1 и заполняем её,
+    # чтобы гарантированно сработал механизм удаления старого кадра.
+    send_queue: asyncio.Queue[object] = asyncio.Queue(maxsize=1)
+    loop.run_until_complete(send_queue.put(b"old"))
+    stream._send_queues.add(send_queue)
+
+    # Планируем отправку нового чанка и выполняем цикл event loop,
+    # чтобы сработала call_soon_threadsafe из _broadcast_binary.
+    stream._broadcast_binary(b"new", purpose="test_pcm")
+    loop.run_until_complete(asyncio.sleep(0))
+
+    # Проверяем, что старый кадр вытеснен, а новый успешно в очереди.
+    assert loop.run_until_complete(send_queue.get()) == b"new"
+    assert send_queue.empty()
+
+    # Счётчик удалённых кадров должен быть очищен после логирования, иначе
+    # последующие чанки будут ошибочно помечены как переполненные.
+    assert stream._drop_counters.get("test_pcm", 0) == 0
+
+    loop.close()
+    asyncio.set_event_loop(None)
