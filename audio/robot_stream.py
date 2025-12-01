@@ -204,7 +204,12 @@ class RobotAudioStream:
     async def _handle_robot(self, websocket: WebSocketServerProtocol) -> None:
         """Принимает одно подключение робота и читает аудиокадры."""
 
-        peer = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        # Формируем читаемое имя пира, защищая код от редких случаев, когда
+        # удалённый адрес отсутствует (например, при нестандартных транспортах).
+        if websocket.remote_address:
+            peer = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
+        else:
+            peer = "unknown"
         if websocket.path != self._path:
             self.log.warning(
                 "Отклоняю подключение: неверный путь",
@@ -228,12 +233,11 @@ class RobotAudioStream:
         send_queue: asyncio.Queue[object] = asyncio.Queue(
             maxsize=self._send_queue_max
         )
-        sender_task = asyncio.create_task(
-            self._send_loop(websocket, send_queue, peer)
-        )
-        heartbeat_task = asyncio.create_task(
-            self._ping_watchdog(websocket, peer)
-        )
+        # Создаём фоновые задачи для отправки и контроля пинг-понга. Отдельные
+        # задачи упрощают изоляцию ошибок: сбой в отправке не должен влиять на
+        # основной цикл чтения аудио.
+        sender_task = asyncio.create_task(self._send_loop(websocket, send_queue, peer))
+        heartbeat_task = asyncio.create_task(self._ping_watchdog(websocket, peer))
         self._send_queues.add(send_queue)
         try:
             async for message in websocket:
@@ -256,6 +260,15 @@ class RobotAudioStream:
                     "Робот закрыл соединение из-за слишком большого фрейма — дроблю PCM на части",
                     extra={"attrs": {"peer": peer, "max_frame": self._max_outgoing_frame}},
                 )
+            elif exc.code == 1006:
+                # Код 1006 приходит при «аномальном» обрыве соединения без
+                # корректного close-фрейма. Логируем явно, чтобы в телеметрии
+                # было понятно, что нужно инициировать переподключение на
+                # стороне робота, но не паниковать.
+                self.log.error(
+                    "Робот разорвал соединение без кода закрытия (1006)",
+                    extra={"attrs": {"peer": peer}},
+                )
         except Exception:
             self.log.exception("Ошибка при обработке аудиопотока робота")
         finally:
@@ -263,7 +276,19 @@ class RobotAudioStream:
                 self._client_tasks.discard(task)
             sender_task.cancel()
             self._send_queues.discard(send_queue)
-            self.log.info("Соединение с роботом завершено", extra={"attrs": {"peer": peer}})
+            # Завершаем соединение с расширенной диагностикой: фиксируем код
+            # закрытия, который уже выставил websockets, чтобы потом соотнести
+            # его с поведением клиента.
+            self.log.info(
+                "Соединение с роботом завершено",
+                extra={
+                    "attrs": {
+                        "peer": peer,
+                        "close_code": websocket.close_code,
+                        "close_reason": websocket.close_reason,
+                    }
+                },
+            )
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat_task

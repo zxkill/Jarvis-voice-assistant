@@ -1663,8 +1663,11 @@ loadParams();
         break;
       }
       case WStype_DISCONNECTED:
-        Serial.println(F("[AUDIO] WebSocket отключён"));
+        Serial.println(F("[AUDIO] WebSocket отключён, инициируем переподключение"));
         gLastHandshakeMs = millis();
+        // При любом разрыве очищаем очередь фоновой отправки, чтобы старые кадры
+        // не мешали новой сессии и не вызывали ложных переполнений.
+        flush_stream_queue();
         lock_stream_stats();
         gAudioStreamStats.wsConnected = false;
         gAudioStreamStats.wsLastDisconnectMs = static_cast<uint64_t>(millis());
@@ -1673,15 +1676,21 @@ loadParams();
         }
         unlock_stream_stats();
         mark_status_dirty();
+        // Полностью сбрасываем состояние клиента, чтобы следующая попытка
+        // подключения стартовала «с нуля» и не зависела от внутреннего
+        // состояния библиотеки после аварийного закрытия (код 1006 и подобные).
+        reset_websocket_client_state("ws-disconnected");
         break;
       case WStype_ERROR:
-        Serial.println(F("[AUDIO] ошибка WebSocket"));
+        Serial.println(F("[AUDIO] ошибка WebSocket, сбрасываем клиент"));
         gLastHandshakeMs = millis();
         lock_stream_stats();
         gAudioStreamStats.wsConnected = false;
         gAudioStreamStats.lastError = "ws-error";
         unlock_stream_stats();
         mark_status_dirty();
+        flush_stream_queue();
+        reset_websocket_client_state("ws-error");
         break;
       case WStype_BIN: {
         const bool accepted = AudioPlayback::feed_stream_chunk(payload, length);
