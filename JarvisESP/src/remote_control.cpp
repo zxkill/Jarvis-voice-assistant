@@ -93,6 +93,11 @@ std::vector<uint8_t> build_audio_stream_frame(const Audio::PcmChunk& chunk,
                                               const Audio::Diagnostics& diag,
                                               uint32_t sequence);
 
+// Предварительное объявление функции сброса состояния клиента WebSocket, чтобы
+// обработчик событий мог без предупреждений вызывать перезапуск даже если
+// реализация расположена ниже по файлу.
+void reset_websocket_client_state(const char* reason);
+
 namespace {
   // --- Общие (кроссплатформенные) данные ---
   Diagnostics gDiagnostics{};            ///< Последние диагностические данные.
@@ -1702,7 +1707,9 @@ loadParams();
       case WStype_TEXT:
         if (payload && length > 0) {
 #ifdef ARDUINO
-          DynamicJsonDocument doc(256);
+          // Используем JsonDocument вместо устаревшего DynamicJsonDocument, чтобы
+          // избежать предупреждений сборки и сохранить совместимость с ArduinoJson 7.
+          JsonDocument doc(256);
           const DeserializationError err = deserializeJson(doc, payload, length);
           if (err) {
             Serial.printf("[AUDIO] ошибка разбора JSON от сервера: %s\n", err.c_str());
